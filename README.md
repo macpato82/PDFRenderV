@@ -136,7 +136,20 @@ XObjects; page /Rotate.
 
 JPEG 2000 (`JPXDecode`) via the vendored OpenJPEG in
 `thirdparty/openjpeg` - needed by scanned PDFs, which are otherwise
-blank pages. Constant alpha and Multiply are composited for real
+blank pages - decoded at a resolution matched to the display size,
+since JPX is resolution-scalable and a full-size decode of a scan is
+many times more work than the screen can show.  CMYK/YCCK JPEGs go
+through our own `c/pdfjpg`, which SpriteExtend cannot decode.
+
+Decoded images are cached (LRU, 4MB by default, keyed by stream
+offset and decode size), so revisiting a page costs nothing.
+
+A note on JPEG: ordinary JPEGs are left to SpriteExtend even though
+`c/pdfjpg` can decode them at 1/2, 1/4 or 1/8 scale.  Measured on an
+emulated StrongARM with a 2550x3300 scan, SpriteExtend took ~19s and
+our scaled decode 26-33s: skipping the IDCT does not help when the
+Huffman pass dominates, and the OS decoder does that in hand-written
+ARM.  The numbers, not the theory, decided it. Constant alpha and Multiply are composited for real
 (the backend owns its sprite and reads it back) on axis-aligned
 rectangles.
 

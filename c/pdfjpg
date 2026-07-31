@@ -1,0 +1,1076 @@
+/*
+  PDFRender - baseline/extended-sequential JPEG (ITU T.81) decoder.
+
+  Written directly from the specification (marker syntax in section B,
+  Huffman decoding procedure in Annex F, the IDCT definition in Annex
+  A) rather than adapted from any existing decoder - this is a clean-
+  room implementation and it ships under CDDL, not GPL.
+
+  The one thing that makes this file worth having alongside
+  SpriteExtend's built-in JPEG plotter is scaled decoding.  SOF holds
+  the coefficients of the image as 8x8 blocks of frequencies; the
+  inverse DCT that turns N frequencies per axis into N samples per
+  axis works just as well for N = 4, 2 or 1 as it does for the usual
+  N = 8 - each is simply a smaller separable IDCT fed only the top-
+  left NxN corner of the block's coefficients.  N = 1 is the fast
+  path this whole file exists for: the DC coefficient alone, divided
+  by 8, IS the block's average sample, so an 8-megapixel scan can be
+  turned into a fast preview by computing one output sample per 8x8
+  block instead of sixty-four, skipping the IDCT's multiplies and (far
+  more importantly for a big image) the memory traffic of writing,
+  upsampling and colour-converting 64 times as many pixels.
+
+  Huffman decoding always walks every coefficient a block actually
+  encodes, at every scale - there is no way to know how many bits a
+  variable-length code occupies without decoding it - so the saving is
+  entirely in the IDCT and everything downstream of it.  That is
+  still the overwhelming majority of the work for a large image, and
+  it is what the scale-factor benchmarks in this project's test suite
+  measure.
+
+  Every arithmetic step is integer/fixed-point: the IDCT's cosine
+  table is precomputed (offline, with a script - see the comment above
+  basis8[]) to a 12-bit fixed-point scale, and all of the accumulation
+  is done in s64 so that even a maximally adversarial coefficient
+  stream (see the DC-predictor clamp below) cannot overflow it.  No
+  float, double or <math.h> appears anywhere in this file, so the
+  module needs neither FPEmulator nor VFP.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfjpg.h"
+
+enum {
+    JPG_MAXCOMP  = 4,          /* grey, YCbCr, or CMYK/YCCK              */
+    JPG_NQUANT   = 4,          /* DQT table selectors 0..3               */
+    JPG_NHUFF    = 4,          /* DC/AC Huffman table selectors 0..3     */
+    DCT_CBITS    = 12          /* fixed-point bits in the IDCT constants */
+};
+
+/* However hostile the DC Huffman stream is, the running DC predictor
+   is clamped to this after every block so that (a) it can never
+   overflow even s64 arithmetic further down the pipeline and (b) the
+   dequantised coefficient it feeds into idct_block() stays inside the
+   range that routine's own s64 accumulators are sized for (see the
+   overflow analysis there).  A legitimate 8-bit-sample image never
+   gets remotely close to this - real DC values run to a few thousand
+   at most - so this only ever bites on deliberately malformed input.  */
+#define JPG_PRED_CLAMP  131072
+
+/* Upper bound on Width*Height straight out of SOF, before any scale
+   choice.  Large enough for any real scanned page, small enough that
+   a tiny file with an absurd claimed frame size fails fast with
+   PDF_E_LIMIT instead of asking the allocator for hundreds of
+   megabytes on behalf of a handful of bytes.                          */
+#define JPG_FRAME_LIMIT ((u32) 268435456)  /* 2^28 */
+
+/* --- zigzag-to-natural-order table (ITU T.81 Figure A.6) --------------
+   Maps a coefficient's position in the zigzag scan (DC first, then AC
+   low-to-high frequency) to its row*8+col position in the natural 8x8
+   matrix F(v,u) - this exact 64-entry permutation is part of the
+   specification itself, not any implementation's expression of it.    */
+static const u8 zigzag[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+};
+
+/* --- IDCT basis tables --------------------------------------------------
+
+   The 2-D inverse DCT (T.81 Annex A, eq. A.4) is separable into two
+   1-D passes, each of the form
+
+       g[n] = sum_{k=0}^{M-1} basis[n][k] * F[k]     (n = 0 .. M-1)
+
+   where basis[n][k] = (1/2) * C(k) * cos((2n+1)k*pi/(2M)), C(0) =
+   1/sqrt(2) and C(k>0) = 1.  For M = 8 that is the ordinary 8-sample
+   IDCT; restricting both the input (top-left MxM coefficients) and
+   the output (M spatial samples per axis) to M = 4, 2 or 1 gives a
+   correctly-scaled band-limited reconstruction at that size - the
+   same identity used for M = 1's well-known special case (see the
+   comment on decode_block()'s DC handling: with only F(0,0) present,
+   applying this formula twice - once per axis - reduces to exactly
+   F(0,0)/8, i.e. the block's average sample, however M is chosen).
+
+   Every table below is the same formula at a different M, scaled by
+   2^DCT_CBITS and rounded to the nearest integer, computed OFFLINE
+   (this comment's python, not anything at runtime) - there is no
+   <math.h> or floating point in this file:
+
+       def C(k): return 1/sqrt(2) if k == 0 else 1.0
+       def basis(M):
+           return [[round(4096 * 0.5 * C(k) * cos((2*n+1)*k*pi/(2*M)))
+                    for k in range(M)] for n in range(M)]
+
+   idct_block() applies the same table to both passes of a given M
+   (the formula is identical for the row and column transforms), so
+   one table per M is all that is needed.                              */
+static const s32 basis8[64] = {
+    1448, 2009, 1892, 1703, 1448, 1138,  784,  400,
+    1448, 1703,  784, -400,-1448,-2009,-1892,-1138,
+    1448, 1138, -784,-2009,-1448,  400, 1892, 1703,
+    1448,  400,-1892,-1138, 1448, 1703, -784,-2009,
+    1448, -400,-1892, 1138, 1448,-1703, -784, 2009,
+    1448,-1138, -784, 2009,-1448, -400, 1892,-1703,
+    1448,-1703,  784,  400,-1448, 2009,-1892, 1138,
+    1448,-2009, 1892,-1703, 1448,-1138,  784, -400
+};
+
+static const s32 basis4[16] = {
+    1448, 1892, 1448,  784,
+    1448,  784,-1448,-1892,
+    1448, -784,-1448, 1892,
+    1448,-1892, 1448, -784
+};
+
+static const s32 basis2[4] = {
+    1448,  1448,
+    1448, -1448
+};
+
+static const s32 basis1[1] = { 1448 };
+
+/* --- Huffman tables ------------------------------------------------------
+
+   Canonical-code bookkeeping and the DECODE procedure below both
+   follow ITU T.81 Annex C (table generation) and Annex F.2.2.3 /
+   Figure F.16 (the reference decoding procedure) directly - both are
+   part of the specification's own description of how a conforming
+   decoder works, not copied from any particular implementation.       */
+typedef struct {
+    s32 mincode[17];      /* index by code length 1..16; 0 unused       */
+    s32 maxcode[17];      /* -1 = no code of this length exists         */
+    s32 valptr[17];
+    u8  vals[256];
+    int nvals;
+    int present;
+} JpgHuff;
+
+/* Build a canonical Huffman table from DHT's 16 length counts and the
+   values that follow them, assigning the shortest available codes to
+   the shortest lengths first length-by-length - the unique canonical
+   assignment implied by the counts (T.81 Annex C, Figures C.1-C.3).   */
+static void
+build_huffman(JpgHuff *h, const u8 *counts, const u8 *vals, int nvals)
+{
+    s32 code = 0;
+    int k = 0, l;
+
+    for (l = 1; l <= 16; l++) {
+        int cnt = counts[l - 1];
+
+        if (cnt > 0) {
+            h->valptr[l]  = k;
+            h->mincode[l] = code;
+            code += cnt;
+            h->maxcode[l] = code - 1;
+            k += cnt;
+        } else {
+            h->maxcode[l] = -1;
+        }
+        code <<= 1;
+    }
+    memcpy(h->vals, vals, (size_t) nvals);
+    h->nvals = nvals;
+    h->present = 1;
+}
+
+/* --- component / frame state -------------------------------------------- */
+
+typedef struct {
+    u8  id;
+    u8  h, v;              /* sampling factors, 1..4                    */
+    u8  tq;                /* quantisation table selector, 0..3         */
+    u8  td, ta;             /* DC/AC Huffman table selectors (from SOS)  */
+    s64 pred;               /* running DC predictor, clamped - see above */
+    u8 *plane;               /* decoded samples at the chosen scale, MCU-
+                               padded; malloc'd plane_w*plane_h bytes    */
+    int plane_w, plane_h;
+} JpgComp;
+
+typedef struct {
+    int width, height;              /* from SOF, full resolution         */
+    int ncomp;
+    JpgComp comp[JPG_MAXCOMP];
+    int hmax, vmax;
+    int have_sof;
+
+    u16 quant[JPG_NQUANT][64];      /* zigzag order, as read from DQT    */
+    int quant_present[JPG_NQUANT];
+
+    JpgHuff huffdc[JPG_NHUFF];
+    JpgHuff huffac[JPG_NHUFF];
+
+    int restart_interval;           /* MCUs between RSTn, 0 = none       */
+    int adobe_transform;            /* APP14 transform byte, -1 = absent */
+
+    int scanorder[JPG_MAXCOMP];     /* SOS component order -> comp index */
+    int scan_ns;
+
+    int mcus_w, mcus_h;
+    int scale;                      /* 0..3 -> block side 8,4,2,1         */
+} JpgCtx;
+
+static u32
+be16(const u8 *p)
+{
+    return ((u32) p[0] << 8) | (u32) p[1];
+}
+
+/* --- entropy-coded bitstream --------------------------------------------- */
+
+typedef struct {
+    const u8 *p;            /* next unconsumed source byte                */
+    const u8 *end;           /* one past the last valid source byte       */
+    u32 buf;                  /* 0..8 bits, right-aligned                  */
+    int nbits;
+} JpgBits;
+
+/* Fetch one entropy-coded byte, undoing FF/00 byte stuffing.  Returns
+   -1 (not a byte value) at true end of buffer AND at a marker (FF
+   followed by anything but 00) - in the latter case p is left
+   pointing AT the marker's leading FF so restart_sync() or the end of
+   the scan can read it.  A correctly formed stream only ever reaches
+   this in the second sense at a byte-aligned MCU/restart boundary, so
+   nothing above this function needs to tell the two apart.            */
+static int
+fetch_byte(JpgBits *br)
+{
+    u8 b, nb;
+
+    if (br->p >= br->end) {
+        return -1;
+    }
+    b = *br->p;
+    if (b == 0xFF) {
+        if (br->p + 1 >= br->end) {
+            return -1;
+        }
+        nb = br->p[1];
+        if (nb == 0x00) {
+            br->p += 2;
+            return 0xFF;
+        }
+        return -1;
+    }
+    br->p += 1;
+    return (int) b;
+}
+
+static int
+getbit(JpgBits *br, int *err)
+{
+    int b;
+
+    if (br->nbits == 0) {
+        int byte = fetch_byte(br);
+
+        if (byte < 0) {
+            *err = 1;
+            return 0;
+        }
+        br->buf = (u32) byte;
+        br->nbits = 8;
+    }
+    br->nbits--;
+    b = (int) ((br->buf >> br->nbits) & 1u);
+    *err = 0;
+    return b;
+}
+
+/* Read a size-bit magnitude and sign-extend it per T.81 Figure F.12
+   (the EXTEND procedure): values with their top bit clear represent
+   negatives, running from -(2^size-1) up to -2^(size-1).  size is
+   always 1..15 here (never called for size 0).                       */
+static s32
+receive_extend(JpgBits *br, int size, int *err)
+{
+    s32 v = 0;
+    int i;
+
+    for (i = 0; i < size; i++) {
+        int b = getbit(br, err);
+
+        if (*err) {
+            return 0;
+        }
+        v = (v << 1) | b;
+    }
+    if (v < (1 << (size - 1))) {
+        v -= (1 << size) - 1;
+    }
+    return v;
+}
+
+/* T.81 Figure F.16's DECODE procedure: extend the code one bit at a
+   time until it falls within the range of codes of some length that
+   actually has any (maxcode[l] >= 0), then look the symbol up.  idx is
+   bounds-checked explicitly - an adversarial custom Huffman table
+   cannot make this read outside vals[], only return a wrong symbol or
+   *err.                                                                */
+static int
+huff_decode(JpgBits *br, const JpgHuff *h, int *err)
+{
+    int code, l, idx;
+
+    code = getbit(br, err);
+    if (*err) {
+        return 0;
+    }
+    l = 1;
+    while (h->maxcode[l] < 0 || code > h->maxcode[l]) {
+        if (l == 16) {
+            *err = 1;
+            return 0;
+        }
+        code = (code << 1) | getbit(br, err);
+        if (*err) {
+            return 0;
+        }
+        l++;
+    }
+    idx = h->valptr[l] + (code - h->mincode[l]);
+    if (idx < 0 || idx >= h->nvals) {
+        *err = 1;
+        return 0;
+    }
+    return h->vals[idx];
+}
+
+/* --- inverse DCT ---------------------------------------------------------
+
+   Separable MxM IDCT (M = 8, 4, 2 or 1 - see the basis table comment
+   above) of the top-left MxM corner of a dequantised 8x8 coefficient
+   block (coef[v*8+u], natural order), producing M*M level-shifted,
+   clamped samples in out[] (row-major, out[y*M+x]).
+
+   Overflow: coef[] can hold at most JPG_PRED_CLAMP*65535 (~8.6e9,
+   from an adversarial DC predictor and a maximal 16-bit DQT entry -
+   AC coefficients are bounded far below that on their own, see
+   decode_block()) and the largest basis magnitude is 2009 (M = 8).  A
+   pass-1 accumulation of at most 8 such products is at most
+   ~1.4e14; a pass-2 accumulation of 8 products of THAT and another
+   basis value is at most ~2.3e18 - comfortably inside s64's ~9.2e18
+   range with room to spare.  Every accumulator here is s64 for
+   exactly this reason.                                                */
+static void
+idct_block(const s64 *coef, int M, u8 *out)
+{
+    const s32 *bas;
+    s64 tmp[8][8];
+    int fv, fu, ox, oy;
+    s64 acc, val;
+
+    bas = M == 8 ? basis8 : M == 4 ? basis4 : M == 2 ? basis2 : basis1;
+
+    for (fv = 0; fv < M; fv++) {
+        for (ox = 0; ox < M; ox++) {
+            acc = 0;
+            for (fu = 0; fu < M; fu++) {
+                acc += coef[fv * 8 + fu] * (s64) bas[ox * M + fu];
+            }
+            tmp[fv][ox] = acc;
+        }
+    }
+    for (ox = 0; ox < M; ox++) {
+        for (oy = 0; oy < M; oy++) {
+            acc = 0;
+            for (fv = 0; fv < M; fv++) {
+                acc += tmp[fv][ox] * (s64) bas[oy * M + fv];
+            }
+            val = (acc + ((s64) 1 << (2 * DCT_CBITS - 1))) >> (2 * DCT_CBITS);
+            val += 128;
+            if (val < 0) {
+                val = 0;
+            } else if (val > 255) {
+                val = 255;
+            }
+            out[oy * M + ox] = (u8) val;
+        }
+    }
+}
+
+/* --- one 8x8 block: Huffman decode, dequantise, scaled IDCT -------------
+
+   Decodes every coefficient the block actually encodes (DC, then AC
+   run/size pairs until EOB or all 63 are seen) regardless of the
+   chosen scale - there is no way to know how many bits a variable-
+   length code occupies without decoding it - but only stores a
+   dequantised value for a coefficient when it falls inside the top-
+   left MxM corner idct_block() will actually use; everything else is
+   decoded (to keep the bitstream position correct) and discarded.     */
+static int
+decode_block(JpgBits *br, JpgComp *comp, const JpgHuff *dctab,
+            const JpgHuff *actab, const u16 *quant, int M, u8 *outblk)
+{
+    s64 coef[64];
+    int err = 0, size, k;
+    s32 diff;
+
+    memset(coef, 0, sizeof coef);
+
+    size = huff_decode(br, dctab, &err);
+    if (err || size > 15) {
+        return PDF_E_DATA;
+    }
+    diff = size ? receive_extend(br, size, &err) : 0;
+    if (err) {
+        return PDF_E_DATA;
+    }
+    comp->pred += diff;
+    if (comp->pred > JPG_PRED_CLAMP) {
+        comp->pred = JPG_PRED_CLAMP;
+    } else if (comp->pred < -JPG_PRED_CLAMP) {
+        comp->pred = -JPG_PRED_CLAMP;
+    }
+    coef[0] = comp->pred * (s64) quant[0];
+
+    k = 1;
+    while (k < 64) {
+        int sym = huff_decode(br, actab, &err);
+        int run, rsize;
+
+        if (err) {
+            return PDF_E_DATA;
+        }
+        run = sym >> 4;
+        rsize = sym & 0xF;
+        if (rsize == 0) {
+            if (run == 15) {         /* ZRL: 16 zero coefficients          */
+                k += 16;
+                continue;
+            }
+            break;                    /* EOB: rest of the block is zero    */
+        }
+        k += run;
+        if (k >= 64) {
+            return PDF_E_DATA;         /* corrupt: run past the block end   */
+        }
+        {
+            s32 val = receive_extend(br, rsize, &err);
+            int pos;
+
+            if (err) {
+                return PDF_E_DATA;
+            }
+            pos = zigzag[k];
+            if ((pos >> 3) < M && (pos & 7) < M) {
+                coef[pos] = (s64) val * (s64) quant[k];
+            }
+        }
+        k++;
+    }
+
+    idct_block(coef, M, outblk);
+    return PDF_OK;
+}
+
+/* After restart_interval MCUs, the bitstream byte-aligns (the encoder
+   pads the last partial byte with 1-bits) and a RSTn marker follows.
+   Any bits still buffered here are exactly that padding - safe to
+   discard - after which br->p is guaranteed to sit at the marker's
+   leading FF, because fetch_byte() never consumes a marker byte.      */
+static int
+restart_sync(JpgBits *br)
+{
+    const u8 *q;
+
+    br->nbits = 0;
+    br->buf = 0;
+    if (br->p >= br->end || *br->p != 0xFF) {
+        return PDF_E_DATA;
+    }
+    q = br->p;
+    while (q < br->end && *q == 0xFF) {
+        q++;
+    }
+    if (q >= br->end || *q < 0xD0 || *q > 0xD7) {
+        return PDF_E_DATA;
+    }
+    br->p = q + 1;
+    return PDF_OK;
+}
+
+/* --- MCU loop ------------------------------------------------------------ */
+
+static int
+decode_scan(JpgCtx *ctx, JpgBits *br)
+{
+    int side = 8 >> ctx->scale;
+    int mx, my, j, bx, by;
+    u32 mcu_count = 0;
+    u8 outblk[64];
+
+    for (my = 0; my < ctx->mcus_h; my++) {
+        for (mx = 0; mx < ctx->mcus_w; mx++) {
+            for (j = 0; j < ctx->scan_ns; j++) {
+                JpgComp *c = &ctx->comp[ctx->scanorder[j]];
+                const JpgHuff *dctab = &ctx->huffdc[c->td];
+                const JpgHuff *actab = &ctx->huffac[c->ta];
+                const u16 *quant = ctx->quant[c->tq];
+
+                if (!dctab->present || !actab->present ||
+                    !ctx->quant_present[c->tq]) {
+                    return PDF_E_DATA;
+                }
+                for (by = 0; by < c->v; by++) {
+                    for (bx = 0; bx < c->h; bx++) {
+                        int err, px, py, r;
+
+                        err = decode_block(br, c, dctab, actab, quant,
+                                           side, outblk);
+                        if (err) {
+                            return err;
+                        }
+                        px = (mx * c->h + bx) * side;
+                        py = (my * c->v + by) * side;
+                        for (r = 0; r < side; r++) {
+                            memcpy(c->plane + (py + r) * c->plane_w + px,
+                                  outblk + r * side, (size_t) side);
+                        }
+                    }
+                }
+            }
+            mcu_count++;
+            if (ctx->restart_interval > 0 &&
+                mcu_count % (u32) ctx->restart_interval == 0 &&
+                !(my == ctx->mcus_h - 1 && mx == ctx->mcus_w - 1)) {
+                int err = restart_sync(br);
+
+                if (err) {
+                    return err;
+                }
+                for (j = 0; j < ctx->ncomp; j++) {
+                    ctx->comp[j].pred = 0;
+                }
+            }
+        }
+    }
+    return PDF_OK;
+}
+
+/* --- colour conversion ---------------------------------------------------- */
+
+static u32
+clamp255(s32 v)
+{
+    if (v < 0) {
+        return 0;
+    }
+    if (v > 255) {
+        return 255;
+    }
+    return (u32) v;
+}
+
+/* Standard fixed-point (16-bit fraction) JFIF/BT.601 YCbCr->RGB.       */
+static void
+ycbcr_to_rgb(u32 y, u32 cb, u32 cr, u32 *rp, u32 *gp, u32 *bp)
+{
+    s32 cb0 = (s32) cb - 128;
+    s32 cr0 = (s32) cr - 128;
+    s32 r = (s32) y + ((91881 * cr0) >> 16);
+    s32 g = (s32) y - ((22554 * cb0 + 46802 * cr0) >> 16);
+    s32 b = (s32) y + ((116130 * cb0) >> 16);
+
+    *rp = clamp255(r);
+    *gp = clamp255(g);
+    *bp = clamp255(b);
+}
+
+/* Fetch component c's sample at output pixel (x, y), nearest-neighbour
+   upsampling any chroma subsampling by the ratio of its own sampling
+   factors to the frame's maximum (mirrors comp_at() in c/pdfjpx,
+   which does the same job for OpenJPEG's differently-shaped planes).
+   Quality is not the point - c->plane is already at the chosen DCT
+   scale, so this is nearest-neighbour on an already-small image.      */
+static u32
+comp_sample(const JpgComp *c, int x, int y, int hmax, int vmax)
+{
+    int cx = (x * c->h) / hmax;
+    int cy = (y * c->v) / vmax;
+
+    if (cx < 0) {
+        cx = 0;
+    } else if (cx >= c->plane_w) {
+        cx = c->plane_w - 1;
+    }
+    if (cy < 0) {
+        cy = 0;
+    } else if (cy >= c->plane_h) {
+        cy = c->plane_h - 1;
+    }
+    return c->plane[cy * c->plane_w + cx];
+}
+
+static int
+build_output(const JpgCtx *ctx, int outw, int outh, u32 **pixp)
+{
+    u32 *pix;
+    int x, y;
+    int hmax = ctx->hmax, vmax = ctx->vmax;
+
+    pix = malloc((size_t) outw * (size_t) outh * sizeof *pix);
+    if (pix == NULL) {
+        return PDF_E_NOMEM;
+    }
+
+    for (y = 0; y < outh; y++) {
+        u32 *row = pix + (u32) y * (u32) outw;
+
+        for (x = 0; x < outw; x++) {
+            u32 r, g, b;
+
+            if (ctx->ncomp == 1) {
+                r = g = b = comp_sample(&ctx->comp[0], x, y, hmax, vmax);
+            } else if (ctx->ncomp == 3) {
+                u32 yv = comp_sample(&ctx->comp[0], x, y, hmax, vmax);
+                u32 cb = comp_sample(&ctx->comp[1], x, y, hmax, vmax);
+                u32 cr = comp_sample(&ctx->comp[2], x, y, hmax, vmax);
+
+                if (ctx->adobe_transform == 0) {
+                    r = yv;
+                    g = cb;
+                    b = cr;
+                } else {
+                    ycbcr_to_rgb(yv, cb, cr, &r, &g, &b);
+                }
+            } else {
+                u32 c0 = comp_sample(&ctx->comp[0], x, y, hmax, vmax);
+                u32 c1 = comp_sample(&ctx->comp[1], x, y, hmax, vmax);
+                u32 c2 = comp_sample(&ctx->comp[2], x, y, hmax, vmax);
+                u32 kk = comp_sample(&ctx->comp[3], x, y, hmax, vmax);
+                u32 cc, mm, yy;
+
+                if (ctx->adobe_transform == 2) {
+                    u32 rr, gg, bb;
+
+                    /* YCCK: the first three channels are YCbCr of an
+                       "inverted CMY" pseudo-RGB (Adobe's own
+                       convention) - undo the transform, then invert.  */
+                    ycbcr_to_rgb(c0, c1, c2, &rr, &gg, &bb);
+                    cc = 255u - rr;
+                    mm = 255u - gg;
+                    yy = 255u - bb;
+                } else {
+                    cc = c0;
+                    mm = c1;
+                    yy = c2;
+                }
+                /* CMYK -> RGB, matching c/pdfimg's combine_pixel().     */
+                r = 255u - (cc + kk > 255u ? 255u : cc + kk);
+                g = 255u - (mm + kk > 255u ? 255u : mm + kk);
+                b = 255u - (yy + kk > 255u ? 255u : yy + kk);
+            }
+            row[x] = r | (g << 8) | (b << 16);
+        }
+    }
+    *pixp = pix;
+    return PDF_OK;
+}
+
+/* --- marker segment parsing ----------------------------------------------- */
+
+static void
+parse_app(JpgCtx *ctx, int marker, const u8 *d, u32 len)
+{
+    if (marker == 0xE0 && len >= 5 && memcmp(d, "JFIF", 5) == 0) {
+        return;                   /* noted for provenance only            */
+    }
+    if (marker == 0xEE && len >= 12 && memcmp(d, "Adobe", 5) == 0) {
+        ctx->adobe_transform = d[11];
+    }
+}
+
+static int
+parse_sof(JpgCtx *ctx, const u8 *d, u32 len)
+{
+    int precision, ncomp, i;
+    u32 w, h;
+
+    if (len < 6) {
+        return PDF_E_DATA;
+    }
+    precision = d[0];
+    h = be16(d + 1);
+    w = be16(d + 3);
+    ncomp = d[5];
+    if (precision != 8) {
+        return PDF_E_UNSUP;         /* 12-bit precision: out of scope     */
+    }
+    if (w == 0 || h == 0) {
+        return PDF_E_DATA;
+    }
+    if (ncomp != 1 && ncomp != 3 && ncomp != 4) {
+        return PDF_E_UNSUP;
+    }
+    if (len != (u32) (6 + 3 * ncomp)) {
+        return PDF_E_DATA;
+    }
+    if (w * h > JPG_FRAME_LIMIT) {
+        return PDF_E_LIMIT;
+    }
+
+    ctx->hmax = 1;
+    ctx->vmax = 1;
+    for (i = 0; i < ncomp; i++) {
+        const u8 *cd = d + 6 + 3 * i;
+        int hv = cd[1];
+        int hh = hv >> 4, vv = hv & 0xF;
+
+        if (hh < 1 || hh > 4 || vv < 1 || vv > 4) {
+            return PDF_E_DATA;
+        }
+        if (cd[2] >= JPG_NQUANT) {
+            return PDF_E_DATA;
+        }
+        ctx->comp[i].id = cd[0];
+        ctx->comp[i].h  = (u8) hh;
+        ctx->comp[i].v  = (u8) vv;
+        ctx->comp[i].tq = cd[2];
+        if (hh > ctx->hmax) {
+            ctx->hmax = hh;
+        }
+        if (vv > ctx->vmax) {
+            ctx->vmax = vv;
+        }
+    }
+    ctx->ncomp    = ncomp;
+    ctx->width    = (int) w;
+    ctx->height   = (int) h;
+    ctx->have_sof = 1;
+    return PDF_OK;
+}
+
+static int
+parse_dqt(JpgCtx *ctx, const u8 *d, u32 len)
+{
+    u32 pos = 0;
+
+    while (pos < len) {
+        int pqtq, pq, tq, i;
+
+        pqtq = d[pos];
+        pq = pqtq >> 4;
+        tq = pqtq & 0xF;
+        pos++;
+        if (tq >= JPG_NQUANT || pq > 1) {
+            return PDF_E_DATA;
+        }
+        if (pq == 0) {
+            if (pos + 64 > len) {
+                return PDF_E_DATA;
+            }
+            for (i = 0; i < 64; i++) {
+                ctx->quant[tq][i] = d[pos + i];
+            }
+            pos += 64;
+        } else {
+            if (pos + 128 > len) {
+                return PDF_E_DATA;
+            }
+            for (i = 0; i < 64; i++) {
+                ctx->quant[tq][i] = (u16) be16(d + pos + i * 2);
+            }
+            pos += 128;
+        }
+        ctx->quant_present[tq] = 1;
+    }
+    return PDF_OK;
+}
+
+static int
+parse_dht(JpgCtx *ctx, const u8 *d, u32 len)
+{
+    u32 pos = 0;
+
+    while (pos < len) {
+        int tcth, cls, id, total, i;
+        const u8 *counts;
+        JpgHuff *tab;
+
+        if (pos + 17 > len) {
+            return PDF_E_DATA;
+        }
+        tcth = d[pos];
+        cls = tcth >> 4;
+        id = tcth & 0xF;
+        if (cls > 1 || id >= JPG_NHUFF) {
+            return PDF_E_DATA;
+        }
+        counts = d + pos + 1;
+        total = 0;
+        for (i = 0; i < 16; i++) {
+            total += counts[i];
+        }
+        if (total > 256 || pos + 17 + (u32) total > len) {
+            return PDF_E_DATA;
+        }
+        tab = cls == 0 ? &ctx->huffdc[id] : &ctx->huffac[id];
+        build_huffman(tab, counts, d + pos + 17, total);
+        pos += 17 + (u32) total;
+    }
+    return PDF_OK;
+}
+
+/* A single scan covering every frame component, interleaved in MCU
+   order, is the only structure supported - the near-universal case
+   for baseline JPEGs from scanners and PDF writers.  Ss/Se/Ah/Al are
+   checked as a defence-in-depth belt-and-braces: they should always
+   be 0/63/0/0 for a sequential (SOF0/SOF1) scan, and a stream where
+   they are not is treated as unsupported rather than guessed at.      */
+static int
+parse_sos(JpgCtx *ctx, const u8 *d, u32 len)
+{
+    int ns, j, i;
+    u32 need;
+
+    if (len < 1) {
+        return PDF_E_DATA;
+    }
+    ns = d[0];
+    if (ns < 1 || ns > JPG_MAXCOMP) {
+        return PDF_E_DATA;
+    }
+    need = (u32) (1 + 2 * ns + 3);
+    if (len != need) {
+        return PDF_E_DATA;
+    }
+    if (ns != ctx->ncomp) {
+        return PDF_E_UNSUP;          /* non-interleaved multi-scan image   */
+    }
+    for (j = 0; j < ns; j++) {
+        int cs = d[1 + 2 * j];
+        int tdta = d[2 + 2 * j];
+        int td = tdta >> 4, ta = tdta & 0xF;
+        int found = -1;
+
+        if (td >= JPG_NHUFF || ta >= JPG_NHUFF) {
+            return PDF_E_DATA;
+        }
+        for (i = 0; i < ctx->ncomp; i++) {
+            if (ctx->comp[i].id == cs) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) {
+            return PDF_E_DATA;
+        }
+        ctx->comp[found].td = (u8) td;
+        ctx->comp[found].ta = (u8) ta;
+        ctx->scanorder[j] = found;
+    }
+    {
+        int ss = d[1 + 2 * ns];
+        int se = d[2 + 2 * ns];
+        int ahal = d[3 + 2 * ns];
+
+        if (ss != 0 || se != 63 || ahal != 0) {
+            return PDF_E_UNSUP;
+        }
+    }
+    ctx->scan_ns = ns;
+    return PDF_OK;
+}
+
+/* --- scale choice, plane allocation, decode, output ---------------------- */
+
+/* Picks the largest DCT scale factor (1/1, 1/2, 1/4, 1/8) whose output
+   is still >= the requested draw size - exactly the policy
+   pdfjpx_decode uses for its wavelet reduction levels, just over four
+   discrete steps instead of a continuous halving.                     */
+static int
+decode_after_sos(JpgCtx *ctx, const u8 *src, u32 srclen, u32 pos,
+                 int maxw, int maxh, int *wp, int *hp, u32 **pixp)
+{
+    JpgBits br;
+    int err, i, side, outw, outh;
+    int mw, mh;
+
+    ctx->scale = 0;
+    if (maxw > 0 && maxh > 0) {
+        while (ctx->scale < 3 &&
+               (ctx->width  >> (ctx->scale + 1)) >= maxw &&
+               (ctx->height >> (ctx->scale + 1)) >= maxh) {
+            ctx->scale++;
+        }
+    }
+    side = 8 >> ctx->scale;
+
+    outw = (ctx->width  + (1 << ctx->scale) - 1) >> ctx->scale;
+    outh = (ctx->height + (1 << ctx->scale) - 1) >> ctx->scale;
+    if (outw < 1 || outh < 1 || outw > 8192 || outh > 8192 ||
+        (u32) outw * (u32) outh > 4194304u) {
+        return PDF_E_LIMIT;
+    }
+
+    mw = (ctx->width  + 8 * ctx->hmax - 1) / (8 * ctx->hmax);
+    mh = (ctx->height + 8 * ctx->vmax - 1) / (8 * ctx->vmax);
+    ctx->mcus_w = mw;
+    ctx->mcus_h = mh;
+
+    for (i = 0; i < ctx->ncomp; i++) {
+        JpgComp *c = &ctx->comp[i];
+        int bw = mw * c->h;
+        int bh = mh * c->v;
+
+        c->plane_w = bw * side;
+        c->plane_h = bh * side;
+        c->plane = malloc((size_t) c->plane_w * (size_t) c->plane_h);
+        if (c->plane == NULL) {
+            return PDF_E_NOMEM;
+        }
+        c->pred = 0;
+    }
+
+    br.p = src + pos;
+    br.end = src + srclen;
+    br.buf = 0;
+    br.nbits = 0;
+
+    err = decode_scan(ctx, &br);
+    if (err) {
+        return err;
+    }
+    err = build_output(ctx, outw, outh, pixp);
+    if (err) {
+        return err;
+    }
+    *wp = outw;
+    *hp = outh;
+    return PDF_OK;
+}
+
+/* --- public interface ----------------------------------------------------- */
+
+int
+pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
+             int *wp, int *hp, u32 **pixp)
+{
+    JpgCtx ctx;
+    u32 pos;
+    int err = PDF_E_DATA, i;
+
+    *wp = *hp = 0;
+    *pixp = NULL;
+    if (src == NULL || srclen < 4 || src[0] != 0xFF || src[1] != 0xD8) {
+        return PDF_E_DATA;
+    }
+
+    memset(&ctx, 0, sizeof ctx);
+    ctx.adobe_transform = -1;
+
+    pos = 2;
+    for (;;) {
+        u32 marker, seglen, datalen;
+        const u8 *segdata;
+
+        if (pos >= srclen || src[pos] != 0xFF) {
+            err = PDF_E_DATA;
+            goto out;
+        }
+        while (pos < srclen && src[pos] == 0xFF) {
+            pos++;
+        }
+        if (pos >= srclen) {
+            err = PDF_E_DATA;
+            goto out;
+        }
+        marker = src[pos];
+        pos++;
+
+        if (marker == 0xD9) {              /* EOI reached with no scan   */
+            err = PDF_E_DATA;
+            goto out;
+        }
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;                       /* TEM / stray RSTn: no length */
+        }
+        if (pos + 2 > srclen) {
+            err = PDF_E_DATA;
+            goto out;
+        }
+        seglen = be16(src + pos);
+        if (seglen < 2 || pos + seglen > srclen) {
+            err = PDF_E_DATA;
+            goto out;
+        }
+        segdata = src + pos + 2;
+        datalen = seglen - 2;
+
+        if (marker >= 0xC0 && marker <= 0xCF &&
+            marker != 0xC4 && marker != 0xCC) {
+            if (marker == 0xC0 || marker == 0xC1) {
+                if (ctx.have_sof) {
+                    err = PDF_E_DATA;
+                    goto out;
+                }
+                err = parse_sof(&ctx, segdata, datalen);
+                if (err) {
+                    goto out;
+                }
+            } else {
+                err = PDF_E_UNSUP;           /* SOF2 (progressive) and all
+                                                 other SOF variants        */
+                goto out;
+            }
+        } else if (marker == 0xC4) {
+            err = parse_dht(&ctx, segdata, datalen);
+            if (err) {
+                goto out;
+            }
+        } else if (marker == 0xDB) {
+            err = parse_dqt(&ctx, segdata, datalen);
+            if (err) {
+                goto out;
+            }
+        } else if (marker == 0xDD) {
+            if (datalen != 2) {
+                err = PDF_E_DATA;
+                goto out;
+            }
+            ctx.restart_interval = (int) be16(segdata);
+        } else if (marker >= 0xE0 && marker <= 0xEF) {
+            parse_app(&ctx, (int) marker, segdata, datalen);
+        } else if (marker == 0xDA) {
+            if (!ctx.have_sof) {
+                err = PDF_E_DATA;
+                goto out;
+            }
+            err = parse_sos(&ctx, segdata, datalen);
+            if (err) {
+                goto out;
+            }
+            pos += seglen;
+            err = decode_after_sos(&ctx, src, srclen, pos, maxw, maxh,
+                                   wp, hp, pixp);
+            goto out;
+        }
+        /* COM, DAC and any other length-prefixed marker: skip it        */
+        pos += seglen;
+    }
+
+out:
+    for (i = 0; i < JPG_MAXCOMP; i++) {
+        free(ctx.comp[i].plane);
+    }
+    if (err) {
+        *wp = *hp = 0;
+        free(*pixp);
+        *pixp = NULL;
+    }
+    return err;
+}

@@ -1,0 +1,61 @@
+/*
+  PDFRender - baseline/extended-sequential JPEG (ITU T.81) decoding,
+  written from the specification with a scaled integer IDCT.
+
+  SpriteExtend's own JPEG_PlotScaled always decodes a DCTDecode image
+  at full resolution before scaling it down for display, which on an
+  8-megapixel scanned page costs on the order of twenty seconds on the
+  target hardware.  This decoder exists purely to avoid that: it picks
+  one of the DCT's four natural scale factors - 1/1, 1/2, 1/4 or 1/8 -
+  and only ever computes that many samples per 8x8 block, so a preview
+  or a page thumbnail can skip nearly all of the IDCT and colour-
+  conversion work instead of throwing it away after the fact.  There
+  is no floating point anywhere in this file - the IDCT is a fixed-
+  point integer transform - so the module pulls in neither FPEmulator
+  nor VFP.
+
+  Mirrors pdfjpx_decode's signature so callers can try this first and
+  fall back to SpriteExtend (or, for JPEG 2000, pdfjpx) when a stream
+  turns out to need something this decoder does not do: progressive
+  scans (SOF2) and multi-scan (non-interleaved) images are refused
+  with PDF_E_UNSUP rather than approximated.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFJPG_H
+#define PDFJPG_H
+
+#include "pdftypes.h"
+
+/* Decode a baseline (SOF0) or extended-sequential (SOF1) JPEG to
+   XRGB32 (red in bits 0-7, row 0 = top), matching PdfImg's and
+   pdfjpx_decode's pixel contract.  wp and hp receive the DECODED
+   dimensions (i.e. after any scaling - see below), pixp a malloc'd
+   w*h word buffer the caller owns.
+
+   Handles 1-component greyscale, 3-component YCbCr (and, when an
+   Adobe APP14 marker says transform=0, already-RGB) and 4-component
+   CMYK/YCCK, with any legal component sampling factors (1..4), 8-
+   and 16-bit quantisation tables, and DRI/RSTn restart markers.
+   Progressive frames (SOF2) and any other SOF variant are refused
+   with PDF_E_UNSUP; a single interleaved scan covering every frame
+   component is the only scan structure supported (again PDF_E_UNSUP
+   otherwise) - both are true of essentially every JPEG a scanner or
+   PDF-writer actually produces.
+
+   maxw/maxh are the size the image will actually be DRAWN at, in
+   device pixels (0 = unknown, decode in full).  Exactly one of the
+   DCT's four natural scale factors - 1/1, 1/2, 1/4, 1/8 - is chosen:
+   the largest reduction whose output is still >= the requested size,
+   the same policy pdfjpx_decode uses for its wavelet levels.  At 1/8
+   every 8x8 block collapses to its DC coefficient alone, so an 8
+   megapixel scan previewed at a few hundred pixels wide decodes tens
+   of times faster than a full decode would, with dramatically less
+   memory traffic.                                                    */
+int pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
+                  int *wp, int *hp, u32 **pixp);
+
+#endif
