@@ -1529,7 +1529,14 @@ bar_main(void)
     blk[1] = 0;                         /* x0                         */
     blk[2] = 0;                         /* y0                         */
     blk[3] = 68;                        /* x1: the icon is 68 wide    */
-    blk[4] = 68;                        /* y1                         */
+    /* The PRM asks for a 68 OS unit square, which is right for the
+       standard tool sprites - but a taller theme leaves a 68-high box
+       sitting on the floor of the bar with the sprite stranded below
+       everything else (measured: 16 pixels low against the Filer's
+       icons).  The sprite is placed in the box, not stretched to it,
+       so a box the height of a generous bar plus the centring flags
+       below puts it level whatever the theme.                      */
+    blk[4] = 136;                       /* y1                         */
     /* sprite, horizontally and vertically centred, button type 3
        (click) so Select and Menu both reach us                      */
     blk[5] = (1 << 1) | (1 << 3) | (1 << 4) | (3 << 12);

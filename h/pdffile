@@ -5,8 +5,9 @@
   The whole file is held in memory (caller-owned buffer); objects are
   parsed lazily on first reference and cached.  Handles classic xref
   tables, xref streams (PDF 1.5+), hybrid files, object streams, and
-  chained /Prev sections.  Encrypted documents are detected and
-  refused cleanly.
+  chained /Prev sections.  Encrypted documents are decrypted where the
+  user password is empty (see h/pdfcrypt); one that genuinely needs a
+  password is refused cleanly.
 
   Copyright (c) RISC OS Technologies 2026.
   SPDX-License-Identifier: CDDL-1.0
@@ -18,6 +19,7 @@
 
 #include "pdftypes.h"
 #include "pdfobj.h"
+#include "pdfcrypt.h"
 #include "pdfflt.h"
 
 typedef struct {
@@ -54,6 +56,8 @@ typedef struct PdfDoc {
                                    already applied                     */
     PdfOStm ostm[PDF_NOSTM];
     u32 tick;
+
+    PdfCrypt crypt;             /* c.ok = 0 for an unencrypted file    */
 } PdfDoc;
 
 /* Open/close.  buf must stay valid until pdf_close.                  */

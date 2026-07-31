@@ -17,7 +17,7 @@ OJSRCS  := bio cio dwt event function_list ht_dec image invert j2k jp2 \
 OJOBJ   := $(addprefix obj/oj_,$(addsuffix .o,$(OJSRCS)))
 CFLAGS  := -std=c99 -O1 -g -Wall -Wextra -Wno-unused-parameter \
            -fsanitize=address,undefined -Ihostinc -Iojinc
-CORE    := pdfflt pdfobj pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng pdfpage
+CORE    := pdfflt pdfobj pdfcrypt pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng pdfpage
 COREOBJ := $(addprefix obj/,$(addsuffix .o,$(CORE)))
 
 all: headers testflt testpdf testtext
@@ -36,6 +36,9 @@ obj/oj_%.o: $(OJDIR)/c/% headers
 
 obj/%.o: $(TOP)/c/% headers
 	$(CC) $(CFLAGS) -x c -c $< -o $@
+
+testcrypt: testcrypt.c obj/pdfcrypt.o
+	$(CC) $(CFLAGS) testcrypt.c obj/pdfcrypt.o -o $@
 
 testflt: testflt.c obj/pdfflt.o
 	$(CC) $(CFLAGS) testflt.c obj/pdfflt.o -o $@

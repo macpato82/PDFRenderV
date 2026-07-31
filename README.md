@@ -195,7 +195,18 @@ hole in the page. Constant alpha and Multiply are composited for real
 (the backend owns its sprite and reads it back) on axis-aligned
 rectangles.
 
-Out (v1): encryption (clean error), embedded font programs (mapped to
+Encrypted PDFs are decrypted transparently when the user password is
+empty - which is what almost every "encrypted" PDF in the wild is,
+restricting permissions rather than demanding a password. All four
+standard-handler flavours are covered: RC4 40-bit (/V 1 /R 2), RC4
+128-bit (/V 2 /R 3), AES-128 (/V 4 /R 4, /CFM /AESV2) and AES-256 (/V 5
+/R 6, /AESV3, including the Algorithm 2.B hardened hash). MD5, SHA-256/
+384/512, RC4 and AES are written from their specifications in
+`c/pdfcrypt` - no GPL or OpenSSL source. A PDF that genuinely needs a
+password is refused with a clear error; supplying one is not
+implemented.
+
+Out (v1): user-supplied passwords, embedded font programs (mapped to
 metric-equivalent RISC OS fonts instead), /Differences encodings,
 Type3 glyph rendering, shadings/patterns (skipped or grey),
 transparency groups and luminosity soft masks - so a highlight
@@ -208,5 +219,10 @@ what is under it - CCITT/JBIG2 images.
   including streams lifted from real PDFs), truncation sweep, LZW
   spec vector, predictor/ASCII85/Hex/RLE unit tests. ASan/UBSan.
 - `test/host/testpdf` - opens real PDFs, dumps/counts backend ops.
+- `test/host/testcrypt` - MD5/SHA-256/384/512 against Python hashlib
+  (18 lengths around every block boundary, plus streaming in awkward
+  chunk sizes), RC4 and AES-128/192/256 against the FIPS-197 vectors.
+  End to end, the four qpdf-produced encryption levels above extract
+  text byte-identical to the unencrypted original.
 - On target: `*PDFToSprite` then view the sprite (or pull it back to
   the Mac for SpriteViewer).

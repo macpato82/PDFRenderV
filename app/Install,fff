@@ -146,7 +146,10 @@ whatever had them before.
 Known limitations in 1.00
 -------------------------
 
-  * Encrypted PDFs are refused with a clear error.
+  * Encrypted PDFs open normally when no password is set on
+    them (the usual case - the encryption restricts printing
+    or copying rather than access).  One that really needs a
+    password is refused: entering one is not implemented.
   * Embedded font programs are not rasterised - the standard-14
     fonts are mapped to their RISC OS metric equivalents (Homerton,
     Trinity, Corpus), so text is anti-aliased and correctly spaced,

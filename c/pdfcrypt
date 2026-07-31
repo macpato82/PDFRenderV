@@ -1,0 +1,1191 @@
+/*
+  PDFRender - cryptographic primitives and standard security handler
+  key derivation for encrypted PDFs.  See h/pdfcrypt for the contract.
+
+  MD5, SHA-256/384/512, RC4 and AES are written here from their
+  published specifications (RFC 1321, FIPS 180-4, FIPS 197); no GPL or
+  OpenSSL source was consulted.  The security handler follows the
+  algorithms in ISO 32000-1 section 7.6.3 and ISO 32000-2 section
+  7.6.4 (Algorithms 1, 2, 2.A, 2.B and 6).
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfcrypt.h"
+
+/* --- little helpers --------------------------------------------------- */
+
+static u32
+rol32(u32 x, int n)
+{
+    return (x << n) | (x >> (32 - n));
+}
+
+static u32
+ror32(u32 x, int n)
+{
+    return (x >> n) | (x << (32 - n));
+}
+
+static u64
+ror64(u64 x, int n)
+{
+    return (x >> n) | (x << (64 - n));
+}
+
+static u32
+ld32le(const u8 *p)
+{
+    return (u32) p[0] | ((u32) p[1] << 8) |
+           ((u32) p[2] << 16) | ((u32) p[3] << 24);
+}
+
+static void
+st32le(u8 *p, u32 v)
+{
+    p[0] = (u8) v;
+    p[1] = (u8) (v >> 8);
+    p[2] = (u8) (v >> 16);
+    p[3] = (u8) (v >> 24);
+}
+
+static u32
+ld32be(const u8 *p)
+{
+    return ((u32) p[0] << 24) | ((u32) p[1] << 16) |
+           ((u32) p[2] << 8) | (u32) p[3];
+}
+
+static void
+st32be(u8 *p, u32 v)
+{
+    p[0] = (u8) (v >> 24);
+    p[1] = (u8) (v >> 16);
+    p[2] = (u8) (v >> 8);
+    p[3] = (u8) v;
+}
+
+static u64
+ld64be(const u8 *p)
+{
+    return ((u64) ld32be(p) << 32) | (u64) ld32be(p + 4);
+}
+
+static void
+st64be(u8 *p, u64 v)
+{
+    st32be(p, (u32) (v >> 32));
+    st32be(p + 4, (u32) v);
+}
+
+/* constant-time-ish compare: no early exit on the first difference     */
+static int
+same(const u8 *a, const u8 *b, u32 n)
+{
+    u32 i;
+    u8 diff = 0;
+
+    for (i = 0; i < n; i++) {
+        diff |= (u8) (a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+/* --- MD5 (RFC 1321) ---------------------------------------------------- */
+
+static const u8 md5_s[64] = {
+    7, 12, 17, 22,  7, 12, 17, 22,  7, 12, 17, 22,  7, 12, 17, 22,
+    5,  9, 14, 20,  5,  9, 14, 20,  5,  9, 14, 20,  5,  9, 14, 20,
+    4, 11, 16, 23,  4, 11, 16, 23,  4, 11, 16, 23,  4, 11, 16, 23,
+    6, 10, 15, 21,  6, 10, 15, 21,  6, 10, 15, 21,  6, 10, 15, 21
+};
+
+static const u32 md5_k[64] = {
+    0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu,
+    0xf57c0fafu, 0x4787c62au, 0xa8304613u, 0xfd469501u,
+    0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
+    0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u,
+    0xf61e2562u, 0xc040b340u, 0x265e5a51u, 0xe9b6c7aau,
+    0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
+    0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu,
+    0xa9e3e905u, 0xfcefa3f8u, 0x676f02d9u, 0x8d2a4c8au,
+    0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu,
+    0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u,
+    0x289b7ec6u, 0xeaa127fau, 0xd4ef3085u, 0x04881d05u,
+    0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
+    0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u,
+    0x655b59c3u, 0x8f0ccc92u, 0xffeff47du, 0x85845dd1u,
+    0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u,
+    0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u
+};
+
+static void
+md5_block(PdfMd5Ctx *ctx, const u8 *p)
+{
+    u32 m[16], a = ctx->a, b = ctx->b, c = ctx->c, d = ctx->d;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        m[i] = ld32le(p + i * 4);
+    }
+    for (i = 0; i < 64; i++) {
+        u32 f;
+        int g;
+
+        if (i < 16) {
+            f = (b & c) | (~b & d);
+            g = i;
+        } else if (i < 32) {
+            f = (d & b) | (~d & c);
+            g = (5 * i + 1) & 15;
+        } else if (i < 48) {
+            f = b ^ c ^ d;
+            g = (3 * i + 5) & 15;
+        } else {
+            f = c ^ (b | ~d);
+            g = (7 * i) & 15;
+        }
+        f += a + md5_k[i] + m[g];
+        a = d;
+        d = c;
+        c = b;
+        b += rol32(f, md5_s[i]);
+    }
+    ctx->a += a;
+    ctx->b += b;
+    ctx->c += c;
+    ctx->d += d;
+}
+
+void
+pdfmd5_init(PdfMd5Ctx *ctx)
+{
+    ctx->a = 0x67452301u;
+    ctx->b = 0xefcdab89u;
+    ctx->c = 0x98badcfeu;
+    ctx->d = 0x10325476u;
+    ctx->len = 0;
+    ctx->buflen = 0;
+}
+
+void
+pdfmd5_update(PdfMd5Ctx *ctx, const u8 *data, u32 len)
+{
+    ctx->len += len;
+    if (ctx->buflen != 0) {
+        u32 need = 64 - ctx->buflen;
+
+        if (len < need) {
+            memcpy(ctx->buf + ctx->buflen, data, len);
+            ctx->buflen += len;
+            return;
+        }
+        memcpy(ctx->buf + ctx->buflen, data, need);
+        md5_block(ctx, ctx->buf);
+        ctx->buflen = 0;
+        data += need;
+        len -= need;
+    }
+    while (len >= 64) {
+        md5_block(ctx, data);
+        data += 64;
+        len -= 64;
+    }
+    if (len != 0) {
+        memcpy(ctx->buf, data, len);
+        ctx->buflen = len;
+    }
+}
+
+void
+pdfmd5_final(PdfMd5Ctx *ctx, u8 out[16])
+{
+    u64 bits = ctx->len * 8;
+    u8 pad[72];
+    u32 padlen;
+
+    memset(pad, 0, sizeof pad);
+    pad[0] = 0x80;
+    padlen = (ctx->buflen < 56) ? (56 - ctx->buflen)
+                                : (120 - ctx->buflen);
+    st32le(pad + padlen, (u32) bits);
+    st32le(pad + padlen + 4, (u32) (bits >> 32));
+    pdfmd5_update(ctx, pad, padlen + 8);
+    st32le(out, ctx->a);
+    st32le(out + 4, ctx->b);
+    st32le(out + 8, ctx->c);
+    st32le(out + 12, ctx->d);
+}
+
+void
+pdfmd5(const u8 *data, u32 len, u8 out[16])
+{
+    PdfMd5Ctx ctx;
+
+    pdfmd5_init(&ctx);
+    pdfmd5_update(&ctx, data, len);
+    pdfmd5_final(&ctx, out);
+}
+
+/* --- SHA-256 (FIPS 180-4) ---------------------------------------------- */
+
+static const u32 sha256_k[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+};
+
+static void
+sha256_block(PdfSha256Ctx *ctx, const u8 *p)
+{
+    u32 w[64], a, b, c, d, e, f, g, h;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ld32be(p + i * 4);
+    }
+    for (i = 16; i < 64; i++) {
+        u32 s0 = ror32(w[i - 15], 7) ^ ror32(w[i - 15], 18) ^
+                 (w[i - 15] >> 3);
+        u32 s1 = ror32(w[i - 2], 17) ^ ror32(w[i - 2], 19) ^
+                 (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = ctx->h[0]; b = ctx->h[1]; c = ctx->h[2]; d = ctx->h[3];
+    e = ctx->h[4]; f = ctx->h[5]; g = ctx->h[6]; h = ctx->h[7];
+    for (i = 0; i < 64; i++) {
+        u32 s1 = ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25);
+        u32 ch = (e & f) ^ (~e & g);
+        u32 t1 = h + s1 + ch + sha256_k[i] + w[i];
+        u32 s0 = ror32(a, 2) ^ ror32(a, 13) ^ ror32(a, 22);
+        u32 maj = (a & b) ^ (a & c) ^ (b & c);
+        u32 t2 = s0 + maj;
+
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d;
+    ctx->h[4] += e; ctx->h[5] += f; ctx->h[6] += g; ctx->h[7] += h;
+}
+
+void
+pdfsha256_init(PdfSha256Ctx *ctx)
+{
+    ctx->h[0] = 0x6a09e667u; ctx->h[1] = 0xbb67ae85u;
+    ctx->h[2] = 0x3c6ef372u; ctx->h[3] = 0xa54ff53au;
+    ctx->h[4] = 0x510e527fu; ctx->h[5] = 0x9b05688cu;
+    ctx->h[6] = 0x1f83d9abu; ctx->h[7] = 0x5be0cd19u;
+    ctx->len = 0;
+    ctx->buflen = 0;
+}
+
+void
+pdfsha256_update(PdfSha256Ctx *ctx, const u8 *data, u32 len)
+{
+    ctx->len += len;
+    if (ctx->buflen != 0) {
+        u32 need = 64 - ctx->buflen;
+
+        if (len < need) {
+            memcpy(ctx->buf + ctx->buflen, data, len);
+            ctx->buflen += len;
+            return;
+        }
+        memcpy(ctx->buf + ctx->buflen, data, need);
+        sha256_block(ctx, ctx->buf);
+        ctx->buflen = 0;
+        data += need;
+        len -= need;
+    }
+    while (len >= 64) {
+        sha256_block(ctx, data);
+        data += 64;
+        len -= 64;
+    }
+    if (len != 0) {
+        memcpy(ctx->buf, data, len);
+        ctx->buflen = len;
+    }
+}
+
+void
+pdfsha256_final(PdfSha256Ctx *ctx, u8 out[32])
+{
+    u64 bits = ctx->len * 8;
+    u8 pad[72];
+    u32 padlen;
+    int i;
+
+    memset(pad, 0, sizeof pad);
+    pad[0] = 0x80;
+    padlen = (ctx->buflen < 56) ? (56 - ctx->buflen)
+                                : (120 - ctx->buflen);
+    st64be(pad + padlen, bits);
+    pdfsha256_update(ctx, pad, padlen + 8);
+    for (i = 0; i < 8; i++) {
+        st32be(out + i * 4, ctx->h[i]);
+    }
+}
+
+void
+pdfsha256(const u8 *data, u32 len, u8 out[32])
+{
+    PdfSha256Ctx ctx;
+
+    pdfsha256_init(&ctx);
+    pdfsha256_update(&ctx, data, len);
+    pdfsha256_final(&ctx, out);
+}
+
+/* --- SHA-384 / SHA-512 (FIPS 180-4) ------------------------------------ */
+
+static const u64 sha512_k[80] = {
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL,
+    0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+    0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL, 0x12835b0145706fbeULL,
+    0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL,
+    0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+    0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL,
+    0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL,
+    0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+    0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL,
+    0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL,
+    0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+    0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL, 0xd69906245565a910ULL,
+    0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL,
+    0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+    0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL,
+    0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL,
+    0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
+    0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+    0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL,
+    0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL,
+    0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+    0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
+};
+
+static void
+sha512_block(PdfSha512Ctx *ctx, const u8 *p)
+{
+    u64 w[80], a, b, c, d, e, f, g, h;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ld64be(p + i * 8);
+    }
+    for (i = 16; i < 80; i++) {
+        u64 s0 = ror64(w[i - 15], 1) ^ ror64(w[i - 15], 8) ^
+                 (w[i - 15] >> 7);
+        u64 s1 = ror64(w[i - 2], 19) ^ ror64(w[i - 2], 61) ^
+                 (w[i - 2] >> 6);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = ctx->h[0]; b = ctx->h[1]; c = ctx->h[2]; d = ctx->h[3];
+    e = ctx->h[4]; f = ctx->h[5]; g = ctx->h[6]; h = ctx->h[7];
+    for (i = 0; i < 80; i++) {
+        u64 s1 = ror64(e, 14) ^ ror64(e, 18) ^ ror64(e, 41);
+        u64 ch = (e & f) ^ (~e & g);
+        u64 t1 = h + s1 + ch + sha512_k[i] + w[i];
+        u64 s0 = ror64(a, 28) ^ ror64(a, 34) ^ ror64(a, 39);
+        u64 maj = (a & b) ^ (a & c) ^ (b & c);
+        u64 t2 = s0 + maj;
+
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d;
+    ctx->h[4] += e; ctx->h[5] += f; ctx->h[6] += g; ctx->h[7] += h;
+}
+
+void
+pdfsha384_init(PdfSha512Ctx *ctx)
+{
+    ctx->h[0] = 0xcbbb9d5dc1059ed8ULL; ctx->h[1] = 0x629a292a367cd507ULL;
+    ctx->h[2] = 0x9159015a3070dd17ULL; ctx->h[3] = 0x152fecd8f70e5939ULL;
+    ctx->h[4] = 0x67332667ffc00b31ULL; ctx->h[5] = 0x8eb44a8768581511ULL;
+    ctx->h[6] = 0xdb0c2e0d64f98fa7ULL; ctx->h[7] = 0x47b5481dbefa4fa4ULL;
+    ctx->len = 0;
+    ctx->buflen = 0;
+}
+
+void
+pdfsha512_init(PdfSha512Ctx *ctx)
+{
+    ctx->h[0] = 0x6a09e667f3bcc908ULL; ctx->h[1] = 0xbb67ae8584caa73bULL;
+    ctx->h[2] = 0x3c6ef372fe94f82bULL; ctx->h[3] = 0xa54ff53a5f1d36f1ULL;
+    ctx->h[4] = 0x510e527fade682d1ULL; ctx->h[5] = 0x9b05688c2b3e6c1fULL;
+    ctx->h[6] = 0x1f83d9abfb41bd6bULL; ctx->h[7] = 0x5be0cd19137e2179ULL;
+    ctx->len = 0;
+    ctx->buflen = 0;
+}
+
+void
+pdfsha512_update(PdfSha512Ctx *ctx, const u8 *data, u32 len)
+{
+    ctx->len += len;
+    if (ctx->buflen != 0) {
+        u32 need = 128 - ctx->buflen;
+
+        if (len < need) {
+            memcpy(ctx->buf + ctx->buflen, data, len);
+            ctx->buflen += len;
+            return;
+        }
+        memcpy(ctx->buf + ctx->buflen, data, need);
+        sha512_block(ctx, ctx->buf);
+        ctx->buflen = 0;
+        data += need;
+        len -= need;
+    }
+    while (len >= 128) {
+        sha512_block(ctx, data);
+        data += 128;
+        len -= 128;
+    }
+    if (len != 0) {
+        memcpy(ctx->buf, data, len);
+        ctx->buflen = len;
+    }
+}
+
+/* The length field is 128 bits; we only ever hash small buffers, so
+   the top 64 bits are always zero.                                    */
+static void
+sha512_finish(PdfSha512Ctx *ctx, u8 *out, int words)
+{
+    u64 bits = ctx->len * 8;
+    u8 pad[144];
+    u32 padlen;
+    int i;
+
+    memset(pad, 0, sizeof pad);
+    pad[0] = 0x80;
+    padlen = (ctx->buflen < 112) ? (112 - ctx->buflen)
+                                 : (240 - ctx->buflen);
+    st64be(pad + padlen + 8, bits);
+    pdfsha512_update(ctx, pad, padlen + 16);
+    for (i = 0; i < words; i++) {
+        st64be(out + i * 8, ctx->h[i]);
+    }
+}
+
+void
+pdfsha384_final(PdfSha512Ctx *ctx, u8 out[48])
+{
+    sha512_finish(ctx, out, 6);
+}
+
+void
+pdfsha512_final(PdfSha512Ctx *ctx, u8 out[64])
+{
+    sha512_finish(ctx, out, 8);
+}
+
+void
+pdfsha384(const u8 *data, u32 len, u8 out[48])
+{
+    PdfSha512Ctx ctx;
+
+    pdfsha384_init(&ctx);
+    pdfsha512_update(&ctx, data, len);
+    pdfsha384_final(&ctx, out);
+}
+
+void
+pdfsha512(const u8 *data, u32 len, u8 out[64])
+{
+    PdfSha512Ctx ctx;
+
+    pdfsha512_init(&ctx);
+    pdfsha512_update(&ctx, data, len);
+    pdfsha512_final(&ctx, out);
+}
+
+/* --- RC4 --------------------------------------------------------------- */
+
+void
+pdfrc4(const u8 *key, u32 keylen, const u8 *in, u32 len, u8 *out)
+{
+    u8 s[256];
+    u32 i, x = 0, y = 0;
+
+    if (keylen == 0) {
+        if (out != in) {
+            memcpy(out, in, len);
+        }
+        return;
+    }
+    for (i = 0; i < 256; i++) {
+        s[i] = (u8) i;
+    }
+    for (i = 0; i < 256; i++) {
+        u8 t;
+
+        y = (y + s[i] + key[i % keylen]) & 0xFF;
+        t = s[i];
+        s[i] = s[y];
+        s[y] = t;
+    }
+    x = 0;
+    y = 0;
+    for (i = 0; i < len; i++) {
+        u8 t;
+
+        x = (x + 1) & 0xFF;
+        y = (y + s[x]) & 0xFF;
+        t = s[x];
+        s[x] = s[y];
+        s[y] = t;
+        out[i] = (u8) (in[i] ^ s[(s[x] + s[y]) & 0xFF]);
+    }
+}
+
+/* --- AES (FIPS 197) ----------------------------------------------------- */
+
+static const u8 aes_sbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+
+static const u8 aes_isbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+
+static const u8 aes_rcon[11] = {
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36
+};
+
+static u8
+xtime(u8 x)
+{
+    return (u8) ((x << 1) ^ ((x & 0x80) ? 0x1B : 0x00));
+}
+
+/* multiply in GF(2^8) - only the small constants the cipher needs    */
+static u8
+gmul(u8 a, u8 b)
+{
+    u8 r = 0;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if (b & 1) {
+            r ^= a;
+        }
+        a = xtime(a);
+        b >>= 1;
+    }
+    return r;
+}
+
+int
+pdfaes_setkey(PdfAesKey *ks, const u8 *key, u32 keylen)
+{
+    u32 nk, i, total;
+
+    if (keylen == 16) {
+        nk = 4; ks->nr = 10;
+    } else if (keylen == 24) {
+        nk = 6; ks->nr = 12;
+    } else if (keylen == 32) {
+        nk = 8; ks->nr = 14;
+    } else {
+        return PDF_E_UNSUP;
+    }
+    for (i = 0; i < nk; i++) {
+        ks->rk[i] = ld32be(key + i * 4);
+    }
+    total = 4u * ((u32) ks->nr + 1u);
+    for (i = nk; i < total; i++) {
+        u32 t = ks->rk[i - 1];
+
+        if (i % nk == 0) {
+            t = (t << 8) | (t >> 24);           /* RotWord            */
+            t = ((u32) aes_sbox[(t >> 24) & 0xFF] << 24) |
+                ((u32) aes_sbox[(t >> 16) & 0xFF] << 16) |
+                ((u32) aes_sbox[(t >> 8) & 0xFF] << 8) |
+                ((u32) aes_sbox[t & 0xFF]);
+            t ^= (u32) aes_rcon[i / nk] << 24;
+        } else if (nk > 6 && i % nk == 4) {
+            t = ((u32) aes_sbox[(t >> 24) & 0xFF] << 24) |
+                ((u32) aes_sbox[(t >> 16) & 0xFF] << 16) |
+                ((u32) aes_sbox[(t >> 8) & 0xFF] << 8) |
+                ((u32) aes_sbox[t & 0xFF]);
+        }
+        ks->rk[i] = ks->rk[i - nk] ^ t;
+    }
+    return PDF_OK;
+}
+
+static void
+add_round_key(u8 st[16], const u32 *rk)
+{
+    int c;
+
+    for (c = 0; c < 4; c++) {
+        u32 k = rk[c];
+
+        st[c * 4 + 0] ^= (u8) (k >> 24);
+        st[c * 4 + 1] ^= (u8) (k >> 16);
+        st[c * 4 + 2] ^= (u8) (k >> 8);
+        st[c * 4 + 3] ^= (u8) k;
+    }
+}
+
+void
+pdfaes_ecb_encrypt(const PdfAesKey *ks, const u8 in[16], u8 out[16])
+{
+    u8 st[16];
+    int r, c, i;
+
+    memcpy(st, in, 16);
+    add_round_key(st, ks->rk);
+    for (r = 1; r <= ks->nr; r++) {
+        u8 t[16];
+
+        for (i = 0; i < 16; i++) {
+            st[i] = aes_sbox[st[i]];
+        }
+        /* ShiftRows: row n rotates left by n (column-major state)    */
+        for (c = 0; c < 4; c++) {
+            t[c * 4 + 0] = st[c * 4 + 0];
+            t[c * 4 + 1] = st[((c + 1) & 3) * 4 + 1];
+            t[c * 4 + 2] = st[((c + 2) & 3) * 4 + 2];
+            t[c * 4 + 3] = st[((c + 3) & 3) * 4 + 3];
+        }
+        if (r != ks->nr) {
+            for (c = 0; c < 4; c++) {
+                u8 a0 = t[c * 4 + 0], a1 = t[c * 4 + 1];
+                u8 a2 = t[c * 4 + 2], a3 = t[c * 4 + 3];
+
+                st[c * 4 + 0] = (u8) (xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3);
+                st[c * 4 + 1] = (u8) (a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3);
+                st[c * 4 + 2] = (u8) (a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3));
+                st[c * 4 + 3] = (u8) ((xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3));
+            }
+        } else {
+            memcpy(st, t, 16);
+        }
+        add_round_key(st, ks->rk + r * 4);
+    }
+    memcpy(out, st, 16);
+}
+
+void
+pdfaes_ecb_decrypt(const PdfAesKey *ks, const u8 in[16], u8 out[16])
+{
+    u8 st[16];
+    int r, c, i;
+
+    memcpy(st, in, 16);
+    add_round_key(st, ks->rk + ks->nr * 4);
+    for (r = ks->nr; r >= 1; r--) {
+        u8 t[16];
+
+        /* InvShiftRows: row n rotates right by n                     */
+        for (c = 0; c < 4; c++) {
+            t[c * 4 + 0] = st[c * 4 + 0];
+            t[((c + 1) & 3) * 4 + 1] = st[c * 4 + 1];
+            t[((c + 2) & 3) * 4 + 2] = st[c * 4 + 2];
+            t[((c + 3) & 3) * 4 + 3] = st[c * 4 + 3];
+        }
+        for (i = 0; i < 16; i++) {
+            st[i] = aes_isbox[t[i]];
+        }
+        add_round_key(st, ks->rk + (r - 1) * 4);
+        if (r != 1) {
+            for (c = 0; c < 4; c++) {
+                u8 a0 = st[c * 4 + 0], a1 = st[c * 4 + 1];
+                u8 a2 = st[c * 4 + 2], a3 = st[c * 4 + 3];
+
+                st[c * 4 + 0] = (u8) (gmul(a0, 14) ^ gmul(a1, 11) ^
+                                      gmul(a2, 13) ^ gmul(a3, 9));
+                st[c * 4 + 1] = (u8) (gmul(a0, 9) ^ gmul(a1, 14) ^
+                                      gmul(a2, 11) ^ gmul(a3, 13));
+                st[c * 4 + 2] = (u8) (gmul(a0, 13) ^ gmul(a1, 9) ^
+                                      gmul(a2, 14) ^ gmul(a3, 11));
+                st[c * 4 + 3] = (u8) (gmul(a0, 11) ^ gmul(a1, 13) ^
+                                      gmul(a2, 9) ^ gmul(a3, 14));
+            }
+        }
+    }
+    memcpy(out, st, 16);
+}
+
+int
+pdfaes_cbc_decrypt_nopad(const u8 *key, u32 keylen, const u8 iv[16],
+                         const u8 *in, u32 len, u8 *out)
+{
+    PdfAesKey ks;
+    u8 chain[16], next[16], blk[16];
+    u32 off;
+    int e, i;
+
+    if ((len & 15u) != 0) {
+        return PDF_E_DATA;
+    }
+    e = pdfaes_setkey(&ks, key, keylen);
+    if (e != PDF_OK) {
+        return e;
+    }
+    memcpy(chain, iv, 16);
+    for (off = 0; off < len; off += 16) {
+        memcpy(next, in + off, 16);         /* in may alias out       */
+        pdfaes_ecb_decrypt(&ks, next, blk);
+        for (i = 0; i < 16; i++) {
+            out[off + i] = (u8) (blk[i] ^ chain[i]);
+        }
+        memcpy(chain, next, 16);
+    }
+    return PDF_OK;
+}
+
+int
+pdfaes_cbc_decrypt(const u8 *key, u32 keylen, const u8 *in, u32 len,
+                   u8 *out, u32 *outlen)
+{
+    u8 iv[16];
+    u32 body;
+    int e;
+
+    *outlen = 0;
+    if (len == 0) {
+        return PDF_OK;
+    }
+    if (len < 16 || ((len - 16) & 15u) != 0) {
+        return PDF_E_DATA;
+    }
+    memcpy(iv, in, 16);
+    body = len - 16;
+    if (body == 0) {
+        return PDF_OK;                      /* IV only: empty string  */
+    }
+    e = pdfaes_cbc_decrypt_nopad(key, keylen, iv, in + 16, body, out);
+    if (e != PDF_OK) {
+        return e;
+    }
+    /* strip PKCS#5 padding, but only if it really is padding: a
+       producer that gets this wrong should still give readable data  */
+    {
+        u8 pad = out[body - 1];
+
+        if (pad >= 1 && pad <= 16 && (u32) pad <= body) {
+            u32 i;
+            int good = 1;
+
+            for (i = 0; i < pad; i++) {
+                if (out[body - 1 - i] != pad) {
+                    good = 0;
+                    break;
+                }
+            }
+            if (good) {
+                body -= pad;
+            }
+        }
+    }
+    *outlen = body;
+    return PDF_OK;
+}
+
+/* CBC encrypt, needed only by the R6 hardened hash (Algorithm 2.B).  */
+static int
+aes_cbc_encrypt_nopad(const u8 *key, u32 keylen, const u8 iv[16],
+                      const u8 *in, u32 len, u8 *out)
+{
+    PdfAesKey ks;
+    u8 chain[16], blk[16];
+    u32 off;
+    int e, i;
+
+    if ((len & 15u) != 0) {
+        return PDF_E_DATA;
+    }
+    e = pdfaes_setkey(&ks, key, keylen);
+    if (e != PDF_OK) {
+        return e;
+    }
+    memcpy(chain, iv, 16);
+    for (off = 0; off < len; off += 16) {
+        for (i = 0; i < 16; i++) {
+            blk[i] = (u8) (in[off + i] ^ chain[i]);
+        }
+        pdfaes_ecb_encrypt(&ks, blk, out + off);
+        memcpy(chain, out + off, 16);
+    }
+    return PDF_OK;
+}
+
+/* --- standard security handler ------------------------------------------ */
+
+/* The padding string from ISO 32000-1, Algorithm 2 step (a).         */
+static const u8 pdf_pad[32] = {
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41,
+    0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+    0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,
+    0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A
+};
+
+/* Algorithm 2: the file key for an empty user password, R2-4.        */
+static void
+key_r234(PdfCrypt *c, const u8 *o, s32 p, const u8 *id0, u32 id0len,
+         int encrypt_metadata)
+{
+    PdfMd5Ctx md;
+    u8 digest[16], pbuf[4];
+    int i;
+
+    pdfmd5_init(&md);
+    pdfmd5_update(&md, pdf_pad, 32);        /* empty password padded  */
+    pdfmd5_update(&md, o, 32);
+    st32le(pbuf, (u32) p);
+    pdfmd5_update(&md, pbuf, 4);
+    if (id0len != 0) {
+        pdfmd5_update(&md, id0, id0len);
+    }
+    if (c->r >= 4 && !encrypt_metadata) {
+        static const u8 ff[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+
+        pdfmd5_update(&md, ff, 4);
+    }
+    pdfmd5_final(&md, digest);
+    if (c->r >= 3) {
+        for (i = 0; i < 50; i++) {
+            pdfmd5(digest, (u32) c->keylen, digest);
+        }
+    }
+    memcpy(c->key, digest, (u32) c->keylen);
+}
+
+/* Algorithm 6 / 4 / 5: does the empty user password check out?       */
+static int
+check_user_r234(const PdfCrypt *c, const u8 *u, u32 ulen,
+                const u8 *id0, u32 id0len)
+{
+    u8 want[32];
+
+    if (c->r == 2) {
+        pdfrc4(c->key, (u32) c->keylen, pdf_pad, 32, want);
+        return ulen >= 32 && same(want, u, 32);
+    } else {
+        PdfMd5Ctx md;
+        u8 digest[16];
+        int i;
+
+        pdfmd5_init(&md);
+        pdfmd5_update(&md, pdf_pad, 32);
+        if (id0len != 0) {
+            pdfmd5_update(&md, id0, id0len);
+        }
+        pdfmd5_final(&md, digest);
+        pdfrc4(c->key, (u32) c->keylen, digest, 16, want);
+        for (i = 1; i <= 19; i++) {
+            u8 k[16];
+            int j;
+
+            for (j = 0; j < c->keylen; j++) {
+                k[j] = (u8) (c->key[j] ^ i);
+            }
+            pdfrc4(k, (u32) c->keylen, want, 16, want);
+        }
+        /* only the first 16 bytes are meaningful; the rest is padding */
+        return ulen >= 16 && same(want, u, 16);
+    }
+}
+
+/* Algorithm 2.B: the R6 hardened hash.  For R5 this degenerates to a
+   single SHA-256, which the caller handles separately.              */
+static int
+hash_2b(const u8 *pwd, u32 pwdlen, const u8 *salt, u32 saltlen,
+        const u8 *udata, u32 udatalen, u8 out[32])
+{
+    u8 k[64], e[64 * 64], k1[64 * 64];
+    u32 klen = 32, k1len;
+    int round, err;
+
+    {
+        PdfSha256Ctx sh;
+
+        pdfsha256_init(&sh);
+        pdfsha256_update(&sh, pwd, pwdlen);
+        pdfsha256_update(&sh, salt, saltlen);
+        if (udatalen != 0) {
+            pdfsha256_update(&sh, udata, udatalen);
+        }
+        pdfsha256_final(&sh, k);
+    }
+
+    for (round = 0; ; round++) {
+        u32 one = pwdlen + klen + udatalen;
+        u32 i, sum = 0;
+
+        if (one * 64 > sizeof k1) {
+            return PDF_E_DATA;              /* absurd password length */
+        }
+        k1len = 0;
+        for (i = 0; i < 64; i++) {
+            memcpy(k1 + k1len, pwd, pwdlen);
+            k1len += pwdlen;
+            memcpy(k1 + k1len, k, klen);
+            k1len += klen;
+            if (udatalen != 0) {
+                memcpy(k1 + k1len, udata, udatalen);
+                k1len += udatalen;
+            }
+        }
+        err = aes_cbc_encrypt_nopad(k, 16, k + 16, k1, k1len, e);
+        if (err != PDF_OK) {
+            return err;
+        }
+        for (i = 0; i < 16; i++) {
+            sum += e[i];
+        }
+        switch (sum % 3) {
+        case 0:
+            pdfsha256(e, k1len, k);
+            klen = 32;
+            break;
+        case 1:
+            pdfsha384(e, k1len, k);
+            klen = 48;
+            break;
+        default:
+            pdfsha512(e, k1len, k);
+            klen = 64;
+            break;
+        }
+        /* at least 64 rounds, then stop once the last byte of E is
+           no greater than round number - 32                         */
+        if (round >= 63 && e[k1len - 1] <= (u8) (round + 1 - 32)) {
+            break;
+        }
+    }
+    memcpy(out, k, 32);
+    return PDF_OK;
+}
+
+/* Algorithms 2.A / 2.B: AES-256, R5 and R6.                          */
+static int
+key_r56(PdfCrypt *c, const u8 *u, u32 ulen, const u8 *ue, u32 uelen)
+{
+    const u8 *vsalt = u + 32;
+    const u8 *ksalt = u + 40;
+    u8 hash[32], ikey[32], zero[16];
+    int err;
+
+    if (ulen < 48) {
+        return PDF_E_DATA;
+    }
+    if (c->r == 5) {
+        PdfSha256Ctx sh;
+
+        pdfsha256_init(&sh);
+        pdfsha256_update(&sh, vsalt, 8);    /* empty password first   */
+        pdfsha256_final(&sh, hash);
+    } else {
+        err = hash_2b((const u8 *) "", 0, vsalt, 8, NULL, 0, hash);
+        if (err != PDF_OK) {
+            return err;
+        }
+    }
+    if (!same(hash, u, 32)) {
+        return PDF_E_ENCRYPTED;             /* a real password needed */
+    }
+    if (uelen < 32) {
+        return PDF_E_DATA;
+    }
+    if (c->r == 5) {
+        PdfSha256Ctx sh;
+
+        pdfsha256_init(&sh);
+        pdfsha256_update(&sh, ksalt, 8);
+        pdfsha256_final(&sh, ikey);
+    } else {
+        err = hash_2b((const u8 *) "", 0, ksalt, 8, NULL, 0, ikey);
+        if (err != PDF_OK) {
+            return err;
+        }
+    }
+    memset(zero, 0, sizeof zero);
+    err = pdfaes_cbc_decrypt_nopad(ikey, 32, zero, ue, 32, c->key);
+    if (err != PDF_OK) {
+        return err;
+    }
+    c->keylen = 32;
+    return PDF_OK;
+}
+
+int
+pdfcrypt_setup(PdfCrypt *c, int v, int r, int length, int cfm,
+               const u8 *o, u32 olen, const u8 *u, u32 ulen,
+               const u8 *oe, u32 oelen, const u8 *ue, u32 uelen,
+               s32 p, const u8 *id0, u32 id0len, int encrypt_metadata)
+{
+    (void) oe;
+    (void) oelen;
+
+    memset(c, 0, sizeof *c);
+    c->v = v;
+    c->r = r;
+    c->metadata = encrypt_metadata;
+
+    if (v == 5 || r == 5 || r == 6) {
+        int err;
+
+        if (r != 5 && r != 6) {
+            return PDF_E_UNSUP;
+        }
+        c->aes = PDFCRYPT_CFM_AESV3;
+        err = key_r56(c, u, ulen, ue, uelen);
+        if (err != PDF_OK) {
+            return err;
+        }
+        c->ok = 1;
+        return PDF_OK;
+    }
+
+    if (r < 2 || r > 4) {
+        return PDF_E_UNSUP;
+    }
+    if (v == 1) {
+        c->keylen = 5;
+        c->aes = PDFCRYPT_CFM_RC4;
+    } else if (v == 2 || v == 4) {
+        c->keylen = (length > 0) ? length / 8 : 5;
+        if (c->keylen < 5 || c->keylen > 16) {
+            return PDF_E_UNSUP;
+        }
+        c->aes = (v == 4) ? cfm : PDFCRYPT_CFM_RC4;
+    } else {
+        return PDF_E_UNSUP;                 /* /V 0 or 3              */
+    }
+    if (c->aes == PDFCRYPT_CFM_NONE || c->aes == PDFCRYPT_CFM_AESV3) {
+        return PDF_E_UNSUP;
+    }
+    if (c->aes == PDFCRYPT_CFM_AESV2) {
+        c->keylen = 16;                     /* AESV2 is always 128bit */
+    }
+    if (olen < 32 || ulen < 32) {
+        return PDF_E_DATA;
+    }
+    key_r234(c, o, p, id0, id0len, encrypt_metadata);
+    if (!check_user_r234(c, u, ulen, id0, id0len)) {
+        return PDF_E_ENCRYPTED;
+    }
+    c->ok = 1;
+    return PDF_OK;
+}
+
+/* Algorithm 1: the per-object key for R2-4.                          */
+static void
+object_key(const PdfCrypt *c, u32 objnum, u32 gennum, u8 *key, u32 *keylen)
+{
+    u8 buf[16 + 5 + 4], digest[16];
+    u32 n = (u32) c->keylen;
+    u32 len = 0;
+
+    memcpy(buf, c->key, n);
+    len = n;
+    buf[len++] = (u8) objnum;
+    buf[len++] = (u8) (objnum >> 8);
+    buf[len++] = (u8) (objnum >> 16);
+    buf[len++] = (u8) gennum;
+    buf[len++] = (u8) (gennum >> 8);
+    if (c->aes == PDFCRYPT_CFM_AESV2) {
+        buf[len++] = 0x73;                  /* "sAlT"                 */
+        buf[len++] = 0x41;
+        buf[len++] = 0x6C;
+        buf[len++] = 0x54;
+    }
+    pdfmd5(buf, len, digest);
+    *keylen = (n + 5 > 16) ? 16 : n + 5;
+    memcpy(key, digest, *keylen);
+}
+
+int
+pdfcrypt_decrypt(const PdfCrypt *c, u32 objnum, u32 gennum,
+                 const u8 *in, u32 len, u8 *out, u32 *outlen)
+{
+    u8 key[16];
+    u32 keylen;
+
+    *outlen = 0;
+    if (c == NULL || !c->ok) {
+        return PDF_E_DATA;
+    }
+    if (c->aes == PDFCRYPT_CFM_AESV3) {
+        return pdfaes_cbc_decrypt(c->key, 32, in, len, out, outlen);
+    }
+    object_key(c, objnum, gennum, key, &keylen);
+    if (c->aes == PDFCRYPT_CFM_AESV2) {
+        return pdfaes_cbc_decrypt(key, keylen, in, len, out, outlen);
+    }
+    pdfrc4(key, keylen, in, len, out);
+    *outlen = len;
+    return PDF_OK;
+}

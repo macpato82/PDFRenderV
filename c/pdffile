@@ -163,6 +163,31 @@ pdf_streamdata(PdfDoc *d, PdfObj *stm, PdfBuf *out, char stopflt[16])
     srclen = stm->u.stm.len;
     memset(tmp, 0, sizeof tmp);
 
+    /* Decrypt before any filter runs.  Cross-reference streams are
+       never encrypted (they have to be readable to find the /Encrypt
+       dictionary in the first place), and neither is /Metadata when
+       /EncryptMetadata is false.                                    */
+    if (d->crypt.ok && !pdf_isname(pdf_resolve(d,
+            pdf_dictget(stm, "Type")), "XRef") &&
+        !(d->crypt.metadata == 0 &&
+          pdf_isname(pdf_resolve(d, pdf_dictget(stm, "Type")),
+                     "Metadata"))) {
+        u32 outlen = 0;
+
+        if (pdfbuf_need(&tmp[0], srclen) != PDF_OK) {
+            return PDF_E_NOMEM;
+        }
+        if (pdfcrypt_decrypt(&d->crypt, stm->u.stm.onum, stm->u.stm.ogen,
+                             src, srclen, tmp[0].p, &outlen) != PDF_OK) {
+            pdfbuf_free(&tmp[0]);
+            return PDF_E_DATA;
+        }
+        tmp[0].len = outlen;
+        src = tmp[0].p;
+        srclen = outlen;
+        cur = 0;
+    }
+
     filter = pdf_resolve(d, pdf_dictget(stm, "Filter"));
     parms = pdf_resolve(d, pdf_dictget(stm, "DecodeParms"));
     if (parms == NULL) {
@@ -259,9 +284,164 @@ out:
     return err;
 }
 
+
+/* Read /Encrypt and set up the file key.  Called once, before any
+   object other than the cross-reference machinery and the /Encrypt
+   dictionary itself has been loaded - those must not be decrypted,
+   and are not, because d->crypt.ok is still zero while they load.  */
+static int
+setup_crypt(PdfDoc *d, PdfObj *encref)
+{
+    PdfObj *enc = pdf_resolve(d, encref);
+    PdfObj *o;
+    const u8 *ostr = NULL, *ustr = NULL, *oe = NULL, *ue = NULL;
+    u32 olen = 0, ulen = 0, oelen = 0, uelen = 0;
+    const u8 *id0 = NULL;
+    u32 id0len = 0;
+    int v = 0, r = 0, length = 0, cfm = PDFCRYPT_CFM_NONE;
+    int encmeta = 1;
+    s32 p = 0;
+
+    if (enc == NULL || enc->type != PDF_DICT) {
+        return PDF_E_ENCRYPTED;
+    }
+    if (!pdf_isname(pdf_resolve(d, pdf_dictget(enc, "Filter")), "Standard")) {
+        return PDF_E_UNSUP;         /* a third-party security handler */
+    }
+    v = pdfobj_int_of(pdf_resolve(d, pdf_dictget(enc, "V")));
+    r = pdfobj_int_of(pdf_resolve(d, pdf_dictget(enc, "R")));
+    length = pdfobj_int_of(pdf_resolve(d, pdf_dictget(enc, "Length")));
+    p = pdfobj_int_of(pdf_resolve(d, pdf_dictget(enc, "P")));
+    o = pdf_resolve(d, pdf_dictget(enc, "EncryptMetadata"));
+    if (o != NULL && o->type == PDF_BOOL) {
+        encmeta = o->u.i != 0;
+    }
+
+    o = pdf_resolve(d, pdf_dictget(enc, "O"));
+    if (o != NULL && o->type == PDF_STRING) {
+        ostr = o->u.str.p;
+        olen = o->u.str.len;
+    }
+    o = pdf_resolve(d, pdf_dictget(enc, "U"));
+    if (o != NULL && o->type == PDF_STRING) {
+        ustr = o->u.str.p;
+        ulen = o->u.str.len;
+    }
+    o = pdf_resolve(d, pdf_dictget(enc, "OE"));
+    if (o != NULL && o->type == PDF_STRING) {
+        oe = o->u.str.p;
+        oelen = o->u.str.len;
+    }
+    o = pdf_resolve(d, pdf_dictget(enc, "UE"));
+    if (o != NULL && o->type == PDF_STRING) {
+        ue = o->u.str.p;
+        uelen = o->u.str.len;
+    }
+    if (ostr == NULL || ustr == NULL) {
+        return PDF_E_DATA;
+    }
+
+    /* /V 4 and 5 name a crypt filter; the method lives in /CF.  We
+       follow /StmF - a file whose strings and streams use different
+       methods is legal but has never been seen in the wild.        */
+    if (v >= 4) {
+        PdfObj *cf = pdf_resolve(d, pdf_dictget(enc, "CF"));
+        PdfObj *stmf = pdf_resolve(d, pdf_dictget(enc, "StmF"));
+        const char *nm = "StdCF";
+
+        if (stmf != NULL && stmf->type == PDF_NAME) {
+            nm = (const char *) stmf->u.str.p;
+        }
+        if (cf != NULL && cf->type == PDF_DICT) {
+            PdfObj *f = pdf_resolve(d, pdf_dictget(cf, nm));
+            PdfObj *m = f ? pdf_resolve(d, pdf_dictget(f, "CFM")) : NULL;
+
+            if (pdf_isname(m, "V2")) {
+                cfm = PDFCRYPT_CFM_RC4;
+            } else if (pdf_isname(m, "AESV2")) {
+                cfm = PDFCRYPT_CFM_AESV2;
+            } else if (pdf_isname(m, "AESV3")) {
+                cfm = PDFCRYPT_CFM_AESV3;
+            }
+            if (f != NULL) {
+                PdfObj *cl = pdf_resolve(d, pdf_dictget(f, "Length"));
+
+                if (cl != NULL) {
+                    int n = pdfobj_int_of(cl);
+
+                    /* /CF /Length is in bytes in some files, bits in
+                       others; both appear in the wild               */
+                    length = (n <= 40) ? n * 8 : n;
+                }
+            }
+        }
+    }
+
+    o = pdf_dictget(d->trailer, "ID");
+    if (o != NULL && o->type == PDF_ARRAY) {
+        PdfObj *e = pdf_arrget(o, 0);
+
+        if (e != NULL && e->type == PDF_STRING) {
+            id0 = e->u.str.p;
+            id0len = e->u.str.len;
+        }
+    }
+
+    return pdfcrypt_setup(&d->crypt, v, r, length, cfm,
+                          ostr, olen, ustr, ulen, oe, oelen, ue, uelen,
+                          p, id0, id0len, encmeta);
+}
+
 /* --- object loading ------------------------------------------------- */
 
 static PdfObj *load_from_objstm(PdfDoc *d, u32 num, u32 stmnum, u32 idx);
+
+
+/* --- decryption -------------------------------------------------------
+
+   Strings are decrypted in place as their containing indirect object is
+   loaded; streams are decrypted in pdf_streamdata, which is the only
+   place their bytes are copied out of the caller's buffer.  Objects
+   that live inside an object stream are never separately encrypted -
+   the container was decrypted as a whole - so only load_at_offset
+   calls this.                                                         */
+static void
+decrypt_strings(PdfDoc *d, PdfObj *o, u32 num, u32 gen, int depth)
+{
+    u32 i;
+
+    if (o == NULL || depth > 32) {
+        return;
+    }
+    switch (o->type) {
+    case PDF_STRING:
+        if (o->u.str.len != 0) {
+            u32 outlen = 0;
+
+            if (pdfcrypt_decrypt(&d->crypt, num, gen, o->u.str.p,
+                                 o->u.str.len, o->u.str.p,
+                                 &outlen) == PDF_OK) {
+                o->u.str.len = outlen;
+            }
+        }
+        break;
+    case PDF_ARRAY:
+        for (i = 0; i < o->u.arr.n; i++) {
+            decrypt_strings(d, o->u.arr.v[i], num, gen, depth + 1);
+        }
+        break;
+    case PDF_DICT:
+        for (i = 0; i < o->u.dict.n; i++) {
+            decrypt_strings(d, o->u.dict.e[i].val, num, gen, depth + 1);
+        }
+        break;
+    case PDF_STREAM:
+        decrypt_strings(d, o->u.stm.dict, num, gen, depth + 1);
+        break;
+    default:
+        break;
+    }
+}
 
 static PdfObj *
 load_at_offset(PdfDoc *d, u32 num, u32 off)
@@ -304,6 +484,8 @@ load_at_offset(PdfDoc *d, u32 num, u32 off)
             }
             s->u.stm.dict = o;
             s->u.stm.off = lx.pos;
+            s->u.stm.onum = n2;         /* for the per-object key   */
+            s->u.stm.ogen = (u16) g2;
             lenobj = pdf_resolve(d, pdf_dictget(o, "Length"));
             s->u.stm.len = lenobj ? (u32) pdfobj_int_of(lenobj) : 0;
             stream_fixlen(d, s);
@@ -312,6 +494,9 @@ load_at_offset(PdfDoc *d, u32 num, u32 off)
         lx.pos = save;
     }
     (void) num;
+    if (o != NULL && d->crypt.ok) {
+        decrypt_strings(d, o, n2, g2, 0);
+    }
     return o;
 }
 
@@ -765,9 +950,15 @@ pdf_open(PdfDoc **docp, const u8 *buf, u32 len)
         }
     }
 
-    if (pdf_dictget(d->trailer, "Encrypt")) {
-        err = PDF_E_ENCRYPTED;
-        goto fail;
+    {
+        PdfObj *encref = pdf_dictget(d->trailer, "Encrypt");
+
+        if (encref != NULL) {
+            err = setup_crypt(d, encref);
+            if (err != PDF_OK) {
+                goto fail;
+            }
+        }
     }
     d->root = pdf_resolve(d, pdf_dictget(d->trailer, "Root"));
     if (d->root == NULL || d->root->type != PDF_DICT) {

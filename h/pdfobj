@@ -53,7 +53,8 @@ struct PdfObj {
         struct { u8 *p; u32 len; } str;
         struct { PdfObj **v; u16 n, cap; } arr;
         struct { PdfDictEnt *e; u16 n, cap; } dict;
-        struct { PdfObj *dict; u32 off, len; } stm;
+        struct { PdfObj *dict; u32 off, len;
+                 u32 onum; u16 ogen; } stm;   /* owner, for decryption */
         struct { u32 num; u16 gen; } ref;
     } u;
 };

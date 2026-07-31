@@ -42,7 +42,7 @@ error-identifiers:      err_Already("PDFRenderV is already loaded - *RMKill PDFR
                         err_BadPage("PDFRenderV: no such page"),
                         err_NoMem("PDFRenderV: out of memory"),
                         err_BadPDF("PDFRenderV: not a valid PDF"),
-                        err_Encrypted("PDFRenderV: encrypted PDFs are not supported"),
+                        err_Encrypted("PDFRenderV: this PDF needs a password"),
                         err_Unsup("PDFRenderV: PDF uses an unsupported feature"),
                         err_BadSWI("PDFRenderV: unknown SWI"),
                         err_Syntax("Syntax: *PDFToSprite <pdf> <page> <spritefile> [<width px>]")
