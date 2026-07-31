@@ -36,6 +36,7 @@
 #include "pdfdraw.h"
 #include "pdfpng.h"
 #include "pdfbmp.h"
+#include "pdfjpg.h"
 #include "pdfgif.h"
 #include "pdftiff.h"
 #include "pdfpsd.h"
@@ -267,6 +268,58 @@ measure_via_ifr(DocSlot *ds)
     return NULL;
 }
 
+/* Width and height out of a JPEG's frame header, for the cases
+   SpriteExtend will not look at.  Every SOF marker but the ones that
+   are not frames at all (DHT, DAC, the restart markers) carries the
+   same five-byte prefix: precision, height, width.                  */
+static int
+jpeg_frame_size(const u8 *d, u32 len, int *w, int *h)
+{
+    u32 p = 2;
+
+    if (d == NULL || len < 4 || d[0] != 0xFF || d[1] != 0xD8) {
+        return 0;
+    }
+    while (p + 4 <= len) {
+        u32 marker, seglen;
+
+        if (d[p] != 0xFF) {
+            return 0;
+        }
+        while (p < len && d[p] == 0xFF) {
+            p++;
+        }
+        if (p >= len) {
+            return 0;
+        }
+        marker = d[p++];
+        if (marker == 0xD9 || marker == 0xDA) {
+            return 0;                   /* no frame header before the scan */
+        }
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;
+        }
+        if (p + 2 > len) {
+            return 0;
+        }
+        seglen = ((u32) d[p] << 8) | d[p + 1];
+        if (seglen < 2 || p + seglen > len) {
+            return 0;
+        }
+        if (marker >= 0xC0 && marker <= 0xCF &&
+            marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+            if (seglen < 7) {
+                return 0;
+            }
+            *h = (int) (((u32) d[p + 3] << 8) | d[p + 4]);
+            *w = (int) (((u32) d[p + 5] << 8) | d[p + 6]);
+            return *w > 0 && *h > 0;
+        }
+        p += seglen;
+    }
+    return 0;
+}
+
 /* Image geometry, so PageSize can answer before anything is drawn.  */
 static _kernel_oserror *
 measure_doc(DocSlot *ds)
@@ -293,7 +346,16 @@ measure_doc(DocSlot *ds)
                 _swix(XJPEG_Info, _INR(0, 2) | _OUT(2) | _OUT(3),
                       1, ds->buf, ds->len, &w, &h);
             if (e != NULL) {
-                return e;
+                /* SpriteExtend refuses progressive JPEGs.  Its size is
+                   in the frame header either way, and we can plot it
+                   ourselves, so read that rather than reporting a
+                   failure - and never report ITS error, which is
+                   about a file it could not open and means nothing
+                   to someone who just opened a picture.            */
+                if (jpeg_frame_size(ds->buf, ds->len, &ds->w, &ds->h)) {
+                    return NULL;
+                }
+                return err_BadPDF;
             }
             ds->w = w;
             ds->h = h;
@@ -476,17 +538,34 @@ render_direct(PdfDoc *doc, u32 page, fix zoom)
    Norcroft internal error (cse_adconbase) in its common-subexpression
    pass, and smaller functions are clearer anyway.                    */
 
+static _kernel_oserror *plot_pixels(u32 *pix, int w, int h,
+                                    int dx, int dy, int dw, int dh);
+
 static _kernel_oserror *
 plot_jpeg(DocSlot *ds, int dx, int dy, int dw, int dh)
 {
     u32 scale[4];
+    _kernel_oserror *e;
 
     scale[0] = (u32) dw;
     scale[1] = (u32) dh;
     scale[2] = (u32) ds->w;
     scale[3] = (u32) ds->h;
-    return _swix(XJPEG_PlotScaled, _INR(0, 5),
-                 ds->buf, dx, dy, scale, ds->len, 0);
+    e = _swix(XJPEG_PlotScaled, _INR(0, 5),
+              ds->buf, dx, dy, scale, ds->len, 0);
+    if (e != NULL) {
+        /* SpriteExtend will not plot a progressive JPEG, and there is
+           no reason the user should see that as a failure when we
+           have a decoder of our own.                               */
+        int w = 0, h = 0;
+        u32 *pix = NULL;
+
+        if (pdfjpg_decode(ds->buf, ds->len, dw, dh, &w, &h, &pix) == PDF_OK) {
+            e = plot_pixels(pix, w, h, dx, dy, dw, dh);
+            free(pix);
+        }
+    }
+    return e;
 }
 
 /* A sprite FILE is a sprite area without its leading size word, so

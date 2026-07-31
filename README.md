@@ -47,6 +47,14 @@ own `c/pdfjpg` decoder if the OS refuses a file, so an older or
 stricter SpriteExtend still draws the page.  That fallback is slower
 and is not the tested path.
 
+**Progressive JPEGs** always take that fallback: SpriteExtend does not
+decode them at any version.  `c/pdfjpg` does - spectral selection and
+successive approximation, interleaved DC scans and single-component AC
+scans, with the whole frame's coefficients held until the last scan
+has been read, which is the one case where scaled decoding cannot save
+the memory.  Frames needing more than 24MB of coefficients are
+refused rather than attempted.
+
 RISC OS 5 otherwise - developed and tested on 5.31, and nothing here
 needs a call newer than RISC OS 3.5, though earlier RO5 releases have
 not been tried.  No other modules are needed.
@@ -152,7 +160,7 @@ binary, so N open documents do not give N identical icons.
 | Type | | Rendered by |
 |---|---|---|
 | PDF | &ADF | this engine |
-| JPEG | &C85 | SpriteExtend (`JPEG_PlotScaled`) |
+| JPEG | &C85 | SpriteExtend (`JPEG_PlotScaled`), `c/pdfjpg` when it refuses (progressive) |
 | PNG | &B60 | `c/pdfpng`, reusing our inflate and PNG predictors |
 | Sprite | &FF9 | `OS_SpriteOp 52`, mask honoured |
 | Draw | &AFF | `DrawFile_Render` |

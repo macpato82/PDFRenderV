@@ -21,7 +21,7 @@ CORE    := pdfflt pdfobj pdfcrypt pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng \
            pdfjbig2 pdfpage
 COREOBJ := $(addprefix obj/,$(addsuffix .o,$(CORE)))
 
-all: headers testflt testpdf testtext testjbig2
+all: headers testflt testpdf testtext testjbig2 testjpg
 
 headers:
 	@mkdir -p hostinc obj ojinc
@@ -53,14 +53,25 @@ testtext: testtext.c $(COREOBJ) $(OJOBJ)
 testjbig2: testjbig2.c obj/pdfjbig2.o
 	$(CC) $(CFLAGS) testjbig2.c obj/pdfjbig2.o -o $@
 
-vectors: mkvectors.py
+testjpg: testjpg.c obj/pdfjpg.o
+	$(CC) $(CFLAGS) testjpg.c obj/pdfjpg.o -o $@
+
+vectors: mkvectors.py mkjpgvec.py
 	python3 mkvectors.py
+	python3 mkjpgvec.py
 
 run: all vectors
 	./testflt
 	./testpdf
+	./testjpg jpgvec/base444.jpg jpgvec/base444.ppm \
+	          jpgvec/prog444.jpg jpgvec/prog444.ppm \
+	          jpgvec/prog444o.jpg jpgvec/prog444o.ppm \
+	          jpgvec/proglo444.jpg jpgvec/proglo444.ppm \
+	          jpgvec/progbig444.jpg jpgvec/progbig444.ppm \
+	          jpgvec/basegrey.jpg jpgvec/basegrey.ppm \
+	          jpgvec/proggrey.jpg jpgvec/proggrey.ppm
 
 clean:
-	rm -rf obj hostinc ojinc testflt testpdf testtext testjbig2 vectors
+	rm -rf obj hostinc ojinc testflt testpdf testtext testjbig2 testjpg vectors
 
 .PHONY: all headers run clean vectors

@@ -198,6 +198,10 @@ typedef struct {
     u8 *plane;               /* decoded samples at the chosen scale, MCU-
                                padded; malloc'd plane_w*plane_h bytes    */
     int plane_w, plane_h;
+    s16 *coef;              /* progressive only: every block's 64 coeffs,
+                               natural order, undequantised             */
+    int bw, bh;             /* blocks across/down, MCU-padded            */
+    int bwf, bhf;           /* blocks the component's own size needs     */
 } JpgComp;
 
 typedef struct {
@@ -221,6 +225,11 @@ typedef struct {
 
     int mcus_w, mcus_h;
     int scale;                      /* 0..3 -> block side 8,4,2,1         */
+
+    int progressive;                /* SOF2                               */
+    int ss, se, ah, al;             /* the current scan's spectral band
+                                       and successive-approximation bits  */
+    u32 eobrun;                     /* end-of-band run still to be served */
 } JpgCtx;
 
 static u32
@@ -288,6 +297,25 @@ getbit(JpgBits *br, int *err)
     b = (int) ((br->buf >> br->nbits) & 1u);
     *err = 0;
     return b;
+}
+
+/* n raw bits, most significant first, as an unsigned value.  Used for
+   the extension bits of an end-of-band run length.                     */
+static u32
+receive_bits(JpgBits *br, int n, int *err)
+{
+    u32 v = 0;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        int b = getbit(br, err);
+
+        if (*err) {
+            return 0;
+        }
+        v = (v << 1) | (u32) b;
+    }
+    return v;
 }
 
 /* Read a size-bit magnitude and sign-extend it per T.81 Figure F.12
@@ -561,6 +589,366 @@ decode_scan(JpgCtx *ctx, JpgBits *br)
     return PDF_OK;
 }
 
+
+/* --- progressive scans (T.81 G.1.2) --------------------------------------
+
+   A progressive JPEG sends the same coefficients over several scans:
+   first the high bits, then refinements, and the AC coefficients split
+   into bands.  Nothing can be turned into pixels until the last scan
+   has been read, so unlike the baseline path - which decodes a block
+   and immediately reduces it to samples - every block's coefficients
+   have to be kept.  They are held undequantised, in natural order, and
+   dequantised only in the final pass, because a refinement scan sets
+   individual bits of a coefficient and needs the raw value to do it.  */
+
+/* The first scan carrying a component's DC: a difference against the
+   running predictor, shifted up by the point transform.               */
+static int
+dc_first(JpgCtx *ctx, JpgBits *br, JpgComp *c, s16 *blk)
+{
+    const JpgHuff *dctab = &ctx->huffdc[c->td];
+    int err = 0, size;
+    s32 diff;
+
+    if (!dctab->present) {
+        return PDF_E_DATA;
+    }
+    size = huff_decode(br, dctab, &err);
+    if (err || size > 15) {
+        return PDF_E_DATA;
+    }
+    diff = size ? receive_extend(br, size, &err) : 0;
+    if (err) {
+        return PDF_E_DATA;
+    }
+    c->pred += diff;
+    if (c->pred > JPG_PRED_CLAMP) {
+        c->pred = JPG_PRED_CLAMP;
+    } else if (c->pred < -JPG_PRED_CLAMP) {
+        c->pred = -JPG_PRED_CLAMP;
+    }
+    {
+        /* a multiply, not a shift: c->pred is signed and shifting a
+           negative value left is undefined                          */
+        s64 v = c->pred * (s64) (1 << ctx->al);
+
+        if (v > 32767) {
+            v = 32767;
+        } else if (v < -32768) {
+            v = -32768;
+        }
+        blk[0] = (s16) v;
+    }
+    return PDF_OK;
+}
+
+/* Later DC scans send one bit per block, the next bit down.           */
+static int
+dc_refine(JpgCtx *ctx, JpgBits *br, s16 *blk)
+{
+    int err = 0;
+    int b = getbit(br, &err);
+
+    if (err) {
+        return PDF_E_DATA;
+    }
+    if (b) {
+        blk[0] = (s16) (blk[0] | (1 << ctx->al));
+    }
+    return PDF_OK;
+}
+
+/* The first scan carrying a band of AC coefficients.  Run/size coding
+   as in a baseline block, but an end-of-band code can stand for a run
+   of blocks whose band is entirely finished, not just this one.       */
+static int
+ac_first(JpgCtx *ctx, JpgBits *br, JpgComp *c, s16 *blk)
+{
+    const JpgHuff *actab = &ctx->huffac[c->ta];
+    int err = 0, k;
+
+    if (!actab->present) {
+        return PDF_E_DATA;
+    }
+    if (ctx->eobrun > 0) {
+        ctx->eobrun--;
+        return PDF_OK;
+    }
+    for (k = ctx->ss; k <= ctx->se; k++) {
+        int sym = huff_decode(br, actab, &err);
+        int r, size;
+
+        if (err) {
+            return PDF_E_DATA;
+        }
+        r = sym >> 4;
+        size = sym & 0xF;
+        if (size != 0) {
+            s32 v;
+
+            k += r;
+            if (k > ctx->se) {
+                return PDF_E_DATA;
+            }
+            v = receive_extend(br, size, &err);
+            if (err) {
+                return PDF_E_DATA;
+            }
+            blk[zigzag[k]] = (s16) (v * (1 << ctx->al));
+        } else if (r != 15) {
+            ctx->eobrun = 1u << r;
+            if (r) {
+                u32 extra = receive_bits(br, r, &err);
+
+                if (err) {
+                    return PDF_E_DATA;
+                }
+                ctx->eobrun += extra;
+            }
+            ctx->eobrun--;              /* this block is the first of them */
+            break;
+        } else {
+            k += 15;                    /* ZRL: sixteen zeroes, with k++   */
+        }
+    }
+    return PDF_OK;
+}
+
+/* A refinement scan over a band.  Every coefficient already known to
+   be non-zero gets a correction bit, in band order, interleaved with
+   the run/size codes that introduce newly non-zero ones - which is why
+   this cannot be written as a simple loop over coefficients.          */
+static int
+ac_refine(JpgCtx *ctx, JpgBits *br, JpgComp *c, s16 *blk)
+{
+    const JpgHuff *actab = &ctx->huffac[c->ta];
+    int p1 = 1 << ctx->al;
+    int m1 = -(1 << ctx->al);
+    int err = 0, k = ctx->ss;
+
+    if (!actab->present) {
+        return PDF_E_DATA;
+    }
+    if (ctx->eobrun == 0) {
+        for (; k <= ctx->se; k++) {
+            int sym = huff_decode(br, actab, &err);
+            int r, size, newval = 0;
+
+            if (err) {
+                return PDF_E_DATA;
+            }
+            r = sym >> 4;
+            size = sym & 0xF;
+            if (size != 0) {
+                if (size != 1) {
+                    return PDF_E_DATA;  /* only one new bit is meaningful  */
+                }
+                newval = getbit(br, &err) ? p1 : m1;
+                if (err) {
+                    return PDF_E_DATA;
+                }
+            } else if (r != 15) {
+                ctx->eobrun = 1u << r;
+                if (r) {
+                    u32 extra = receive_bits(br, r, &err);
+
+                    if (err) {
+                        return PDF_E_DATA;
+                    }
+                    ctx->eobrun += extra;
+                }
+                break;
+            }
+            /* Step over the coefficients that are already non-zero,
+               appending a correction bit to each, and over r that are
+               still zero; the one after those is the new coefficient. */
+            while (k <= ctx->se) {
+                s16 *cp = &blk[zigzag[k]];
+
+                if (*cp != 0) {
+                    int b = getbit(br, &err);
+
+                    if (err) {
+                        return PDF_E_DATA;
+                    }
+                    if (b && (*cp & p1) == 0) {
+                        *cp = (s16) (*cp >= 0 ? *cp + p1 : *cp + m1);
+                    }
+                } else {
+                    if (r == 0) {
+                        break;
+                    }
+                    r--;
+                }
+                k++;
+            }
+            if (newval != 0 && k <= ctx->se) {
+                blk[zigzag[k]] = (s16) newval;
+            }
+        }
+    }
+    if (ctx->eobrun > 0) {
+        /* inside an end-of-band run: no new coefficients, but the ones
+           already there still take their correction bits              */
+        for (; k <= ctx->se; k++) {
+            s16 *cp = &blk[zigzag[k]];
+
+            if (*cp != 0) {
+                int b = getbit(br, &err);
+
+                if (err) {
+                    return PDF_E_DATA;
+                }
+                if (b && (*cp & p1) == 0) {
+                    *cp = (s16) (*cp >= 0 ? *cp + p1 : *cp + m1);
+                }
+            }
+        }
+        ctx->eobrun--;
+    }
+    return PDF_OK;
+}
+
+static s16 *
+block_at(JpgComp *c, int bx, int by)
+{
+    return c->coef + ((u32) by * (u32) c->bw + (u32) bx) * 64u;
+}
+
+static void
+prog_restart(JpgCtx *ctx)
+{
+    int i;
+
+    for (i = 0; i < ctx->ncomp; i++) {
+        ctx->comp[i].pred = 0;
+    }
+    ctx->eobrun = 0;
+}
+
+/* One progressive scan.  A DC scan may cover several components and is
+   then in MCU order; an AC scan is always one component, and then the
+   unit is a single block and the grid is the component's own size
+   rather than the MCU-padded one.                                    */
+static int
+decode_scan_prog(JpgCtx *ctx, JpgBits *br)
+{
+    u32 unit = 0;
+    int err;
+
+    ctx->eobrun = 0;
+    if (ctx->ss == 0 && ctx->scan_ns > 1) {
+        int mx, my, j, bx, by;
+
+        for (my = 0; my < ctx->mcus_h; my++) {
+            for (mx = 0; mx < ctx->mcus_w; mx++) {
+                for (j = 0; j < ctx->scan_ns; j++) {
+                    JpgComp *c = &ctx->comp[ctx->scanorder[j]];
+
+                    for (by = 0; by < c->v; by++) {
+                        for (bx = 0; bx < c->h; bx++) {
+                            s16 *blk = block_at(c, mx * c->h + bx,
+                                                my * c->v + by);
+
+                            err = ctx->ah == 0 ? dc_first(ctx, br, c, blk)
+                                               : dc_refine(ctx, br, blk);
+                            if (err) {
+                                return err;
+                            }
+                        }
+                    }
+                }
+                unit++;
+                if (ctx->restart_interval > 0 &&
+                    unit % (u32) ctx->restart_interval == 0 &&
+                    !(my == ctx->mcus_h - 1 && mx == ctx->mcus_w - 1)) {
+                    err = restart_sync(br);
+                    if (err) {
+                        return err;
+                    }
+                    prog_restart(ctx);
+                }
+            }
+        }
+        return PDF_OK;
+    }
+    {
+        JpgComp *c = &ctx->comp[ctx->scanorder[0]];
+        int bx, by;
+
+        for (by = 0; by < c->bhf; by++) {
+            for (bx = 0; bx < c->bwf; bx++) {
+                s16 *blk = block_at(c, bx, by);
+
+                if (ctx->ss == 0) {
+                    err = ctx->ah == 0 ? dc_first(ctx, br, c, blk)
+                                       : dc_refine(ctx, br, blk);
+                } else {
+                    err = ctx->ah == 0 ? ac_first(ctx, br, c, blk)
+                                       : ac_refine(ctx, br, c, blk);
+                }
+                if (err) {
+                    return err;
+                }
+                unit++;
+                if (ctx->restart_interval > 0 &&
+                    unit % (u32) ctx->restart_interval == 0 &&
+                    !(by == c->bhf - 1 && bx == c->bwf - 1)) {
+                    err = restart_sync(br);
+                    if (err) {
+                        return err;
+                    }
+                    prog_restart(ctx);
+                }
+            }
+        }
+    }
+    return PDF_OK;
+}
+
+/* Every scan has been read: dequantise and transform.  Only the top-
+   left MxM corner of each block is dequantised, for the same reason
+   the baseline path only stores that corner - it is all the scaled
+   inverse transform reads.                                          */
+static int
+prog_to_planes(JpgCtx *ctx)
+{
+    int side = 8 >> ctx->scale;
+    int i, bx, by, k, r;
+    s64 coef[64];
+    u8 outblk[64];
+
+    for (i = 0; i < ctx->ncomp; i++) {
+        JpgComp *c = &ctx->comp[i];
+        const u16 *quant = ctx->quant[c->tq];
+
+        if (!ctx->quant_present[c->tq]) {
+            return PDF_E_DATA;
+        }
+        for (by = 0; by < c->bh; by++) {
+            for (bx = 0; bx < c->bw; bx++) {
+                const s16 *blk = block_at(c, bx, by);
+
+                memset(coef, 0, sizeof coef);
+                for (k = 0; k < 64; k++) {
+                    int pos = zigzag[k];
+
+                    if ((pos >> 3) < side && (pos & 7) < side &&
+                        blk[pos] != 0) {
+                        coef[pos] = (s64) blk[pos] * (s64) quant[k];
+                    }
+                }
+                idct_block(coef, side, outblk);
+                for (r = 0; r < side; r++) {
+                    memcpy(c->plane + (by * side + r) * c->plane_w +
+                           bx * side, outblk + r * side, (size_t) side);
+                }
+            }
+        }
+    }
+    return PDF_OK;
+}
+
 /* --- colour conversion ---------------------------------------------------- */
 
 static u32
@@ -825,12 +1213,15 @@ parse_dht(JpgCtx *ctx, const u8 *d, u32 len)
     return PDF_OK;
 }
 
-/* A single scan covering every frame component, interleaved in MCU
-   order, is the only structure supported - the near-universal case
-   for baseline JPEGs from scanners and PDF writers.  Ss/Se/Ah/Al are
-   checked as a defence-in-depth belt-and-braces: they should always
-   be 0/63/0/0 for a sequential (SOF0/SOF1) scan, and a stream where
-   they are not is treated as unsupported rather than guessed at.      */
+/* For a sequential frame the only structure supported is a single scan
+   covering every component, interleaved in MCU order - the
+   near-universal case for baseline JPEGs from scanners and PDF
+   writers - and Ss/Se/Ah/Al must then be 0/63/0/0, which is checked
+   rather than assumed.
+
+   A progressive frame is the opposite: many scans, each carrying part
+   of the coefficients, and every one of them names its spectral band
+   and which bits of it this scan holds.                              */
 static int
 parse_sos(JpgCtx *ctx, const u8 *d, u32 len)
 {
@@ -848,7 +1239,7 @@ parse_sos(JpgCtx *ctx, const u8 *d, u32 len)
     if (len != need) {
         return PDF_E_DATA;
     }
-    if (ns != ctx->ncomp) {
+    if (ns != ctx->ncomp && !ctx->progressive) {
         return PDF_E_UNSUP;          /* non-interleaved multi-scan image   */
     }
     for (j = 0; j < ns; j++) {
@@ -878,8 +1269,21 @@ parse_sos(JpgCtx *ctx, const u8 *d, u32 len)
         int se = d[2 + 2 * ns];
         int ahal = d[3 + 2 * ns];
 
-        if (ss != 0 || se != 63 || ahal != 0) {
-            return PDF_E_UNSUP;
+        if (!ctx->progressive) {
+            if (ss != 0 || se != 63 || ahal != 0) {
+                return PDF_E_UNSUP;
+            }
+        } else {
+            if (ss > 63 || se > 63 || se < ss ||
+                (ss == 0 && se != 0) ||
+                (ss != 0 && ns != 1) ||       /* an AC scan is one component */
+                (ahal >> 4) > 13 || (ahal & 0xF) > 13) {
+                return PDF_E_DATA;
+            }
+            ctx->ss = ss;
+            ctx->se = se;
+            ctx->ah = ahal >> 4;
+            ctx->al = ahal & 0xF;
         }
     }
     ctx->scan_ns = ns;
@@ -893,12 +1297,11 @@ parse_sos(JpgCtx *ctx, const u8 *d, u32 len)
    pdfjpx_decode uses for its wavelet reduction levels, just over four
    discrete steps instead of a continuous halving.                     */
 static int
-decode_after_sos(JpgCtx *ctx, const u8 *src, u32 srclen, u32 pos,
-                 int maxw, int maxh, int *wp, int *hp, u32 **pixp)
+setup_planes(JpgCtx *ctx, int maxw, int maxh, int *outwp, int *outhp)
 {
-    JpgBits br;
-    int err, i, side, outw, outh;
+    int i, side, outw, outh;
     int mw, mh;
+    u32 coefbytes = 0;
 
     ctx->scale = 0;
     if (maxw > 0 && maxh > 0) {
@@ -927,6 +1330,14 @@ decode_after_sos(JpgCtx *ctx, const u8 *src, u32 srclen, u32 pos,
         int bw = mw * c->h;
         int bh = mh * c->v;
 
+        c->bw = bw;
+        c->bh = bh;
+        /* A scan carrying one component alone covers the blocks that
+           component's own size needs, not the MCU-padded grid.      */
+        c->bwf = (((ctx->width * c->h + ctx->hmax - 1) / ctx->hmax) + 7) / 8;
+        c->bhf = (((ctx->height * c->v + ctx->vmax - 1) / ctx->vmax) + 7) / 8;
+        if (c->bwf > bw) { c->bwf = bw; }
+        if (c->bhf > bh) { c->bhf = bh; }
         c->plane_w = bw * side;
         c->plane_h = bh * side;
         c->plane = malloc((size_t) c->plane_w * (size_t) c->plane_h);
@@ -934,23 +1345,30 @@ decode_after_sos(JpgCtx *ctx, const u8 *src, u32 srclen, u32 pos,
             return PDF_E_NOMEM;
         }
         c->pred = 0;
+        if (ctx->progressive) {
+            u32 nblk = (u32) bw * (u32) bh;
+
+            /* Progressive coefficients cannot be turned into pixels
+               until the last scan has been read, so the whole frame
+               has to be held at once: 128 bytes a block, every
+               component.  Scaled decoding does not help - the scale
+               only applies to the transform at the end - so this is
+               capped rather than left to the allocator.  24MB is
+               several times any progressive JPEG in the wild and
+               still leaves a RISC OS machine standing.            */
+            coefbytes += (u32) nblk * 64u * (u32) sizeof *c->coef;
+            if (nblk > 4000000u || coefbytes > 24u * 1024u * 1024u) {
+                return PDF_E_LIMIT;
+            }
+            c->coef = calloc(nblk, 64u * sizeof *c->coef);
+            if (c->coef == NULL) {
+                return PDF_E_NOMEM;
+            }
+        }
     }
 
-    br.p = src + pos;
-    br.end = src + srclen;
-    br.buf = 0;
-    br.nbits = 0;
-
-    err = decode_scan(ctx, &br);
-    if (err) {
-        return err;
-    }
-    err = build_output(ctx, outw, outh, pixp);
-    if (err) {
-        return err;
-    }
-    *wp = outw;
-    *hp = outh;
+    *outwp = outw;
+    *outhp = outh;
     return PDF_OK;
 }
 
@@ -963,6 +1381,7 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
     JpgCtx ctx;
     u32 pos;
     int err = PDF_E_DATA, i;
+    int setup_done = 0, sawscan = 0, outw = 0, outh = 0;
 
     *wp = *hp = 0;
     *pixp = NULL;
@@ -992,8 +1411,21 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
         marker = src[pos];
         pos++;
 
-        if (marker == 0xD9) {              /* EOI reached with no scan   */
-            err = PDF_E_DATA;
+        if (marker == 0xD9) {              /* EOI                        */
+            if (ctx.progressive && sawscan) {
+                err = prog_to_planes(&ctx);
+                if (err) {
+                    goto out;
+                }
+                err = build_output(&ctx, outw, outh, pixp);
+                if (err) {
+                    goto out;
+                }
+                *wp = outw;
+                *hp = outh;
+                goto out;
+            }
+            err = PDF_E_DATA;              /* no scan at all             */
             goto out;
         }
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
@@ -1013,18 +1445,19 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
 
         if (marker >= 0xC0 && marker <= 0xCF &&
             marker != 0xC4 && marker != 0xCC) {
-            if (marker == 0xC0 || marker == 0xC1) {
+            if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
                 if (ctx.have_sof) {
                     err = PDF_E_DATA;
                     goto out;
                 }
+                ctx.progressive = marker == 0xC2;
                 err = parse_sof(&ctx, segdata, datalen);
                 if (err) {
                     goto out;
                 }
             } else {
-                err = PDF_E_UNSUP;           /* SOF2 (progressive) and all
-                                                 other SOF variants        */
+                err = PDF_E_UNSUP;           /* arithmetic coding, lossless
+                                                and hierarchical frames    */
                 goto out;
             }
         } else if (marker == 0xC4) {
@@ -1046,6 +1479,8 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
         } else if (marker >= 0xE0 && marker <= 0xEF) {
             parse_app(&ctx, (int) marker, segdata, datalen);
         } else if (marker == 0xDA) {
+            JpgBits br;
+
             if (!ctx.have_sof) {
                 err = PDF_E_DATA;
                 goto out;
@@ -1055,9 +1490,39 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
                 goto out;
             }
             pos += seglen;
-            err = decode_after_sos(&ctx, src, srclen, pos, maxw, maxh,
-                                   wp, hp, pixp);
-            goto out;
+            if (!setup_done) {
+                err = setup_planes(&ctx, maxw, maxh, &outw, &outh);
+                if (err) {
+                    goto out;
+                }
+                setup_done = 1;
+            }
+            br.p = src + pos;
+            br.end = src + srclen;
+            br.buf = 0;
+            br.nbits = 0;
+
+            if (!ctx.progressive) {
+                err = decode_scan(&ctx, &br);
+                if (err) {
+                    goto out;
+                }
+                err = build_output(&ctx, outw, outh, pixp);
+                if (err) {
+                    goto out;
+                }
+                *wp = outw;
+                *hp = outh;
+                goto out;
+            }
+            err = decode_scan_prog(&ctx, &br);
+            if (err) {
+                goto out;
+            }
+            /* the scan ends where the next marker begins               */
+            pos = (u32) (br.p - src);
+            sawscan = 1;
+            continue;
         }
         /* COM, DAC and any other length-prefixed marker: skip it        */
         pos += seglen;
@@ -1066,6 +1531,7 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
 out:
     for (i = 0; i < JPG_MAXCOMP; i++) {
         free(ctx.comp[i].plane);
+        free(ctx.comp[i].coef);
     }
     if (err) {
         *wp = *hp = 0;
