@@ -1,0 +1,46 @@
+Viewer
+======
+
+A native document previewer for RISC OS 5.  It opens PDF, JPEG, PNG,
+Sprite and Draw files in the same window, with the same zoom, text
+selection and printing, so one viewer covers everything.
+
+The application is called !Viewer because it is no longer just about
+PDFs; the module inside it is still PDFRenderV, and so are its system
+variables and *Commands.
+
+Installation
+------------
+Drop !Viewer anywhere the boot sequence scans (Boot:^.Apps, or add it
+to Configure > Boot > Look at), or simply open its parent directory
+once per session.  Its !Boot loads the PDFRenderV module and claims
+the filetypes, so double-clicking a document opens it in the viewer.
+
+Double-clicking !Viewer itself puts it on the left of the icon bar,
+next to the Apps icon; documents can be dropped on it there.
+
+Viewer
+------
+  <  n/N  >     previous / next page
+  -  zoom%  +   zoom from 25% to 400%
+  Print         print the current page through the printer driver
+
+The toolbar sits in the window's bottom scroll bar, sharing the row
+with it.  On a PDF, the Menu button over the page offers Copy, Select
+all and Save text, and text can be selected by dragging.
+
+Commands
+--------
+  *PDFInfo <file>
+        report version, page count and page sizes
+  *PDFToSprite <file> <page> <spritefile> [<width>]
+        render a page to a 32bpp sprite file
+  *PDFText <file> <page> [<textfile>]
+        extract the text of a page
+  *PDFClaim
+        re-assert the filetype claims
+  *PDFRenderVOpen <file>
+        open a document in the viewer (what the Filer uses)
+
+Copyright (c) RISC OS Technologies 2026.
+SPDX-License-Identifier: CDDL-1.0

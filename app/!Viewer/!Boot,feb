@@ -1,8 +1,12 @@
-| !Boot for PDFRenderV - run by the Filer when it first sees this
+| !Boot for !Viewer - run by the Filer when it first sees this
 | application directory, and by the boot sequence if the app is in a
 | scanned Apps directory.  Loading the module here (rather than in
-| !Run) is what makes double-clicking a PDF work without having
+| !Run) is what makes double-clicking a document work without having
 | started the viewer first.
+|
+| The application is !Viewer because it opens far more than PDFs; the
+| module inside it is still called PDFRenderV, and so are its system
+| variables and *Commands.
 |
 | Copyright (c) RISC OS Technologies 2026.
 | SPDX-License-Identifier: CDDL-1.0

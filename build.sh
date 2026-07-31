@@ -103,10 +103,10 @@ run "$D/bin/link,ff8" -aif -o aif.Viewer o.viewapp C:CLib.o.stubs
 [ -s aif/Viewer ] || { echo "viewer link produced nothing"; exit 1; }
 
 # Keep the shipping application directory in step with the build.
-if [ -d "$HERE/app/!PDFRenderV" ]; then
-    cp "$HERE/rm/PDFRenderV" "$HERE/app/!PDFRenderV/PDFRenderV,ffa"
-    cp "$HERE/aif/Viewer"    "$HERE/app/!PDFRenderV/Viewer,ff8"
-    echo "   refreshed app/!PDFRenderV"
+if [ -d "$HERE/app/!Viewer" ]; then
+    cp "$HERE/rm/PDFRenderV" "$HERE/app/!Viewer/PDFRenderV,ffa"
+    cp "$HERE/aif/Viewer"    "$HERE/app/!Viewer/Viewer,ff8"
+    echo "   refreshed app/!Viewer"
 fi
 
 echo

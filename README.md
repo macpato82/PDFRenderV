@@ -29,7 +29,9 @@ own `c/pdfjpg` decoder if the OS refuses a file, so an older or
 stricter SpriteExtend still draws the page.  That fallback is slower
 and is not the tested path.
 
-RISC OS 5.28 or later otherwise; no other modules are needed.
+RISC OS 5 otherwise - developed and tested on 5.31, and nothing here
+needs a call newer than RISC OS 3.5, though earlier RO5 releases have
+not been tried.  No other modules are needed.
 
 ## Design
 
@@ -78,7 +80,9 @@ Otherwise the page is scaled to fit the given sprite, which should be
 
 ## Installing
 
-`app/!PDFRenderV` is the shipping application directory. Put it
+`app/!Viewer` is the shipping application directory - named for what it
+does rather than for the module inside it, which is still PDFRenderV,
+as are its system variables and `*Commands`. Put it
 anywhere the boot sequence scans (`Boot:^.Apps`, or Configure > Boot >
 Look at) and the module loads itself at boot: the app's `!Boot` sets
 `PDFRenderV$Viewer`, `RMEnsure`s the module, and names the filetype.
@@ -95,6 +99,23 @@ Double-clicking any supported file opens it: window + toolbar
 25-400%, vector printing through PDriver.  On a PDF the Menu button
 over the page also offers Copy / Select all / Save text, with
 click-drag text selection.
+
+The toolbar is embedded in the window's horizontal scroll bar, the
+way Ovation and NetSurf do it: the pane is a nested-Wimp *furniture
+window* (window flag bit 23), which is what lets a child encroach on
+its parent's border instead of being clipped to the work area, and the
+Wimp then shortens the scroll bar to fit beside it. Its height is
+therefore whatever the scroll bar is in the current mode and theme, so
+the icons are sized when the window opens and again on
+Message_ModeChange rather than being fixed in the definition. This
+needs the nested Wimp, so the task initialises as Wimp 380.
+
+Running `!Viewer` with no document puts it on the **left** of the icon
+bar, next to the ROM `Apps` icon (`Wimp_CreateIcon` window handle -5
+with priority &4F000000; the PRM gives Apps &50000000 and the RAM disc
+&40000000). Documents dropped there open in a window. Only the no-file
+copy creates a bar icon - a document window is a separate copy of the
+binary, so N open documents do not give N identical icons.
 
 | Type | | Rendered by |
 |---|---|---|

@@ -1,0 +1,163 @@
+Viewer 1.00 (PDFRenderV) - Installation
+=======================================
+
+A fast native document previewer for RISC OS 5: PDF, JPEG, PNG,
+Sprite and Draw files, all in one window with zoom, text selection
+and printing.
+
+Copyright (c) RISC OS Technologies 2026.
+Licensed under the CDDL 1.0 - see LICENSE.
+
+
+What is in this archive
+-----------------------
+
+  !Viewer            the application directory - this is all you
+                     need to install
+      !Boot          loads the module and claims the filetypes
+      !Run           starts the viewer
+      PDFRenderV     the module (engine, SWIs, *Commands)
+      Viewer         the desktop window and toolbar
+  Install            this file
+  ReadMe             overview, SWI reference, design notes
+  LICENSE            CDDL 1.0
+
+
+Requirements
+------------
+
+  * RISC OS 5.  Developed and tested on 5.31; nothing here needs a
+    call newer than RISC OS 3.5, so earlier RO5 releases should be
+    fine, but they have not been tried.
+  * SpriteExtend 1.88 recommended.  All JPEG plotting is
+    SpriteExtend's, so its version decides the JPEG behaviour you
+    get; 1.88 is the tested one.  Older versions work - PDFRenderV
+    checks with JPEG_Info first and decodes the file itself if the
+    OS refuses it.
+
+Nothing else is needed.  Everything else - PDF parsing, PNG, JPEG
+2000, fonts, printing - is in the module.
+
+
+Installing
+----------
+
+  1. Copy !Viewer to a directory the boot sequence scans.
+
+     The usual place is  Boot:^.Apps  (open Configure > Boot >
+     Look at to see or add directories).  Any of these will do:
+
+        SDFS::RISCOSpi.$.Apps
+        ADFS::HardDisc4.$.Apps
+        Boot:^.Apps
+
+  2. Open that directory once, or reboot.
+
+That is all.  There is nothing to type at the command line.
+
+Opening the directory makes the Filer run !Boot, which loads the
+module and claims the filetypes.  From then on, double-clicking a
+PDF, JPEG, PNG, Sprite or Draw file opens it in PDFRenderV - the
+application itself does not need to be running first.
+
+If you prefer to keep it somewhere the boot sequence does not scan,
+double-click !Viewer once per session instead, or add
+
+    Run <path>.!Viewer.!Boot
+
+to your boot Obey file.
+
+
+Which filetypes it takes over
+-----------------------------
+
+By default all five: PDF (&ADF), JPEG (&C85), PNG (&B60), Sprite
+(&FF9) and Draw (&AFF).
+
+To keep an existing application on a type, set PDFRenderV$Claim
+before !Boot runs - list only the types you want:
+
+    Set PDFRenderV$Claim ADF,C85,B60          | leave Paint and Draw alone
+    Set PDFRenderV$Claim ADF                  | PDFs only
+
+An application booted after ours can take a type back (ChangeFSI
+claims JPEG, for instance).  PDFRenderV re-claims when the desktop
+starts, and
+
+    *PDFClaim
+
+re-asserts them at any time.  Killing the module hands every claimed
+type back, and only if the alias still points at our viewer - so it
+never strands a filetype.
+
+
+Using it
+--------
+
+Double-click any supported file.  The toolbar is
+
+    [<] [n/N] [>]   [-] [zoom%] [+]   [Print]
+
+and it sits in the window's bottom scroll bar, sharing that row with
+it - the scroll bar is shortened to fit alongside.
+
+Zoom is 25-400%.  Printing goes through PDriver as vectors, not as a
+bitmap, so it prints at the printer's resolution.
+
+On a PDF, the Menu button over the page offers Copy, Select all and
+Save text; text can be selected by dragging.
+
+Double-clicking !Viewer itself, rather than a document, puts it on the
+left of the icon bar next to the Apps icon.  Documents dropped on that
+icon open in a window; Menu over it gives Info and Quit.  A document
+opened by double-clicking gets a window of its own and does not add a
+second icon.
+
+
+Command line
+------------
+
+    *PDFInfo <pdffile>
+        version, page count and page sizes
+
+    *PDFToSprite <pdf> <page> <spritefile> [<width px>]
+        render one page to a 32bpp sprite file (default 1000px wide)
+
+    *PDFText <pdffile> <page> [<textfile>]
+        extract the text of a page
+
+    *PDFClaim
+        re-assert the filetype claims
+
+    *PDFRenderVOpen <pdffile>
+        open a file in the desktop viewer - this is what the filetype
+        alias runs, so you rarely need it by hand
+
+
+Removing it
+-----------
+
+    *RMKill PDFRenderV
+
+then delete the !Viewer directory.  The filetypes go back to
+whatever had them before.
+
+
+Known limitations in 1.00
+-------------------------
+
+  * Encrypted PDFs are refused with a clear error.
+  * Embedded font programs are not rasterised - the standard-14
+    fonts are mapped to their RISC OS metric equivalents (Homerton,
+    Trinity, Corpus), so text is anti-aliased and correctly spaced,
+    but an unusual embedded face will not look identical.
+  * No transparency groups or luminosity soft masks, so a highlight
+    annotation drawn as an opaque fill can cover the text under it.
+  * Shadings and patterns are skipped or drawn grey.
+  * CCITT and JBIG2 images are not decoded.
+
+
+Support
+-------
+
+    https://github.com/macpato82/PDFRenderV

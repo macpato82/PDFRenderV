@@ -10,8 +10,8 @@ thirdparty/openjpeg/o/
 
 # The application directory ships as source; build.sh fills in the
 # two binaries, so they are not tracked.
-app/!PDFRenderV/PDFRenderV,ffa
-app/!PDFRenderV/Viewer,ff8
+app/!Viewer/PDFRenderV,ffa
+app/!Viewer/Viewer,ff8
 
 # Host test artefacts
 test/host/obj/

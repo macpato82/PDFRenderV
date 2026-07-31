@@ -1,0 +1,12 @@
+| !Run for !Viewer.  The Filer passes a double-clicked document as %*0
+| through Alias$@RunType_<type>; running the application directory with
+| no argument installs the module and puts the viewer on the icon bar,
+| where documents can be dropped on it.
+|
+| Copyright (c) RISC OS Technologies 2026.
+| SPDX-License-Identifier: CDDL-1.0
+| Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+
+Run <Obey$Dir>.!Boot
+WimpSlot -min 320K -max 4096K
+Run <PDFRenderV$Dir>.Viewer %*0

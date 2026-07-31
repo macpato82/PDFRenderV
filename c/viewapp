@@ -86,6 +86,11 @@ typedef s32 fix;
 #define XWimp_SendMessage       (0x400E7)
 #define XWimp_GetPointerInfo    (0x400CF)
 #define XWimp_UpdateWindow      (0x400C9)
+#define XWimp_GetWindowOutline  (0x400E0)
+#define XWimp_ResizeIcon        (0x400FC)
+#define XWimp_CreateIcon        (0x400C2)
+#define XWimp_DeleteIcon        (0x400C4)
+#define XWimp_StartTask         (0x400DE)
 #define XOS_GBPB                (0x0C)
 #define XHourglass_On           (0x406C0)
 #define XHourglass_Off          (0x406C1)
@@ -93,14 +98,38 @@ typedef s32 fix;
 #define SPRITE_MODE_32BPP_180 \
     ((6u << 27) | (180u << 14) | (180u << 1) | 1u)
 
-#define TOOLH 52                        /* toolbar height, OS units   */
+/* The toolbar is embedded in the document window's horizontal scroll
+   bar, so its height is not ours to pick - it is whatever the scroll
+   bar is in the current mode and theme, worked out at open time.
+   Only the horizontal layout is fixed.  (Nested Wimp; see
+   arrange_toolbar.)                                                 */
+static const struct { int x0, x1; } toollayout[] = {
+    {   8,  56 },                       /* IC_PREV   <                */
+    {  60, 172 },                       /* IC_PAGE   n/N              */
+    { 176, 224 },                       /* IC_NEXT   >                */
+    { 244, 292 },                       /* IC_ZOUT   -                */
+    { 296, 384 },                       /* IC_ZOOM   100%             */
+    { 388, 436 },                       /* IC_ZIN    +                */
+    { 456, 568 }                        /* IC_PRINT  Print            */
+};
+#define NTOOL ((int) (sizeof toollayout / sizeof toollayout[0]))
+#define TOOLW 576                       /* bar width, OS units        */
+
+/* Nested Wimp: R2 of the extended Wimp_OpenWindow, and the nesting
+   flags for R4.  Every anchor (bits 16-27) is %01, "link to the left
+   or bottom of the parent's visible area" - the bar is pinned to the
+   parent's bottom-left corner at a fixed size.                      */
+#define WIMP_NEST_MAGIC 0x4B534154
+#define NEST_BOTTOMLEFT 0x05550000
 
 /* Wimp message numbers (PRM / ROOL wiki: Message Codes)              */
 #define Msg_DataSave        0x1
 #define Msg_DataSaveAck     0x2
 #define Msg_DataLoad        0x3
+#define Msg_DataLoadAck     0x4
 #define Msg_ClaimEntity     0xF
 #define Msg_DataRequest     0x10
+#define Msg_ModeChange      0x400C1
 #define ENTITY_CLIPBOARD    4           /* bit 2                      */
 
 /* One glyph as PDFRenderV_ExtractText returns it: device units,
@@ -483,7 +512,7 @@ fit_zoom(void)
     screen_size(&sw, &sh);
     /* leave room for window furniture and the icon bar               */
     sw -= 80;
-    sh -= 200 + TOOLH;
+    sh -= 260;                          /* title, scroll row, iconbar */
     if (sw < 200 || sh < 200 || wmpt <= 0 || hmpt <= 0) {
         return;
     }
@@ -525,16 +554,16 @@ set_extent(void)
 {
     int ext[4];
 
-    /* The work area extends TOOLH above the page: that strip lives
-       under the toolbar pane, so the page itself starts just below
-       the toolbar and the window keeps its own title bar.          */
+    /* The work area is exactly the page.  The toolbar no longer eats
+       into it: it lives in the horizontal scroll bar, which is
+       furniture, outside the work area entirely.                   */
     ext[0] = 0;
     ext[1] = -(vw.sprh << vw.yeig);
     ext[2] = vw.sprw << vw.xeig;
-    ext[3] = TOOLH;
+    ext[3] = 0;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
-          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, TOOLH);
+          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
 }
 
 /* icon block helper: bbox + flags + 12 bytes of data                 */
@@ -572,15 +601,17 @@ create_windows(void)
 
         screen_size(&sw, &sh);
         ww = vw.sprw << vw.xeig;
-        wh = (vw.sprh << vw.yeig) + TOOLH;      /* page + toolbar     */
+        wh = vw.sprh << vw.yeig;
         if (ww > sw - 80) {
             ww = sw - 80;
         }
         if (wh > sh - 160) {
             wh = sh - 160;
         }
-        if (ww < 320) {
-            ww = 320;
+        /* never narrower than the embedded toolbar plus a usable
+           length of scroll bar beside it                           */
+        if (ww < TOOLW + 200) {
+            ww = TOOLW + 200;
         }
         if (wh < 200) {
             wh = 200;
@@ -604,17 +635,21 @@ create_windows(void)
     ((u8 *) &blk[9])[1] = 1;            /* scroll inner               */
     ((u8 *) &blk[9])[2] = 12;           /* highlight                  */
     blk[4] = 0;                         /* scroll x                   */
-    blk[5] = TOOLH;                     /* scroll y: page below pane  */
+    blk[5] = 0;                         /* scroll y                   */
     blk[10] = 0;                        /* work area extent           */
     blk[11] = -(vw.sprh << vw.yeig);
     blk[12] = vw.sprw << vw.xeig;
-    blk[13] = TOOLH;
+    blk[13] = 0;
     blk[14] = 0x00000109;               /* title: text+indirected+ctr */
     /* work-area button type 10 (click/drag): without this the Wimp
        never reports clicks in the page and text cannot be selected  */
     blk[15] = 10 << 12;
     blk[16] = 1;                        /* wimp sprite area           */
-    blk[17] = 0;                        /* min w/h                    */
+    /* minimum size: the toolbar occupies the left of the scroll bar
+       row, so refuse to be dragged narrower than it plus enough bar
+       to be worth dragging (the Wimp will happily give a scroll well
+       of negative length otherwise)                                */
+    blk[17] = (TOOLW + 160) | (128 << 16);
     blk[18] = (int) vw.titletxt;        /* indirected title           */
     blk[19] = -1;
     blk[20] = (int) sizeof vw.titletxt;
@@ -627,13 +662,17 @@ create_windows(void)
 
     /* --- toolbar pane --- */
     memset(blk, 0, sizeof blk);
-    blk[0] = 200;
+    blk[0] = 200;                       /* placed properly at open    */
     blk[1] = 900;
-    blk[2] = 200 + 560;
-    blk[3] = 900 + TOOLH;
+    blk[2] = 200 + TOOLW;
+    blk[3] = 940;
     blk[6] = -1;
-    /* pane + auto-redraw + no control icons (new-style, none set)    */
-    blk[7] = (int) 0x80000030u;
+    /* pane + auto-redraw + no control icons, plus bit 23: a
+       "furniture window", which is what lets a nested child encroach
+       on its parent's border instead of being clipped to the work
+       area - without it the bar cannot reach the scroll bar at all
+       (Nested Window Manager functional spec; window flag 23).     */
+    blk[7] = (int) 0x80800030u;
     ((u8 *) &blk[8])[0] = 0xFF;         /* no frame/title             */
     ((u8 *) &blk[8])[1] = 2;
     ((u8 *) &blk[8])[2] = 7;
@@ -641,9 +680,9 @@ create_windows(void)
     ((u8 *) &blk[9])[0] = 3;
     ((u8 *) &blk[9])[1] = 1;
     ((u8 *) &blk[9])[2] = 12;
-    blk[10] = 0;
-    blk[11] = -TOOLH;
-    blk[12] = 1600;
+    blk[10] = 0;                        /* extent: set at open time    */
+    blk[11] = -40;
+    blk[12] = TOOLW;
     blk[13] = 0;
     blk[14] = 0;                        /* no title text              */
     blk[15] = 0;
@@ -652,22 +691,30 @@ create_windows(void)
     blk[18] = 0;
     blk[19] = 0;
     blk[20] = 0;
-    blk[21] = 7;                        /* icons follow               */
+    blk[21] = NTOOL;                    /* icons follow               */
     {
         /* icon flags: text|border|hcentre|vcentre|filled, click
-           button type, black on grey                                 */
+           button type, black on grey.  The y coordinates here are
+           provisional - arrange_toolbar resizes every icon to the
+           real scroll bar height before the bar is ever shown.     */
         unsigned bf = 0x1700303Du;
         unsigned df = 0x1700013Du;      /* display only: no button    */
         int *ic = blk + 22;
-        mkicon(ic + 0, 8, -48, 56, -4, bf, "<", NULL, 0);
-        mkicon(ic + 8, 64, -48, 176, -4, df | 0x100, NULL,
-               vw.pagetxt, sizeof vw.pagetxt);
-        mkicon(ic + 16, 184, -48, 232, -4, bf, ">", NULL, 0);
-        mkicon(ic + 24, 256, -48, 304, -4, bf, "-", NULL, 0);
-        mkicon(ic + 32, 312, -48, 400, -4, df | 0x100, NULL,
-               vw.zoomtxt, sizeof vw.zoomtxt);
-        mkicon(ic + 40, 408, -48, 456, -4, bf, "+", NULL, 0);
-        mkicon(ic + 48, 480, -48, 592, -4, bf, "Print", NULL, 0);
+
+        mkicon(ic + 0, toollayout[0].x0, -36, toollayout[0].x1, -4,
+               bf, "<", NULL, 0);
+        mkicon(ic + 8, toollayout[1].x0, -36, toollayout[1].x1, -4,
+               df | 0x100, NULL, vw.pagetxt, sizeof vw.pagetxt);
+        mkicon(ic + 16, toollayout[2].x0, -36, toollayout[2].x1, -4,
+               bf, ">", NULL, 0);
+        mkicon(ic + 24, toollayout[3].x0, -36, toollayout[3].x1, -4,
+               bf, "-", NULL, 0);
+        mkicon(ic + 32, toollayout[4].x0, -36, toollayout[4].x1, -4,
+               df | 0x100, NULL, vw.zoomtxt, sizeof vw.zoomtxt);
+        mkicon(ic + 40, toollayout[5].x0, -36, toollayout[5].x1, -4,
+               bf, "+", NULL, 0);
+        mkicon(ic + 48, toollayout[6].x0, -36, toollayout[6].x1, -4,
+               bf, "Print", NULL, 0);
     }
     e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.pane);
     if (e != NULL) {
@@ -677,33 +724,81 @@ create_windows(void)
     return 0;
 }
 
-/* Open the main window (from an open request block) and glue the
-   toolbar pane above its visible area.                               */
+/* Fit the toolbar into the horizontal scroll bar of the document
+   window and open it there as a nested child.
+
+   The height of that row is not ours to choose - it comes from the
+   current screen mode and the toolsprites in use - so the icons are
+   sized here rather than in the window definition, and this is redone
+   whenever the mode changes.  The row itself is the gap between the
+   bottom of the window's outline (which includes the border) and the
+   bottom of its visible area, a pixel inside each.
+
+   With the pane marked as a furniture window the Wimp shortens the
+   scroll bar to whatever is left, so the bar and the scroll bar share
+   the row instead of overlapping.                                  */
+static void
+arrange_toolbar(const int *mainst)
+{
+    int out[8], st[16], ext[4];
+    int ph, h, i;
+
+    out[0] = vw.win;
+    if (_swix(XWimp_GetWindowOutline, _IN(1), out) != NULL) {
+        return;
+    }
+    ph = 1 << vw.yeig;                  /* height of a pixel          */
+    h = (mainst[2] - ph) - (out[2] + ph);
+    if (h < 8) {
+        return;                         /* no scroll bar to sit in    */
+    }
+
+    /* work area = the whole visible area of the bar                  */
+    ext[0] = 0;
+    ext[1] = -h;
+    ext[2] = TOOLW;
+    ext[3] = 0;
+    _swix(XWimp_SetExtent, _INR(0, 1), vw.pane, ext);
+
+    /* every icon fills the row bar a pixel top and bottom            */
+    for (i = 0; i < NTOOL; i++) {
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.pane, i,
+              toollayout[i].x0, -h + ph, toollayout[i].x1, -ph);
+    }
+
+    st[0] = vw.pane;
+    if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
+        return;
+    }
+    st[1] = mainst[1];                  /* left edge of the window    */
+    st[2] = out[2] + ph;                /* bottom of the scroll row   */
+    st[3] = mainst[1] + TOOLW;
+    st[4] = st[2] + h;
+    st[5] = 0;                          /* scroll offsets             */
+    st[6] = 0;
+    st[7] = -1;                         /* in front                   */
+    _swix(XWimp_OpenWindow, _INR(1, 4), st, WIMP_NEST_MAGIC,
+          vw.win, NEST_BOTTOMLEFT);
+}
+
+/* Open the main window (from an open request block) and place the
+   toolbar in its scroll bar.                                         */
 static void
 open_with_pane(int *open)
 {
-    int st[16], pblk[8];
+    int st[16];
 
     /* Open the document window FIRST, then read back where it really
-       landed: the Wimp forces a new window on-screen, so a pane
-       placed from the requested coordinates can end up somewhere
-       else entirely (or off the top of the screen, which is how the
-       toolbar went missing).  The pane then goes in front of it.   */
+       landed: the Wimp forces a new window on-screen, so a bar placed
+       from the requested coordinates can end up somewhere else
+       entirely (which is how the toolbar once went missing).       */
     _swix(XWimp_OpenWindow, _IN(1), open);
 
     st[0] = vw.win;
     if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
         return;
     }
-    pblk[0] = vw.pane;
-    pblk[1] = st[1];                    /* x0 of the visible area     */
-    pblk[2] = st[4] - TOOLH;            /* sit on its top strip       */
-    pblk[3] = st[3];                    /* x1                         */
-    pblk[4] = st[4];                    /* y1                         */
-    pblk[5] = 0;
-    pblk[6] = 0;
-    pblk[7] = -1;                       /* in front of the document   */
-    _swix(XWimp_OpenWindow, _IN(1), pblk);
+    arrange_toolbar(st);
 }
 
 /* Paint the selection as EOR'd rectangles over the plotted page, so
@@ -1127,6 +1222,17 @@ poll_loop(void)
         case 2:                         /* open                      */
             if (blk[0] == vw.win) {
                 open_with_pane(blk);
+            } else if (blk[0] == vw.pane) {
+                /* Never re-open the bar with the plain form: that
+                   drops its parent link and leaves it floating as a
+                   top-level window.  Go back through the nested
+                   open instead.                                    */
+                int st[16];
+
+                st[0] = vw.win;
+                if (_swix(XWimp_GetWindowState, _IN(1), st) == NULL) {
+                    arrange_toolbar(st);
+                }
             } else {
                 _swix(XWimp_OpenWindow, _IN(1), blk);
             }
@@ -1217,6 +1323,24 @@ poll_loop(void)
             case Msg_DataSaveAck:
                 clipboard_saveack(blk);
                 break;
+            case Msg_ModeChange:
+                /* Both the size of a pixel and the height of the
+                   scroll bar row change with the mode, so the extent
+                   and the embedded bar have to be worked out again -
+                   otherwise the bar ends up a row adrift.         */
+                vw.xeig = readmodevar(4);
+                vw.yeig = readmodevar(5);
+                set_extent();
+                {
+                    int st[16];
+
+                    st[0] = vw.win;
+                    if (_swix(XWimp_GetWindowState, _IN(1), st) == NULL
+                        && (st[8] & (1 << 16)) != 0) {
+                        arrange_toolbar(st);
+                    }
+                }
+                break;
             case Msg_ClaimEntity:
                 /* someone else took the clipboard                   */
                 if (blk[1] != vw.task && (blk[5] & ENTITY_CLIPBOARD)) {
@@ -1234,6 +1358,152 @@ poll_loop(void)
             break;
         }
     }
+}
+
+/* --- icon bar ------------------------------------------------------- */
+
+/* Run with no file, the viewer is just an icon on the icon bar: drop a
+   document on it to open one.  A document window is a separate copy of
+   this binary (the Filer runs one per file through the filetype alias),
+   so only this no-file copy ever creates a bar icon - otherwise every
+   open document would add another identical one.                     */
+
+#define IB_MENU_INFO  0
+#define IB_MENU_QUIT  1
+#define IB_MENU_ITEMS 2
+
+static struct {
+    char title[12];
+    char tfcol, tbcol, wfcol, wbcol;
+    int width, height, gap;
+    struct {
+        int flags;
+        int submenu;
+        int iconflags;
+        char text[12];
+    } item[IB_MENU_ITEMS];
+} barmenu;
+
+static void
+build_barmenu(void)
+{
+    static const char *const names[IB_MENU_ITEMS] = { "Info", "Quit" };
+    int i;
+
+    memset(&barmenu, 0, sizeof barmenu);
+    strcpy(barmenu.title, "Viewer");
+    barmenu.tfcol = 7;
+    barmenu.tbcol = 2;
+    barmenu.wfcol = 7;
+    barmenu.wbcol = 0;
+    barmenu.width = 200;
+    barmenu.height = 44;
+    barmenu.gap = 0;
+    for (i = 0; i < IB_MENU_ITEMS; i++) {
+        barmenu.item[i].submenu = -1;
+        barmenu.item[i].iconflags = 0x07000021;         /* text, filled */
+        strcpy(barmenu.item[i].text, names[i]);
+    }
+    barmenu.item[IB_MENU_ITEMS - 1].flags |= 0x80;      /* last item    */
+}
+
+/* Hand a dropped file to a fresh copy of ourselves, the same way the
+   Filer would open it.                                              */
+static void
+bar_open_file(const char *path)
+{
+    char cmd[320];
+
+    /* PDFRenderV$Viewer is what the module puts in Alias$@RunType_*,
+       so this is exactly the command a double-click would run.     */
+    sprintf(cmd, "Run <PDFRenderV$Viewer> %.280s", path);
+    _swix(XWimp_StartTask, _IN(0), cmd);
+}
+
+static int
+bar_main(void)
+{
+    int blk[64];
+    int icon = 0;
+    int quit = 0;
+
+    /* Icon bar, left-hand (device) side, immediately to the right of
+       the ROM 'Apps' icon.  Handle -5 is "left side, scanning from the
+       left" with R0 a priority; the PRM's table gives Apps &50000000
+       and the RAM disc &40000000, and higher priority sits nearer the
+       outside, so &4F000000 lands us just inside Apps.              */
+    memset(blk, 0, sizeof blk);
+    blk[0] = -5;                        /* left side, by priority     */
+    blk[1] = 0;                         /* x0                         */
+    blk[2] = 0;                         /* y0                         */
+    blk[3] = 68;                        /* x1: the icon is 68 wide    */
+    blk[4] = 68;                        /* y1                         */
+    /* sprite, horizontally and vertically centred, button type 3
+       (click) so Select and Menu both reach us                      */
+    blk[5] = (1 << 1) | (1 << 3) | (1 << 4) | (3 << 12);
+    strcpy((char *) &blk[6], "!viewer");
+    if (_swix(XWimp_CreateIcon, _INR(0, 1) | _OUT(0),
+              0x4F000000, blk, &icon) != NULL) {
+        return 1;
+    }
+    build_barmenu();
+
+    while (!quit) {
+        int event = 0;
+
+        if (_swix(XWimp_Poll, _INR(0, 1) | _OUT(0), 1, blk, &event)
+            != NULL) {
+            break;
+        }
+        switch (event) {
+        case 6:                         /* mouse click               */
+            if (blk[3] == -2) {         /* on the icon bar           */
+                if ((blk[2] & 2) != 0) {        /* Menu              */
+                    _swix(XWimp_CreateMenu, _INR(1, 3), &barmenu,
+                          blk[0] - 64, 96 + IB_MENU_ITEMS * 44);
+                }
+            }
+            break;
+        case 9:                         /* menu selection            */
+            if (blk[0] == IB_MENU_QUIT) {
+                quit = 1;
+            } else if (blk[0] == IB_MENU_INFO) {
+                report("PDFRenderV Viewer 1.00 - PDF, JPEG, PNG, "
+                       "Sprite and Draw");
+            }
+            break;
+        case 17:
+        case 18:
+            switch (blk[4]) {
+            case 0:                     /* Message_Quit              */
+                quit = 1;
+                break;
+            case Msg_DataLoad:
+                /* a file dropped on the icon: open it, then
+                   acknowledge so the sender does not report the
+                   transfer as failed                              */
+                bar_open_file((const char *) &blk[11]);
+                blk[3] = blk[2];        /* your_ref = their my_ref   */
+                blk[4] = Msg_DataLoadAck;
+                _swix(XWimp_SendMessage, _INR(0, 2), 17, blk, blk[1]);
+                break;
+            default:
+                break;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    {
+        int del[2];                     /* blk has long since been
+                                           overwritten by Wimp_Poll  */
+        del[0] = -2;                    /* icon bar                  */
+        del[1] = icon;
+        _swix(XWimp_DeleteIcon, _IN(1), del);
+    }
+    _swix(XWimp_CloseDown, _INR(0, 1), vw.task, WIMP_NEST_MAGIC);
+    return 0;
 }
 
 /* --- entry ---------------------------------------------------------- */
@@ -1255,8 +1525,11 @@ main(int argc, char **argv)
             Msg_DataSave, Msg_DataSaveAck, Msg_DataLoad,
             Msg_ClaimEntity, Msg_DataRequest, 0
         };
+        /* 380, not 310: the nested Wimp only makes its child-window
+           features available to a task that asks for that version,
+           and the toolbar is a nested furniture window.           */
         e = _swix(XWimp_Initialise, _INR(0, 3) | _OUT(1),
-                  310, 0x4B534154, "PDFRenderV", wanted, &vw.task);
+                  380, WIMP_NEST_MAGIC, "PDFRenderV", wanted, &vw.task);
     }
     if (e != NULL) {
         fprintf(stderr, "PDFRenderV: %s\n", e->errmess);
@@ -1264,9 +1537,8 @@ main(int argc, char **argv)
     }
     dbg(2);
     if (argc < 2) {
-        report("Usage: *Run <viewer> <pdffile>");
-        _swix(XWimp_CloseDown, _INR(0, 1), vw.task, 0x4B534154);
-        return 1;
+        /* No document: be the icon bar application instead          */
+        return bar_main();
     }
     /* CLib splits the tail on spaces; rejoin so paths containing
        spaces survive                                                 */
