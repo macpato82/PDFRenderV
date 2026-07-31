@@ -330,6 +330,7 @@ static void
 close_doc(DocSlot *ds)
 {
     if (ds->doc != NULL) {
+        pdfimg_cache_flush(ds->doc);
         pdf_close(ds->doc);
     }
     free(ds->buf);

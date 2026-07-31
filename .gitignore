@@ -23,3 +23,4 @@ test/host/testpdf
 test/host/testtext
 
 .DS_Store
+test/host/*.dSYM/

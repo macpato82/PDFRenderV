@@ -719,8 +719,22 @@ static int run_content(Interp *it, const u8 *cbuf, u32 clen);
 static void
 do_xobject(Interp *it, PdfObj *name)
 {
-    PdfObj *xo = res_get(it, "XObject", name);
-    PdfObj *sub;
+    PdfObj *xo, *sub;
+    u32 key = 0;
+
+    /* keep the reference's object number before resolving it: that
+       is what the decoded-image cache is keyed on                   */
+    {
+        PdfObj *cat = pdf_resolve(it->doc,
+                                  pdf_dictget(it->res, "XObject"));
+        PdfObj *raw = (name && name->type == PDF_NAME)
+                      ? pdf_dictget(cat, (const char *) name->u.str.p)
+                      : NULL;
+        if (raw != NULL && raw->type == PDF_REF) {
+            key = raw->u.ref.num;
+        }
+    }
+    xo = res_get(it, "XObject", name);
 
     if (xo == NULL || xo->type != PDF_STREAM) {
         return;
@@ -732,6 +746,14 @@ do_xobject(Interp *it, PdfObj *name)
             return;                     /* fully transparent          */
         }
         memset(&img, 0, sizeof img);
+        {   /* the unit square maps to this many device pixels       */
+            const fix *m = cur(it)->m;
+            fix w = fx_abs(m[0]) + fx_abs(m[2]);
+            fix h = fx_abs(m[1]) + fx_abs(m[3]);
+            img.maxw = FX_TOINT(w) + 1;
+            img.maxh = FX_TOINT(h) + 1;
+            img.cachekey = key;
+        }
         if (pdfimg_load(it->doc, xo, cur(it)->fillrgb, &img) == PDF_OK) {
             it->be->image(it->be->ctx, &img, cur(it)->m);
         }
@@ -904,7 +926,11 @@ inline_image(Interp *it, PdfLex *lx)
     }
     {
         PdfImg img;
+        const fix *m = cur(it)->m;
+
         memset(&img, 0, sizeof img);
+        img.maxw = FX_TOINT(fx_abs(m[0]) + fx_abs(m[2])) + 1;
+        img.maxh = FX_TOINT(fx_abs(m[1]) + fx_abs(m[3])) + 1;
         if (pdfimg_inline(it->doc, dict, data, dlen, cur(it)->fillrgb,
                           &img) == PDF_OK) {
             it->be->image(it->be->ctx, &img, cur(it)->m);

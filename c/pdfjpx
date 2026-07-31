@@ -80,17 +80,23 @@ msg_quiet(const char *msg, void *client)
 
 /* --- component sampling --------------------------------------------- */
 
-/* Fetch component c's sample at image pixel (x, y), scaled to 0..255.
-   Handles subsampling (dx/dy), signed data and precision != 8.        */
+/* Fetch component c's sample at output pixel (x, y) of a w x h
+   image, scaled to 0..255.  The component may be smaller than the
+   output for two independent reasons - chroma subsampling, and the
+   reduced-resolution decode we ask for - so map through its actual
+   dimensions rather than assuming either.                           */
 static int
-comp_at(const opj_image_comp_t *c, int x, int y)
+comp_at(const opj_image_comp_t *c, int x, int y, int w, int h)
 {
     u32 cx, cy;
     s32 v;
     int prec = (int) c->prec;
 
-    cx = (u32) x / (c->dx ? c->dx : 1);
-    cy = (u32) y / (c->dy ? c->dy : 1);
+    if (c->w == 0 || c->h == 0 || w <= 0 || h <= 0) {
+        return 0;
+    }
+    cx = (u32) ((s64) x * c->w / w);
+    cy = (u32) ((s64) y * c->h / h);
     if (cx >= c->w) {
         cx = c->w - 1;
     }
@@ -119,7 +125,8 @@ comp_at(const opj_image_comp_t *c, int x, int y)
 /* --- public --------------------------------------------------------- */
 
 int
-pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
+pdfjpx_decode(const u8 *src, u32 srclen, int maxw, int maxh,
+              int *wp, int *hp, u32 **pixp)
 {
     JpxMem m;
     opj_stream_t *stream = NULL;
@@ -128,7 +135,7 @@ pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
     opj_dparameters_t param;
     u32 *pix = NULL;
     int w, h, x, y, err = PDF_E_DATA;
-    int fmt;
+    int fmt, red = 0;
 
     *wp = *hp = 0;
     *pixp = NULL;
@@ -166,6 +173,23 @@ pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
         !opj_read_header(stream, codec, &img) || img == NULL) {
         goto out;
     }
+    /* Now the dimensions are known, ask for only as many wavelet
+       levels as the display needs.  Each level halves both axes and
+       cuts the work roughly fourfold.                              */
+    if (maxw > 0 && maxh > 0) {
+        u32 fw = img->x1 - img->x0;
+        u32 fh = img->y1 - img->y0;
+        while (red < 5 &&
+               (fw >> (red + 1)) >= (u32) maxw &&
+               (fh >> (red + 1)) >= (u32) maxh) {
+            red++;
+        }
+        if (red > 0 &&
+            !opj_set_decoded_resolution_factor(codec, (OPJ_UINT32) red)) {
+            /* not fatal: fall back to full resolution              */
+            (void) 0;
+        }
+    }
     if (!opj_decode(codec, stream, img) ||
         !opj_end_decompress(codec, stream)) {
         goto out;
@@ -174,8 +198,10 @@ pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
         goto out;
     }
 
-    w = (int) (img->x1 - img->x0);
-    h = (int) (img->y1 - img->y0);
+    /* the decoded image is the full size shifted down by the number
+       of wavelet levels we skipped                                  */
+    w = (int) (((img->x1 - img->x0) + (1u << red) - 1) >> red);
+    h = (int) (((img->y1 - img->y0) + (1u << red) - 1) >> red);
     if (w < 1 || h < 1 || w > 8192 || h > 8192 ||
         (u32) w * (u32) h > 4194304u) {
         err = PDF_E_LIMIT;
@@ -193,19 +219,19 @@ pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
             int r, g, b;
             if (img->numcomps >= 4) {
                 /* CMYK (rare from PDF, but legal)                    */
-                int c = comp_at(&img->comps[0], x, y);
-                int mg = comp_at(&img->comps[1], x, y);
-                int yl = comp_at(&img->comps[2], x, y);
-                int k = comp_at(&img->comps[3], x, y);
+                int c = comp_at(&img->comps[0], x, y, w, h);
+                int mg = comp_at(&img->comps[1], x, y, w, h);
+                int yl = comp_at(&img->comps[2], x, y, w, h);
+                int k = comp_at(&img->comps[3], x, y, w, h);
                 r = 255 - (c + k > 255 ? 255 : c + k);
                 g = 255 - (mg + k > 255 ? 255 : mg + k);
                 b = 255 - (yl + k > 255 ? 255 : yl + k);
             } else if (img->numcomps >= 3) {
-                r = comp_at(&img->comps[0], x, y);
-                g = comp_at(&img->comps[1], x, y);
-                b = comp_at(&img->comps[2], x, y);
+                r = comp_at(&img->comps[0], x, y, w, h);
+                g = comp_at(&img->comps[1], x, y, w, h);
+                b = comp_at(&img->comps[2], x, y, w, h);
             } else {
-                r = g = b = comp_at(&img->comps[0], x, y);
+                r = g = b = comp_at(&img->comps[0], x, y, w, h);
             }
             row[x] = (u32) r | ((u32) g << 8) | ((u32) b << 16);
         }

@@ -1,0 +1,230 @@
+/*
+  PDFRender - cryptographic primitives and standard security handler
+  key derivation for encrypted PDFs.
+
+  Everything here works on raw byte buffers only: no PdfObj, no
+  PdfDoc, no I/O.  The caller (document layer) is responsible for
+  pulling the relevant values out of the /Encrypt dictionary and the
+  trailer /ID, deciding which crypt filter method applies to a given
+  /Filter, and for never handing the /Encrypt dictionary's own
+  strings (or the trailer /ID strings) back through pdfcrypt_decrypt
+  - those are never encrypted, per the PDF spec.
+
+  Primitives (MD5, RC4, SHA-256/384/512, AES) are implemented
+  directly from their published specifications (RFC 1321, FIPS
+  180-4, FIPS 197) for this file; nothing here is derived from any
+  GPL or OpenSSL source.
+
+  Only the empty-password path through the standard security handler
+  is implemented (Algorithms 1, 2, 2.A, 2.B and 6 from ISO 32000-1/2)
+  - that covers the overwhelming majority of "encrypted" PDFs found
+  in the wild, which merely restrict permissions and leave the user
+  password blank.  A supplied non-empty password is out of scope.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFCRYPT_H
+#define PDFCRYPT_H
+
+#include "pdftypes.h"
+
+/* --- MD5 (RFC 1321) --------------------------------------------------- */
+
+typedef struct {
+    u32 a, b, c, d;
+    u64 len;            /* total bytes absorbed so far                  */
+    u8  buf[64];         /* partial block                                */
+    u32 buflen;          /* bytes valid in buf, 0..63                    */
+} PdfMd5Ctx;
+
+void pdfmd5_init(PdfMd5Ctx *ctx);
+void pdfmd5_update(PdfMd5Ctx *ctx, const u8 *data, u32 len);
+void pdfmd5_final(PdfMd5Ctx *ctx, u8 out[16]);
+
+/* One-shot convenience wrapper. */
+void pdfmd5(const u8 *data, u32 len, u8 out[16]);
+
+/* --- SHA-256 (FIPS 180-4) ---------------------------------------------- */
+
+typedef struct {
+    u32 h[8];
+    u64 len;
+    u8  buf[64];
+    u32 buflen;
+} PdfSha256Ctx;
+
+void pdfsha256_init(PdfSha256Ctx *ctx);
+void pdfsha256_update(PdfSha256Ctx *ctx, const u8 *data, u32 len);
+void pdfsha256_final(PdfSha256Ctx *ctx, u8 out[32]);
+void pdfsha256(const u8 *data, u32 len, u8 out[32]);
+
+/* --- SHA-384 / SHA-512 (FIPS 180-4) ------------------------------------
+
+   Same compression function and update; only the initial hash value
+   (set by _init) and the output length (used by _final) differ, so
+   SHA-384 and SHA-512 share one context type.                          */
+
+typedef struct {
+    u64 h[8];
+    u64 len;
+    u8  buf[128];
+    u32 buflen;
+} PdfSha512Ctx;
+
+void pdfsha384_init(PdfSha512Ctx *ctx);
+void pdfsha512_init(PdfSha512Ctx *ctx);
+void pdfsha512_update(PdfSha512Ctx *ctx, const u8 *data, u32 len);
+void pdfsha384_final(PdfSha512Ctx *ctx, u8 out[48]);
+void pdfsha512_final(PdfSha512Ctx *ctx, u8 out[64]);
+void pdfsha384(const u8 *data, u32 len, u8 out[48]);
+void pdfsha512(const u8 *data, u32 len, u8 out[64]);
+
+/* --- RC4 ---------------------------------------------------------------
+
+   Classic ARC4 keystream cipher.  Symmetric: the same call encrypts
+   or decrypts.  Safe to call with out == in (single left-to-right
+   pass, byte i is read before it is written).                         */
+
+void pdfrc4(const u8 *key, u32 keylen, const u8 *in, u32 len, u8 *out);
+
+/* --- AES (FIPS 197) -----------------------------------------------------
+
+   Supports AES-128/192/256.  pdfaes_setkey() expands one key
+   schedule that serves both pdfaes_ecb_encrypt() and
+   pdfaes_ecb_decrypt() (the "straightforward" FIPS-197 5.3 inverse
+   cipher is used, which needs no separately-transformed decryption
+   key schedule).                                                       */
+
+#define PDFAES_BLOCK  16
+#define PDFAES_MAXRK  60    /* words: 4 * (Nr+1), Nr=14 for AES-256      */
+
+typedef struct {
+    u32 rk[PDFAES_MAXRK];
+    int nr;             /* rounds: 10 (128-bit key), 12 (192), 14 (256)  */
+} PdfAesKey;
+
+/* keylen must be 16, 24 or 32; anything else is PDF_E_UNSUP.           */
+int  pdfaes_setkey(PdfAesKey *ks, const u8 *key, u32 keylen);
+
+/* Single 16-byte block.  Safe with out == in.                          */
+void pdfaes_ecb_encrypt(const PdfAesKey *ks, const u8 in[16], u8 out[16]);
+void pdfaes_ecb_decrypt(const PdfAesKey *ks, const u8 in[16], u8 out[16]);
+
+/* CBC decrypt as used for PDF strings/streams: the first 16 bytes of
+   in are the IV, the rest is ciphertext, and PKCS#5 padding is
+   removed from the tail on success.  *outlen receives the plaintext
+   length (<= len - 16).  If the trailing padding does not validate
+   as a proper PKCS#5 block, the bytes are returned unstripped rather
+   than failing outright - some PDF producers get this detail wrong,
+   and a single bad byte should not make the whole stream unreadable.
+   Genuinely malformed input (len not a multiple of 16, or len < 16
+   when len != 0) is reported as PDF_E_DATA.  len == 0 succeeds with
+   *outlen == 0.  Safe with out == in.                                  */
+int pdfaes_cbc_decrypt(const u8 *key, u32 keylen, const u8 *in, u32 len,
+                       u8 *out, u32 *outlen);
+
+/* CBC decrypt with an external IV and no padding interpretation: out
+   receives exactly len bytes.  len must be a multiple of 16 (0 is
+   fine).  Used to unwrap the R5/R6 /UE and /OE intermediate-key-
+   wrapped file key, which carries no IV of its own (the spec fixes
+   it at all-zero) and is not PKCS#5-padded.  Safe with out == in.       */
+int pdfaes_cbc_decrypt_nopad(const u8 *key, u32 keylen, const u8 iv[16],
+                             const u8 *in, u32 len, u8 *out);
+
+/* --- Standard security handler ------------------------------------------
+
+   Only the "supplied password is empty" case is implemented:
+
+     R2-4  (Algorithms 1, 2 and 6): the file key is derived from
+           /O, /P, the trailer's first /ID element and (R>=4)
+           /EncryptMetadata, then validated by re-deriving the
+           padded-password encryption of /U and comparing.  RC4 or
+           AES-128-CBC strings/streams additionally need a per-object
+           key (Algorithm 1): MD5(filekey || objnum(3 LE) ||
+           gennum(2 LE) || ["sAlT" if AES]), truncated to
+           min(filekeylen+5, 16) bytes.
+
+     R5-6  (Algorithms 2.A/2.B, AES-256 only, no crypt-filter choice):
+           /U's first 48 bytes split into a 32-byte hash, an 8-byte
+           validation salt and an 8-byte key salt.  The empty
+           password's validation hash (plain SHA-256 for R5, the
+           iterative "hardened hash" of Algorithm 2.B for R6) must
+           match the stored hash; the same construction over the key
+           salt gives an intermediate key that unwraps /UE (AES-256-
+           CBC-NoPad, zero IV) into the 32-byte file key.  No
+           per-object derivation: the file key is used directly.
+
+   Which crypt filter method applies (cfm below) is not something
+   pdfcrypt can know on its own for /V 4 documents - it comes from
+   the /CF dictionary named by /StmF and /StrF (or is implicitly RC4
+   for /V 1-2, and implicitly AESV3 for /V 5, in which case cfm is
+   ignored).  Pass PDFCRYPT_CFM_NONE, or any /CFM this module does
+   not implement (e.g. a private crypt filter), to get PDF_E_UNSUP
+   back rather than a silent wrong answer.                              */
+
+enum {
+    PDFCRYPT_CFM_NONE  = 0,     /* Identity, or unrecognised - PDF_E_UNSUP */
+    PDFCRYPT_CFM_RC4   = 1,     /* /CFM /V2, or implicit for /V 1-2        */
+    PDFCRYPT_CFM_AESV2 = 2,     /* /CFM /AESV2 - AES-128-CBC, per-object   */
+    PDFCRYPT_CFM_AESV3 = 3      /* /CFM /AESV3 - AES-256-CBC, R5/R6 only   */
+};
+
+typedef struct {
+    int ok;             /* nonzero once pdfcrypt_setup() has succeeded   */
+    int v, r;            /* /Encrypt's /V and /R, for the caller's info  */
+    int aes;             /* PDFCRYPT_CFM_* actually in effect            */
+    int keylen;          /* file/object key length in bytes (5-16, 32)   */
+    u8  key[32];          /* derived file encryption key                 */
+    int metadata;         /* /EncryptMetadata (0 = metadata not encrypted) */
+} PdfCrypt;
+
+/* Derive and validate the file key for an empty user password.
+
+   v, r, length      - /Encrypt's /V, /R and /Length (bits; 0 means
+                       the omitted-/Length default of 40).
+   cfm               - PDFCRYPT_CFM_*, see above; ignored when v == 5.
+   o, olen           - /O string (must be >= 32 bytes for R2-4).
+   u, ulen           - /U string (>= 32 bytes for R2-4, >= 48 for R5-6).
+   oe, oelen         - /OE string; unused (owner path not implemented)
+                       but accepted so the caller need not special-
+                       case R5/R6 dictionaries that carry it.
+   ue, uelen         - /UE string (R5-6 only; must be >= 32 bytes).
+   p                 - /P, sign-extended as PDF stores it.
+   id0, id0len       - first element of the trailer's /ID array (may
+                       be zero-length if the document omits /ID,
+                       though that is itself non-conformant).
+   encrypt_metadata  - /EncryptMetadata (default true if absent).
+
+   Returns PDF_OK with *c filled in and c->ok = 1 on success.
+   PDF_E_UNSUP   - a /V, /R or cfm combination this module does not
+                   implement (e.g. unknown /CFM, /V 3, R7+).
+   PDF_E_DATA    - an Encrypt-dictionary string is too short to be
+                   well-formed for the given /V and /R.
+   PDF_E_ENCRYPTED - the crypto checks out, but the empty-password
+                   validation failed - a real user password is
+                   required and this module cannot supply one.        */
+int pdfcrypt_setup(PdfCrypt *c, int v, int r, int length, int cfm,
+                   const u8 *o, u32 olen, const u8 *u, u32 ulen,
+                   const u8 *oe, u32 oelen, const u8 *ue, u32 uelen,
+                   s32 p, const u8 *id0, u32 id0len, int encrypt_metadata);
+
+/* Decrypt one string or stream's raw bytes.  objnum/gennum are the
+   indirect object that directly contains the string/stream (for an
+   object inside an object stream, that is the *container* object
+   stream's number/generation, not the compressed object's own
+   number - object streams are themselves decrypted as a single
+   stream, and the objects they contain are never separately
+   encrypted).  out must have room for at least len bytes; *outlen
+   receives the actual plaintext length.  Safe with out == in.
+
+   Never call this for the /Encrypt dictionary's own strings (/O, /U,
+   /OE, /UE are used to derive the key, not encrypted themselves) or
+   for the trailer's /ID strings, which are always left in the
+   clear.                                                              */
+int pdfcrypt_decrypt(const PdfCrypt *c, u32 objnum, u32 gennum,
+                     const u8 *in, u32 len, u8 *out, u32 *outlen);
+
+#endif

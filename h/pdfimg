@@ -28,6 +28,13 @@ enum {
 
 typedef struct {
     int kind;
+    /* Size the caller will draw this at, in device pixels; set
+       before calling, 0 if unknown.  Only JPEG 2000 uses it, to
+       decode at a matching resolution instead of in full.          */
+    int maxw, maxh;
+    /* Object number of the image XObject, so decoded pixels can be
+       cached and reused; 0 means do not cache (inline images).      */
+    u32 cachekey;
     int w, h;
     u32 *pix;                   /* XRGB32: malloc'd w*h words         */
     const u8 *jpeg;             /* JPEG: pointer into jpegbuf         */
@@ -47,5 +54,18 @@ int pdfimg_inline(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
                   u32 fillrgb, PdfImg *img);
 
 void pdfimg_free(PdfImg *img);
+
+/* --- decoded-image cache -------------------------------------------- */
+
+/* Decoding a multi-megapixel scan costs seconds on slow hardware, and
+   a viewer re-renders the same page constantly (scrolling back, zoom,
+   a redraw after an error box).  Keep the last few decoded images
+   keyed by the object that produced them and the size they were
+   decoded for, so only the first look is expensive.                  */
+void pdfimg_cache_flush(PdfDoc *doc);
+void pdfimg_cache_limit(u32 bytes);
+
+/* Hit/miss counts, so the cache can be checked rather than assumed. */
+void pdfimg_cache_stats(u32 *hits, u32 *misses);
 
 #endif

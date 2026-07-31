@@ -28,6 +28,146 @@
 
 enum { CS_GRAY = 0, CS_RGB, CS_CMYK, CS_INDEXED, CS_UNKNOWN };
 
+/* --- decoded-image cache -------------------------------------------- */
+
+#define IMGCACHE_SLOTS 6
+
+typedef struct {
+    PdfDoc *doc;                /* NULL = empty slot                  */
+    u32 objnum;                 /* the image XObject                  */
+    int maxw, maxh;             /* what it was decoded for            */
+    int w, h;
+    u32 *pix;
+    u32 bytes;
+    u32 tick;
+} ImgCache;
+
+static ImgCache img_cache[IMGCACHE_SLOTS];
+static u32 img_tick;
+static u32 img_bytes;
+static u32 img_limit = 4u * 1024u * 1024u;      /* 4MB by default    */
+static u32 img_hits, img_misses;
+
+void
+pdfimg_cache_stats(u32 *hits, u32 *misses)
+{
+    if (hits) {
+        *hits = img_hits;
+    }
+    if (misses) {
+        *misses = img_misses;
+    }
+}
+
+void
+pdfimg_cache_limit(u32 bytes)
+{
+    img_limit = bytes;
+}
+
+static void
+cache_drop(int i)
+{
+    free(img_cache[i].pix);
+    img_bytes -= img_cache[i].bytes;
+    img_cache[i].pix = NULL;
+    img_cache[i].doc = NULL;
+    img_cache[i].bytes = 0;
+}
+
+void
+pdfimg_cache_flush(PdfDoc *doc)
+{
+    int i;
+
+    for (i = 0; i < IMGCACHE_SLOTS; i++) {
+        if (img_cache[i].doc != NULL &&
+            (doc == NULL || img_cache[i].doc == doc)) {
+            cache_drop(i);
+        }
+    }
+}
+
+/* Look for a decoded copy good enough for this request: same object,
+   and decoded for at least the size being asked for now.            */
+static int
+cache_find(PdfDoc *doc, u32 objnum, int maxw, int maxh)
+{
+    int i;
+
+    if (objnum == 0) {
+        return -1;
+    }
+    for (i = 0; i < IMGCACHE_SLOTS; i++) {
+        if (img_cache[i].doc == doc && img_cache[i].objnum == objnum &&
+            img_cache[i].pix != NULL &&
+            img_cache[i].maxw == maxw && img_cache[i].maxh == maxh) {
+            img_cache[i].tick = ++img_tick;
+            img_hits++;
+            return i;
+        }
+    }
+    img_misses++;
+    return -1;
+}
+
+static void
+cache_put(PdfDoc *doc, u32 objnum, int maxw, int maxh,
+          int w, int h, const u32 *pix)
+{
+    u32 bytes = (u32) w * (u32) h * 4;
+    int i, slot = -1;
+    u32 oldest = 0xffffffffu;
+
+    if (objnum == 0 || bytes == 0 || bytes > img_limit) {
+        return;                         /* never worth caching        */
+    }
+    while (img_bytes + bytes > img_limit) {
+        int victim = -1;
+        u32 old = 0xffffffffu;
+        for (i = 0; i < IMGCACHE_SLOTS; i++) {
+            if (img_cache[i].pix != NULL && img_cache[i].tick < old) {
+                old = img_cache[i].tick;
+                victim = i;
+            }
+        }
+        if (victim < 0) {
+            break;
+        }
+        cache_drop(victim);
+    }
+    for (i = 0; i < IMGCACHE_SLOTS; i++) {
+        if (img_cache[i].pix == NULL) {
+            slot = i;
+            break;
+        }
+        if (img_cache[i].tick < oldest) {
+            oldest = img_cache[i].tick;
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        return;
+    }
+    if (img_cache[slot].pix != NULL) {
+        cache_drop(slot);
+    }
+    img_cache[slot].pix = malloc(bytes);
+    if (img_cache[slot].pix == NULL) {
+        return;
+    }
+    memcpy(img_cache[slot].pix, pix, bytes);
+    img_cache[slot].doc = doc;
+    img_cache[slot].objnum = objnum;
+    img_cache[slot].maxw = maxw;
+    img_cache[slot].maxh = maxh;
+    img_cache[slot].w = w;
+    img_cache[slot].h = h;
+    img_cache[slot].bytes = bytes;
+    img_cache[slot].tick = ++img_tick;
+    img_bytes += bytes;
+}
+
 /* --- small helpers ---------------------------------------------------- */
 
 static int
@@ -545,6 +685,8 @@ out:
 
 /* --- public interface ---------------------------------------------------- */
 
+/* The caller passes the XObject; we key the cache on the object
+   number it came from, which pdf_objnum_of() recovers.              */
 int
 pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
 {
@@ -554,10 +696,33 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
     char stopflt[16];
     PdfBuf buf = { 0 };
     int err;
+    int hintw = img->maxw, hinth = img->maxh;
 
     memset(img, 0, sizeof *img);
+    img->maxw = hintw;              /* set by the caller: keep it    */
+    img->maxh = hinth;
     if (doc == NULL || xobj == NULL || xobj->type != PDF_STREAM) {
         return PDF_E_SYNTAX;
+    }
+    /* already decoded at this size?                                  */
+    {
+        /* Identify the image by where its stream sits in the file:
+           always available, unique, and it does not depend on the
+           resource entry being an indirect reference (it often is
+           not, and the object number then comes back as zero).     */
+        int slot = cache_find(doc, xobj->u.stm.off, hintw, hinth);
+        if (slot >= 0) {
+            u32 bytes = (u32) img_cache[slot].w *
+                        (u32) img_cache[slot].h * 4;
+            img->pix = malloc(bytes);
+            if (img->pix != NULL) {
+                memcpy(img->pix, img_cache[slot].pix, bytes);
+                img->kind = PDFIMG_XRGB32;
+                img->w = img_cache[slot].w;
+                img->h = img_cache[slot].h;
+                return PDF_OK;
+            }
+        }
     }
 
     wobj   = pdf_resolve(doc, pdf_dictget(xobj, "Width"));
@@ -607,7 +772,8 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
             int jw = 0, jh = 0;
             u32 *pix = NULL;
 
-            err = pdfjpx_decode(buf.p, buf.len, &jw, &jh, &pix);
+            err = pdfjpx_decode(buf.p, buf.len, img->maxw, img->maxh,
+                                &jw, &jh, &pix);
             pdfbuf_free(&buf);
             if (err) {
                 return err;
@@ -616,6 +782,7 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
             img->w = jw;
             img->h = jh;
             img->pix = pix;
+            cache_put(doc, xobj->u.stm.off, hintw, hinth, jw, jh, pix);
             return PDF_OK;
         }
         pdfbuf_free(&buf);
@@ -635,6 +802,8 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
         img->w = w;
         img->h = h;
         img->pix = pix;
+        cache_put(doc, xobj->u.stm.off, hintw, hinth, (int) w, (int) h,
+                  pix);
         return PDF_OK;
     }
 }
@@ -649,7 +818,12 @@ pdfimg_inline(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
     PdfBuf buf = { 0 };
     int err;
 
-    memset(img, 0, sizeof *img);
+    {
+        int hw = img->maxw, hh = img->maxh;
+        memset(img, 0, sizeof *img);
+        img->maxw = hw;             /* set by the caller: keep it    */
+        img->maxh = hh;
+    }
     if (doc == NULL || dict == NULL) {
         return PDF_E_SYNTAX;
     }
@@ -695,7 +869,8 @@ pdfimg_inline(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
         int jw = 0, jh = 0;
         u32 *pix = NULL;
 
-        err = pdfjpx_decode(buf.p, buf.len, &jw, &jh, &pix);
+        err = pdfjpx_decode(buf.p, buf.len, img->maxw, img->maxh,
+                            &jw, &jh, &pix);
         pdfbuf_free(&buf);
         if (err) {
             return err;

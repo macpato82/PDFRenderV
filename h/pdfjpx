@@ -21,7 +21,13 @@
    the caller owns.  Handles 1-component grey, 3-component RGB/YCC
    and 4-component CMYK, any bit depth (scaled to 8), subsampled
    components (replicated), and signed components (level-shifted).  */
-int pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp,
-                  u32 **pixp);
+/* maxw/maxh are the size the image will actually be DRAWN at, in
+   device pixels (0 = unknown, decode in full).  JPEG 2000 is
+   resolution-scalable, so a 1257-pixel scan shown 700 pixels wide is
+   decoded at half resolution and four times faster: on a StrongARM
+   that is the difference between a page taking a minute and taking a
+   few seconds.                                                      */
+int pdfjpx_decode(const u8 *src, u32 srclen, int maxw, int maxh,
+                  int *wp, int *hp, u32 **pixp);
 
 #endif
