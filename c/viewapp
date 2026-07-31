@@ -56,6 +56,8 @@ typedef s32 fix;
 #define PDFRenderV_ExtractText 0x5B745
 
 #define XOS_File                (0x08)
+#define XOS_ReadVarVal          (0x23)
+#define XOS_SetVarVal           (0x24)
 #define XOS_Find                (0x0D)
 #define XOS_SpriteOp            (0x2E)
 #define XOS_DynamicArea         (0x66)
@@ -130,6 +132,11 @@ static const struct { int x0, x1; } toollayout[] = {
 #define Msg_ClaimEntity     0xF
 #define Msg_DataRequest     0x10
 #define Msg_ModeChange      0x400C1
+/* Private to the viewer, for finding an existing icon bar instance.
+   Placeholder numbers from our SWI chunk - they need a proper
+   allocation alongside it.                                          */
+#define Msg_BarPing         0x5B740
+#define Msg_BarPong         0x5B741
 #define ENTITY_CLIPBOARD    4           /* bit 2                      */
 
 /* One glyph as PDFRenderV_ExtractText returns it: device units,
@@ -164,6 +171,8 @@ typedef struct {
     /* wimp */
     int task;
     int win, pane;
+    int barh;                   /* scroll bar row height last laid out */
+    int barnested;              /* the bar has been nested in already  */
     int xeig, yeig;
     char pagetxt[16], zoomtxt[12];
     char titletxt[300];
@@ -753,6 +762,17 @@ arrange_toolbar(const int *mainst)
         return;                         /* no scroll bar to sit in    */
     }
 
+    /* Open requests arrive continuously while a window is dragged or
+       scrolled, and the nested Wimp keeps the bar in place by itself
+       once it is anchored.  So do the expensive part - setting the
+       extent and resizing every icon, both of which force redraws -
+       only when the row has actually changed size, which happens on
+       a mode change and not otherwise.  Doing it every time made
+       dragging and paging crawl.                                   */
+    if (vw.barnested && h == vw.barh) {
+        return;
+    }
+
     /* work area = the whole visible area of the bar                  */
     ext[0] = 0;
     ext[1] = -h;
@@ -779,6 +799,8 @@ arrange_toolbar(const int *mainst)
     st[7] = -1;                         /* in front                   */
     _swix(XWimp_OpenWindow, _INR(1, 4), st, WIMP_NEST_MAGIC,
           vw.win, NEST_BOTTOMLEFT);
+    vw.barh = h;
+    vw.barnested = 1;
 }
 
 /* Open the main window (from an open request block) and place the
@@ -1223,16 +1245,11 @@ poll_loop(void)
             if (blk[0] == vw.win) {
                 open_with_pane(blk);
             } else if (blk[0] == vw.pane) {
-                /* Never re-open the bar with the plain form: that
-                   drops its parent link and leaves it floating as a
-                   top-level window.  Go back through the nested
-                   open instead.                                    */
-                int st[16];
-
-                st[0] = vw.win;
-                if (_swix(XWimp_GetWindowState, _IN(1), st) == NULL) {
-                    arrange_toolbar(st);
-                }
+                /* Deliberately nothing.  Once the bar is nested the
+                   Wimp keeps it with its parent, and re-opening it
+                   with the plain form would drop the parent link and
+                   leave it floating as a top-level window.        */
+                ;
             } else {
                 _swix(XWimp_OpenWindow, _IN(1), blk);
             }
@@ -1330,6 +1347,7 @@ poll_loop(void)
                    otherwise the bar ends up a row adrift.         */
                 vw.xeig = readmodevar(4);
                 vw.yeig = readmodevar(5);
+                vw.barnested = 0;       /* force a full re-layout    */
                 set_extent();
                 {
                     int st[16];
@@ -1420,12 +1438,86 @@ bar_open_file(const char *path)
     _swix(XWimp_StartTask, _IN(0), cmd);
 }
 
+/* Is another copy already sitting on the icon bar?
+
+   PDFRenderV$BarTask holds the task handle of whichever copy owns the
+   icon.  Ping that handle directly and wait for the answer: a live
+   copy replies with a pong, and if the handle is stale - the previous
+   copy died without tidying up, or the Wimp has since reused the
+   number for something else - the message either fails outright or
+   bounces back unacknowledged, and we take the icon over.  The
+   message goes to one task rather than being broadcast, so there is
+   no race between the reply and the bounce.                        */
+static int
+bar_already_running(void)
+{
+    int blk[16];
+    int other = 0, len = 0;
+    char val[16];
+    int i;
+
+    if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+              "PDFRenderV$BarTask", val, (int) sizeof val - 1, 0, 3,
+              &len) != NULL || len <= 0) {
+        return 0;
+    }
+    val[len] = 0;
+    other = atoi(val);
+    if (other == 0 || other == vw.task) {
+        return 0;
+    }
+
+    memset(blk, 0, sizeof blk);
+    blk[0] = 20;                        /* message size              */
+    blk[3] = 0;                         /* your_ref: a new message   */
+    blk[4] = Msg_BarPing;
+    if (_swix(XWimp_SendMessage, _INR(0, 2), 18, blk, other) != NULL) {
+        return 0;                       /* no such task              */
+    }
+    for (i = 0; i < 32; i++) {
+        int event = 0;
+
+        if (_swix(XWimp_Poll, _INR(0, 1) | _OUT(0), 1, blk, &event)
+            != NULL) {
+            return 0;
+        }
+        if ((event == 17 || event == 18) && blk[4] == Msg_BarPong) {
+            return 1;                   /* someone is there          */
+        }
+        if (event == 19 && blk[4] == Msg_BarPing) {
+            return 0;                   /* nobody answered           */
+        }
+    }
+    return 0;
+}
+
+static void
+set_bartask(int handle)
+{
+    char val[16];
+
+    if (handle == 0) {
+        _swix(XOS_SetVarVal, _INR(0, 4),
+              "PDFRenderV$BarTask", val, -1, 0, 0);   /* delete      */
+        return;
+    }
+    sprintf(val, "%d", handle);
+    _swix(XOS_SetVarVal, _INR(0, 4),
+          "PDFRenderV$BarTask", val, (int) strlen(val), 0, 0);
+}
+
 static int
 bar_main(void)
 {
     int blk[64];
     int icon = 0;
     int quit = 0;
+
+    /* One icon, however many times the application is started.      */
+    if (bar_already_running()) {
+        _swix(XWimp_CloseDown, _INR(0, 1), vw.task, WIMP_NEST_MAGIC);
+        return 0;
+    }
 
     /* Icon bar, left-hand (device) side, immediately to the right of
        the ROM 'Apps' icon.  Handle -5 is "left side, scanning from the
@@ -1446,6 +1538,7 @@ bar_main(void)
               0x4F000000, blk, &icon) != NULL) {
         return 1;
     }
+    set_bartask(vw.task);
     build_barmenu();
 
     while (!quit) {
@@ -1487,6 +1580,17 @@ bar_main(void)
                 blk[4] = Msg_DataLoadAck;
                 _swix(XWimp_SendMessage, _INR(0, 2), 17, blk, blk[1]);
                 break;
+            case Msg_BarPing:
+                /* another copy is starting up and asking whether the
+                   icon is taken.  It is.                          */
+                {
+                    int who = blk[1];
+
+                    blk[3] = blk[2];
+                    blk[4] = Msg_BarPong;
+                    _swix(XWimp_SendMessage, _INR(0, 2), 17, blk, who);
+                }
+                break;
             default:
                 break;
             }
@@ -1495,6 +1599,7 @@ bar_main(void)
             break;
         }
     }
+    set_bartask(0);
     {
         int del[2];                     /* blk has long since been
                                            overwritten by Wimp_Poll  */
@@ -1523,7 +1628,8 @@ main(int argc, char **argv)
     {
         static const int wanted[] = {
             Msg_DataSave, Msg_DataSaveAck, Msg_DataLoad,
-            Msg_ClaimEntity, Msg_DataRequest, 0
+            Msg_ClaimEntity, Msg_DataRequest,
+            Msg_ModeChange, Msg_BarPing, Msg_BarPong, 0
         };
         /* 380, not 310: the nested Wimp only makes its child-window
            features available to a task that asks for that version,
