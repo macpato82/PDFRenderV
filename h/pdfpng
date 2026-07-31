@@ -1,0 +1,34 @@
+/*
+  PDFRender - baseline PNG (ISO/IEC 15948) decoding.
+
+  A self-contained chunk walker over the existing Flate/predictor
+  layer: no OpenJPEG-style external library here, just IHDR/PLTE/
+  tRNS/IDAT/IEND parsing feeding pdf_inflate() and pdf_predict() from
+  pdfflt.h, so the module needs neither its own inflate nor its own
+  Sub/Up/Average/Paeth unfilter.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFPNG_H
+#define PDFPNG_H
+
+#include "pdftypes.h"
+
+/* Decode a PNG image (signature plus IHDR/PLTE/tRNS/IDAT/IEND chunks;
+   every other chunk type is skipped) to XRGB32 (red in bits 0-7, row
+   0 = top), matching PdfImg's/pdfjpx_decode's pixel contract.  wp and
+   hp receive the dimensions, pixp a malloc'd w*h word buffer the
+   caller owns.  Handles colour types 0/2/3/4/6 (grey, truecolour,
+   indexed, grey+alpha, truecolour+alpha) at their legal bit depths -
+   1/2/4/8/16 for grey, 8/16 for truecolour and the two alpha types,
+   1/2/4/8 for indexed - and composites any alpha channel or tRNS
+   transparency against a white background.  Adam7 interlacing (IHDR
+   interlace method 1) is refused with PDF_E_UNSUP; anything malformed
+   or truncated is PDF_E_DATA; oversized images are PDF_E_LIMIT.      */
+int pdfpng_decode(const u8 *src, u32 srclen, int *wp, int *hp,
+                  u32 **pixp);
+
+#endif

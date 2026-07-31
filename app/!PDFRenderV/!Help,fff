@@ -1,7 +1,9 @@
 PDFRenderV
 ==========
 
-A native PDF renderer and viewer for RISC OS 5.
+A native PDF renderer and previewer for RISC OS 5.  As well as PDFs
+it opens JPEG, PNG, Sprite and Draw files in the same window, with
+the same zoom and printing, so one viewer covers everything.
 
 Installation
 ------------

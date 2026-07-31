@@ -1,0 +1,471 @@
+/*
+  PDFRender - baseline PNG decode wrapper.
+
+  Walks the chunk stream by hand (length/type/data/CRC, CRC ignored),
+  keeping IHDR's fields, any PLTE/tRNS bytes and the concatenation of
+  every IDAT's data.  The concatenated IDAT bytes go through the
+  shared pdf_inflate() (PNG's IDAT is always zlib-wrapped DEFLATE,
+  exactly what that function expects) and then the shared
+  pdf_predict() with predictor 15 - the PNG per-row-filter-byte case -
+  which both unfilters and compacts the rows in place.  What is left
+  is one Sub/Up/Average/Paeth-free array of tightly packed samples,
+  row-major, which png_expand() turns into XRGB32 the same way
+  pdfimg.c's expand_pixels() does for the non-PNG image path: a
+  bit-exact sample fetch (png_sample), a scale to 0..255
+  (png_scale255) and, where transparency applies, a composite against
+  a white page (composite_white).
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfflt.h"
+#include "pdfpng.h"
+
+enum {
+    CT_GRAY  = 0,
+    CT_RGB   = 2,
+    CT_IDX   = 3,
+    CT_GA    = 4,
+    CT_RGBA  = 6
+};
+
+/* --- chunk-level bookkeeping ------------------------------------------ */
+
+typedef struct {
+    int width, height;
+    int bitdepth, colortype;
+    int colors;                 /* samples per pixel for this colortype */
+
+    u8  plte[256 * 3];
+    int plte_n;                 /* palette entries actually present     */
+
+    int have_trns;
+    u8  trns_alpha[256];        /* colour type 3: per-palette-entry     */
+    u32 trns_n;
+    u32 trns_gray;              /* colour type 0: single transparent grey */
+    u32 trns_r, trns_g, trns_b; /* colour type 2: single transparent RGB */
+} PngHdr;
+
+static u32
+be32(const u8 *p)
+{
+    return ((u32) p[0] << 24) | ((u32) p[1] << 16) |
+           ((u32) p[2] << 8)  |  (u32) p[3];
+}
+
+static u32
+be16(const u8 *p)
+{
+    return ((u32) p[0] << 8) | (u32) p[1];
+}
+
+/* Parse IHDR's 13 data bytes, validating everything the format spec
+   and PDFRender's own limits require.  Interlace method 1 (Adam7) is
+   the one legal-but-unsupported case, reported separately so the
+   caller can distinguish it from outright corruption.                */
+static int
+parse_ihdr(const u8 *d, u32 len, PngHdr *h)
+{
+    int compression, filtermethod, interlace;
+    u32 w, ht;
+
+    if (len != 13) {
+        return PDF_E_DATA;
+    }
+    w  = be32(d);
+    ht = be32(d + 4);
+    if (w == 0 || ht == 0) {
+        return PDF_E_DATA;
+    }
+    if (w > 8192 || ht > 8192) {
+        return PDF_E_LIMIT;
+    }
+    if (w * ht > 4194304u) {
+        return PDF_E_LIMIT;
+    }
+    h->width  = (int) w;
+    h->height = (int) ht;
+    h->bitdepth  = d[8];
+    h->colortype = d[9];
+    compression  = d[10];
+    filtermethod = d[11];
+    interlace    = d[12];
+
+    if (compression != 0 || filtermethod != 0) {
+        return PDF_E_DATA;
+    }
+    if (interlace == 1) {
+        return PDF_E_UNSUP;
+    }
+    if (interlace != 0) {
+        return PDF_E_DATA;
+    }
+
+    switch (h->colortype) {
+    case CT_GRAY:
+        if (h->bitdepth != 1 && h->bitdepth != 2 && h->bitdepth != 4 &&
+            h->bitdepth != 8 && h->bitdepth != 16) {
+            return PDF_E_DATA;
+        }
+        h->colors = 1;
+        break;
+    case CT_RGB:
+        if (h->bitdepth != 8 && h->bitdepth != 16) {
+            return PDF_E_DATA;
+        }
+        h->colors = 3;
+        break;
+    case CT_IDX:
+        if (h->bitdepth != 1 && h->bitdepth != 2 && h->bitdepth != 4 &&
+            h->bitdepth != 8) {
+            return PDF_E_DATA;
+        }
+        h->colors = 1;
+        break;
+    case CT_GA:
+        if (h->bitdepth != 8 && h->bitdepth != 16) {
+            return PDF_E_DATA;
+        }
+        h->colors = 2;
+        break;
+    case CT_RGBA:
+        if (h->bitdepth != 8 && h->bitdepth != 16) {
+            return PDF_E_DATA;
+        }
+        h->colors = 4;
+        break;
+    default:
+        return PDF_E_DATA;
+    }
+    return PDF_OK;
+}
+
+static int
+parse_plte(const u8 *d, u32 len, PngHdr *h)
+{
+    if (len == 0 || len % 3 != 0 || len > 256u * 3u) {
+        return PDF_E_DATA;
+    }
+    memcpy(h->plte, d, len);
+    h->plte_n = (int) (len / 3);
+    return PDF_OK;
+}
+
+/* tRNS's shape depends on the colour type, already known from IHDR
+   (chunk order is enforced below, so IHDR has always been seen).
+   Colour types 4 and 6 carry a full alpha channel already and never
+   use tRNS; a tRNS chunk turning up there is simply ignored.         */
+static int
+parse_trns(const u8 *d, u32 len, PngHdr *h)
+{
+    if (h->colortype == CT_IDX) {
+        if (h->plte_n == 0 || len > 256u) {
+            return PDF_E_DATA;
+        }
+        memcpy(h->trns_alpha, d, len);
+        h->trns_n = len;
+        h->have_trns = 1;
+    } else if (h->colortype == CT_GRAY) {
+        if (len != 2) {
+            return PDF_E_DATA;
+        }
+        h->trns_gray = be16(d);
+        if (h->bitdepth == 16) {
+            h->trns_gray >>= 8;      /* pipeline only keeps the high byte */
+        }
+        h->have_trns = 1;
+    } else if (h->colortype == CT_RGB) {
+        if (len != 6) {
+            return PDF_E_DATA;
+        }
+        h->trns_r = be16(d);
+        h->trns_g = be16(d + 2);
+        h->trns_b = be16(d + 4);
+        if (h->bitdepth == 16) {
+            h->trns_r >>= 8;
+            h->trns_g >>= 8;
+            h->trns_b >>= 8;
+        }
+        h->have_trns = 1;
+    }
+    return PDF_OK;
+}
+
+/* --- sample fetch / scale / composite ---------------------------------- */
+
+/* Fetch sample idx (0-based, component-interleaved) from a tightly
+   packed row: MSB-first bit order, first sample in the high bits.
+   16-bit samples yield only the high byte, matching the module's
+   8-bit pixel pipeline (mirrors img_sample() in c/pdfimg).           */
+static u32
+png_sample(const u8 *row, u32 idx, int bpc)
+{
+    u32 bitpos, byteoff, bitoff, shift, mask;
+
+    if (bpc == 8) {
+        return row[idx];
+    }
+    if (bpc == 16) {
+        return row[idx * 2];
+    }
+    bitpos = idx * (u32) bpc;
+    byteoff = bitpos >> 3;
+    bitoff = bitpos & 7u;
+    shift = 8u - bitoff - (u32) bpc;
+    mask = (1u << bpc) - 1u;
+    return (row[byteoff] >> shift) & mask;
+}
+
+/* Scale a bpc-wide sample to 0..255 (identity for bpc 8, and for the
+   16-bit high byte already extracted by png_sample).                 */
+static u32
+png_scale255(u32 v, int bpc)
+{
+    int eff = bpc == 16 ? 8 : bpc;
+    u32 maxv = (1u << eff) - 1u;
+
+    return maxv ? v * 255u / maxv : 0u;
+}
+
+/* out = colour composited over a white page at the given alpha
+   (0 = fully transparent, 255 = fully opaque).                       */
+static u32
+composite_white(u32 colour, u32 alpha)
+{
+    return 255u - ((255u - colour) * alpha) / 255u;
+}
+
+/* --- row expansion ------------------------------------------------------ */
+
+/* data/len is the fully unfiltered, row-major sample array (no filter
+   bytes - pdf_predict() already consumed those).  Builds *outpix
+   (malloc'd, w*h words, caller frees).                                */
+static int
+png_expand(const PngHdr *h, const u8 *data, u32 len, u32 **outpix)
+{
+    u32 rowbytes, npix, y;
+    u32 *pix;
+
+    rowbytes = ((u32) h->colors * (u32) h->bitdepth * (u32) h->width + 7u)
+             / 8u;
+    /* colors<=4, bitdepth<=16, width/height<=8192 (IHDR-checked), so
+       rowbytes<=65536 and rowbytes*height<=2^29: no u32 overflow.    */
+    if (rowbytes == 0 || rowbytes * (u32) h->height > len) {
+        return PDF_E_DATA;
+    }
+    npix = (u32) h->width * (u32) h->height;   /* <= 4194304, IHDR-checked */
+    pix = malloc((size_t) npix * sizeof(u32));
+    if (pix == NULL) {
+        return PDF_E_NOMEM;
+    }
+
+    for (y = 0; y < (u32) h->height; y++) {
+        const u8 *row = data + y * rowbytes;
+        u32 *dstrow = pix + y * (u32) h->width;
+        int x;
+
+        for (x = 0; x < h->width; x++) {
+            u32 r, g, b, a;
+
+            switch (h->colortype) {
+            case CT_GRAY: {
+                u32 raw = png_sample(row, (u32) x, h->bitdepth);
+                u32 v = png_scale255(raw, h->bitdepth);
+
+                a = (h->have_trns && raw == h->trns_gray) ? 0u : 255u;
+                r = g = b = composite_white(v, a);
+                break;
+            }
+            case CT_RGB: {
+                u32 rr = png_sample(row, (u32) x * 3u, h->bitdepth);
+                u32 gg = png_sample(row, (u32) x * 3u + 1u, h->bitdepth);
+                u32 bb = png_sample(row, (u32) x * 3u + 2u, h->bitdepth);
+
+                a = (h->have_trns && rr == h->trns_r && gg == h->trns_g &&
+                     bb == h->trns_b) ? 0u : 255u;
+                r = composite_white(png_scale255(rr, h->bitdepth), a);
+                g = composite_white(png_scale255(gg, h->bitdepth), a);
+                b = composite_white(png_scale255(bb, h->bitdepth), a);
+                break;
+            }
+            case CT_IDX: {
+                u32 idx = png_sample(row, (u32) x, h->bitdepth);
+
+                if ((int) idx < h->plte_n) {
+                    r = h->plte[idx * 3];
+                    g = h->plte[idx * 3 + 1];
+                    b = h->plte[idx * 3 + 2];
+                } else {
+                    r = g = b = 0;          /* beyond the palette: black */
+                }
+                a = (h->have_trns && idx < h->trns_n)
+                    ? h->trns_alpha[idx] : 255u;
+                r = composite_white(r, a);
+                g = composite_white(g, a);
+                b = composite_white(b, a);
+                break;
+            }
+            case CT_GA: {
+                u32 vv = png_sample(row, (u32) x * 2u, h->bitdepth);
+                u32 aa = png_sample(row, (u32) x * 2u + 1u, h->bitdepth);
+                u32 v = png_scale255(vv, h->bitdepth);
+
+                a = png_scale255(aa, h->bitdepth);
+                r = g = b = composite_white(v, a);
+                break;
+            }
+            default: {                      /* CT_RGBA */
+                u32 rr = png_sample(row, (u32) x * 4u, h->bitdepth);
+                u32 gg = png_sample(row, (u32) x * 4u + 1u, h->bitdepth);
+                u32 bb = png_sample(row, (u32) x * 4u + 2u, h->bitdepth);
+                u32 aa = png_sample(row, (u32) x * 4u + 3u, h->bitdepth);
+
+                a = png_scale255(aa, h->bitdepth);
+                r = composite_white(png_scale255(rr, h->bitdepth), a);
+                g = composite_white(png_scale255(gg, h->bitdepth), a);
+                b = composite_white(png_scale255(bb, h->bitdepth), a);
+                break;
+            }
+            }
+            dstrow[x] = r | (g << 8) | (b << 16);
+        }
+    }
+    *outpix = pix;
+    return PDF_OK;
+}
+
+/* --- public interface ---------------------------------------------------- */
+
+static const u8 pngsig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+
+int
+pdfpng_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
+{
+    PngHdr h;
+    PdfBuf idat, raw;
+    u32 pos;
+    int have_ihdr = 0, seen_iend = 0, first = 1;
+    int err = PDF_E_DATA;
+    u32 *pix = NULL;
+
+    *wp = *hp = 0;
+    *pixp = NULL;
+    memset(&h, 0, sizeof h);
+    idat.p = NULL; idat.len = 0; idat.cap = 0;
+    raw.p  = NULL; raw.len  = 0; raw.cap  = 0;
+
+    if (src == NULL || srclen < 8 || memcmp(src, pngsig, 8) != 0) {
+        return PDF_E_DATA;
+    }
+
+    pos = 8;
+    while (pos < srclen && !seen_iend) {
+        u32 remain = srclen - pos;
+        u32 clen;
+        const u8 *ctype, *cdata;
+
+        if (remain < 8) {
+            err = PDF_E_DATA;              /* truncated chunk header */
+            goto out;
+        }
+        clen  = be32(src + pos);
+        ctype = src + pos + 4;
+        pos += 8;
+        remain = srclen - pos;
+        if (clen > remain || remain - clen < 4) {
+            err = PDF_E_DATA;              /* truncated chunk data/CRC */
+            goto out;
+        }
+        cdata = src + pos;
+        pos += clen + 4;                   /* data, then the ignored CRC */
+
+        if (first) {
+            if (memcmp(ctype, "IHDR", 4) != 0) {
+                err = PDF_E_DATA;
+                goto out;
+            }
+            first = 0;
+        }
+
+        if (memcmp(ctype, "IHDR", 4) == 0) {
+            if (have_ihdr) {
+                err = PDF_E_DATA;          /* duplicate IHDR */
+                goto out;
+            }
+            err = parse_ihdr(cdata, clen, &h);
+            if (err) {
+                goto out;
+            }
+            have_ihdr = 1;
+        } else if (memcmp(ctype, "PLTE", 4) == 0) {
+            err = parse_plte(cdata, clen, &h);
+            if (err) {
+                goto out;
+            }
+        } else if (memcmp(ctype, "tRNS", 4) == 0) {
+            if (!have_ihdr) {
+                err = PDF_E_DATA;
+                goto out;
+            }
+            err = parse_trns(cdata, clen, &h);
+            if (err) {
+                goto out;
+            }
+        } else if (memcmp(ctype, "IDAT", 4) == 0) {
+            if (clen) {
+                err = pdfbuf_need(&idat, clen);
+                if (err) {
+                    goto out;
+                }
+                memcpy(idat.p + idat.len, cdata, clen);
+                idat.len += clen;
+            }
+        } else if (memcmp(ctype, "IEND", 4) == 0) {
+            seen_iend = 1;
+        }
+        /* every other chunk type is skipped: pos has already moved on */
+    }
+
+    if (!have_ihdr || idat.len == 0) {
+        err = PDF_E_DATA;
+        goto out;
+    }
+    if (h.colortype == CT_IDX && h.plte_n == 0) {
+        err = PDF_E_DATA;                  /* indexed image needs PLTE */
+        goto out;
+    }
+
+    err = pdf_inflate(idat.p, idat.len, &raw);
+    if (err) {
+        goto out;
+    }
+    pdfbuf_free(&idat);
+
+    err = pdf_predict(raw.p, &raw.len, 15, h.colors, h.bitdepth, h.width);
+    if (err) {
+        goto out;
+    }
+
+    err = png_expand(&h, raw.p, raw.len, &pix);
+    if (err) {
+        goto out;
+    }
+
+    *wp = h.width;
+    *hp = h.height;
+    *pixp = pix;
+    pix = NULL;
+    err = PDF_OK;
+
+out:
+    pdfbuf_free(&idat);
+    pdfbuf_free(&raw);
+    free(pix);
+    return err;
+}

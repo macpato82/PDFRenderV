@@ -149,6 +149,7 @@ typedef struct {
     u32 cliplen;
     int ownclip;
     int savemyref;              /* my_ref of the DataSave we sent     */
+    int isimage;                /* JPEG/PNG/Sprite/Draw, not a PDF    */
     int quit;
 } Viewer;
 
@@ -1218,6 +1219,15 @@ main(int argc, char **argv)
         }
         vw.handle = handle;
         vw.npages = (u32) npages;
+    }
+    /* PDFRenderV_Info returns the filetype in R1 for non-PDF files,
+       so the viewer can tell a document from a picture              */
+    {
+        int pages = 0, info = 0;
+        if (_swix(PDFRenderV_Info, _IN(0) | _OUT(0) | _OUT(1),
+                  vw.handle, &pages, &info) == NULL) {
+            vw.isimage = info > 0xFF;   /* a filetype, not a version */
+        }
     }
     dbg(3);
 

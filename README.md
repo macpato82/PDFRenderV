@@ -1,9 +1,11 @@
 # PDFRenderV
 
-A fast, native PDF renderer and viewer for RISC OS 5: a softloadable
+A fast, native document previewer for RISC OS 5 - a softloadable
 relocatable module (the engine + SWIs + *Commands) and a small
-absolute application (`aif.Viewer`) providing the desktop viewer
-window with its toolbar. One binary runs on everything from
+absolute application (`aif.Viewer`) providing the desktop window
+with its toolbar.  It opens **PDF, JPEG, PNG, Sprite and Draw**
+files in the same window with the same zoom, selection and printing,
+so one viewer covers everything. One binary runs on everything from
 ARMv5 (Iyonix/XScale) through ARMv7 (iMX6/ARMX6, Titanium, Pi) to
 ARMv8 AArch32: the core is integer-only 16.16 fixed point (no FPA, no
 VFP), and the Norcroft build emits no ARMv6+ encodings.
@@ -70,9 +72,24 @@ between "the module is loaded" and "PDFs just open".
 
 ## The viewer
 
-Double-clicking a PDF (filetype &ADF) opens the viewer: window +
-toolbar `[<] [n/N] [>]  [-] [zoom%] [+]  [Print]`, scrollable page,
-zoom 25-400%, vector printing through PDriver.
+Double-clicking any supported file opens it: window + toolbar
+`[<] [n/N] [>]  [-] [zoom%] [+]  [Print]`, scrollable page, zoom
+25-400%, vector printing through PDriver.  On a PDF the Menu button
+over the page also offers Copy / Select all / Save text, with
+click-drag text selection.
+
+| Type | | Rendered by |
+|---|---|---|
+| PDF | &ADF | this engine |
+| JPEG | &C85 | SpriteExtend (`JPEG_PlotScaled`) |
+| PNG | &B60 | `c/pdfpng`, reusing our inflate and PNG predictors |
+| Sprite | &FF9 | `OS_SpriteOp 52` |
+| Draw | &AFF | `DrawFile_Render` |
+
+`PDFRenderV$Claim` lists which filetypes the module takes over
+(default: all five).  Drop `FF9` to keep Paint on sprites, or `AFF`
+to keep Draw on drawings; every claimed type is handed back when the
+module is killed, and only if the alias still points at our viewer.
 
 The module claims `Alias$@RunType_ADF` at init (only when
 `PDFRenderV$Viewer` is set) and releases it at finalisation, so
