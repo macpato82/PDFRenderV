@@ -863,6 +863,53 @@ mod_swi(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = (int) n;
             return NULL;
         }
+    case SWIOFF_ExtractLinks:
+        {
+            DocSlot *ds = get_doc(r->r[1]);
+            PdfLink *lk = NULL;
+            char *uris = NULL;
+            u32 n = 0, ulen = 0, need;
+            int err;
+
+            if (ds == NULL) {
+                return err_BadHandle;
+            }
+            if (ds->kind != FT_PDF) {
+                r->r[0] = 0;            /* an image has no links     */
+                r->r[1] = 0;
+                return NULL;
+            }
+            if (r->r[2] < 1 || (u32) r->r[2] > ds->doc->npages) {
+                return err_BadPage;
+            }
+            err = pdf_extractlinks(ds->doc, (u32) r->r[2] - 1,
+                                   r->r[3] ? (fix) r->r[3] : FX_ONE,
+                                   &lk, &n, &uris, &ulen);
+            if (err != PDF_OK) {
+                free(lk);
+                free(uris);
+                return pdferr_to_os(err);
+            }
+            /* the records first, then the strings they point at, so
+               the whole lot is one block the caller can keep       */
+            need = n * (u32) sizeof(PdfLink) + ulen;
+            if (r->r[4] != 0 && (u32) r->r[5] >= need && need > 0) {
+                u8 *dst = (u8 *) r->r[4];
+                u32 base = n * (u32) sizeof(PdfLink);
+                u32 i;
+
+                memcpy(dst, lk, base);
+                memcpy(dst + base, uris, ulen);
+                for (i = 0; i < n; i++) {
+                    ((PdfLink *) dst)[i].uoff += base;
+                }
+            }
+            free(lk);
+            free(uris);
+            r->r[0] = (int) need;
+            r->r[1] = (int) n;
+            return NULL;
+        }
     default:
         return err_BadSWI;
     }

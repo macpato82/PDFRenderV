@@ -1490,6 +1490,199 @@ pdf_extracttext(PdfDoc *doc, u32 pageidx, fix zoom, PdfGlyph **outp,
     return PDF_OK;
 }
 
+
+/* --- link annotations --------------------------------------------------
+
+   /Annots entries of /Subtype /Link whose /A action is /S /URI.  The
+   rectangle is in default user space, so it goes through exactly the
+   same page-to-device matrix pdf_runpage builds - including /Rotate
+   and a MediaBox whose origin is not (0,0) - and the result lands in
+   the same space as the glyphs from pdf_extracttext.                */
+
+static void
+page_matrix(PdfDoc *doc, PdfObj *page, fix zoom, fix m[6])
+{
+    fix ox, oy, pw, ph;
+    int rotate;
+
+    mediabox(doc, page, &ox, &oy, &pw, &ph);
+    {
+        PdfObj *rot = pdf_resolve(doc, pdf_dictget(page, "Rotate"));
+        int r = pdfobj_int_of(rot);
+
+        rotate = ((r % 360) + 360) % 360;
+        if (rotate != 90 && rotate != 180 && rotate != 270) {
+            rotate = 0;
+        }
+    }
+    switch (rotate) {
+    default:
+        m[0] = zoom; m[1] = 0;
+        m[2] = 0;    m[3] = zoom;
+        m[4] = -fx_mul(ox, zoom);
+        m[5] = -fx_mul(oy, zoom);
+        break;
+    case 90:
+        m[0] = 0;    m[1] = -zoom;
+        m[2] = zoom; m[3] = 0;
+        m[4] = -fx_mul(oy, zoom);
+        m[5] = fx_mul(ox + pw, zoom);
+        break;
+    case 180:
+        m[0] = -zoom; m[1] = 0;
+        m[2] = 0;     m[3] = -zoom;
+        m[4] = fx_mul(ox + pw, zoom);
+        m[5] = fx_mul(oy + ph, zoom);
+        break;
+    case 270:
+        m[0] = 0;     m[1] = zoom;
+        m[2] = -zoom; m[3] = 0;
+        m[4] = fx_mul(oy + ph, zoom);
+        m[5] = -fx_mul(ox, zoom);
+        break;
+    }
+}
+
+/* The /URI of an annotation's action, or NULL.  Follows /A, and the
+   /Next chain is ignored - one link, one destination.               */
+static PdfObj *
+link_uri(PdfDoc *doc, PdfObj *annot)
+{
+    PdfObj *a, *s, *u;
+
+    if (!pdf_isname(pdf_resolve(doc, pdf_dictget(annot, "Subtype")),
+                    "Link")) {
+        return NULL;
+    }
+    a = pdf_resolve(doc, pdf_dictget(annot, "A"));
+    if (a == NULL || a->type != PDF_DICT) {
+        return NULL;                    /* /Dest: an internal jump   */
+    }
+    s = pdf_resolve(doc, pdf_dictget(a, "S"));
+    if (!pdf_isname(s, "URI")) {
+        return NULL;
+    }
+    u = pdf_resolve(doc, pdf_dictget(a, "URI"));
+    if (u == NULL || u->type != PDF_STRING || u->u.str.len == 0) {
+        return NULL;
+    }
+    return u;
+}
+
+int
+pdf_extractlinks(PdfDoc *doc, u32 pageidx, fix zoom,
+                 PdfLink **outp, u32 *nout, char **uris, u32 *urilen)
+{
+    PdfObj *page, *annots;
+    PdfLink *out = NULL;
+    char *blob = NULL;
+    u32 n = 0, cap = 0, bl = 0, bcap = 0, i, count;
+    fix m[6];
+
+    *outp = NULL;
+    *nout = 0;
+    *uris = NULL;
+    *urilen = 0;
+    if (doc == NULL || pageidx >= doc->npages || zoom <= 0) {
+        return PDF_E_RANGE;
+    }
+    page = doc->pages[pageidx];
+    annots = pdf_resolve(doc, pdf_dictget(page, "Annots"));
+    if (annots == NULL || annots->type != PDF_ARRAY) {
+        return PDF_OK;                  /* no annotations at all     */
+    }
+    page_matrix(doc, page, zoom, m);
+
+    count = pdf_arrlen(annots);
+    for (i = 0; i < count; i++) {
+        PdfObj *an = pdf_resolve(doc, pdf_arrget(annots, i));
+        PdfObj *rect, *u;
+        fix c[8];
+        fix lo_x, lo_y, hi_x, hi_y;
+        int k;
+
+        if (an == NULL || an->type != PDF_DICT) {
+            continue;
+        }
+        u = link_uri(doc, an);
+        if (u == NULL) {
+            continue;
+        }
+        rect = pdf_resolve(doc, pdf_dictget(an, "Rect"));
+        if (rect == NULL || pdf_arrlen(rect) != 4) {
+            continue;
+        }
+        {
+            fix rx0 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(rect, 0)));
+            fix ry0 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(rect, 1)));
+            fix rx1 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(rect, 2)));
+            fix ry1 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(rect, 3)));
+
+            /* all four corners, so a rotated page still gives a
+               sensible axis-aligned box                            */
+            c[0] = fx_mul(m[0], rx0) + fx_mul(m[2], ry0) + m[4];
+            c[1] = fx_mul(m[1], rx0) + fx_mul(m[3], ry0) + m[5];
+            c[2] = fx_mul(m[0], rx1) + fx_mul(m[2], ry0) + m[4];
+            c[3] = fx_mul(m[1], rx1) + fx_mul(m[3], ry0) + m[5];
+            c[4] = fx_mul(m[0], rx1) + fx_mul(m[2], ry1) + m[4];
+            c[5] = fx_mul(m[1], rx1) + fx_mul(m[3], ry1) + m[5];
+            c[6] = fx_mul(m[0], rx0) + fx_mul(m[2], ry1) + m[4];
+            c[7] = fx_mul(m[1], rx0) + fx_mul(m[3], ry1) + m[5];
+        }
+        lo_x = hi_x = c[0];
+        lo_y = hi_y = c[1];
+        for (k = 1; k < 4; k++) {
+            if (c[k * 2] < lo_x)     lo_x = c[k * 2];
+            if (c[k * 2] > hi_x)     hi_x = c[k * 2];
+            if (c[k * 2 + 1] < lo_y) lo_y = c[k * 2 + 1];
+            if (c[k * 2 + 1] > hi_y) hi_y = c[k * 2 + 1];
+        }
+
+        if (n == cap) {
+            u32 ncap = cap ? cap * 2 : 8;
+            PdfLink *nl = realloc(out, ncap * sizeof *nl);
+
+            if (nl == NULL) {
+                free(out);
+                free(blob);
+                return PDF_E_NOMEM;
+            }
+            out = nl;
+            cap = ncap;
+        }
+        if (bl + u->u.str.len + 1 > bcap) {
+            u32 ncap = bcap ? bcap * 2 : 256;
+            char *nb;
+
+            while (bl + u->u.str.len + 1 > ncap) {
+                ncap *= 2;
+            }
+            nb = realloc(blob, ncap);
+            if (nb == NULL) {
+                free(out);
+                free(blob);
+                return PDF_E_NOMEM;
+            }
+            blob = nb;
+            bcap = ncap;
+        }
+        out[n].x0 = lo_x;
+        out[n].y0 = lo_y;
+        out[n].x1 = hi_x;
+        out[n].y1 = hi_y;
+        out[n].uoff = bl;
+        memcpy(blob + bl, u->u.str.p, u->u.str.len);
+        bl += u->u.str.len;
+        blob[bl++] = 0;
+        n++;
+    }
+    *outp = out;
+    *nout = n;
+    *uris = blob;
+    *urilen = bl;
+    return PDF_OK;
+}
+
 int
 pdf_runpage(PdfDoc *doc, u32 pageidx, PdfBackend *be, fix zoom)
 {

@@ -132,4 +132,20 @@ typedef struct {
 int pdf_extracttext(PdfDoc *doc, u32 pageidx, fix zoom,
                     PdfGlyph **outp, u32 *nout);
 
+/* One /Link annotation whose action opens a URI, in the same device
+   space and at the same zoom as PdfGlyph, so a viewer can hit-test
+   both against the pixels it has on screen.  uoff is a byte offset
+   into the string blob returned alongside.                          */
+typedef struct {
+    s32 x0, y0, x1, y1;
+    u32 uoff;
+} PdfLink;
+
+/* Collect the page's URI links.  *outp gets a malloc'd array and
+   *uris a malloc'd blob of NUL-terminated strings; the caller owns
+   both.  A page with no links succeeds with *nout == 0.             */
+int pdf_extractlinks(PdfDoc *doc, u32 pageidx, fix zoom,
+                     PdfLink **outp, u32 *nout,
+                     char **uris, u32 *urilen);
+
 #endif

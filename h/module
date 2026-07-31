@@ -16,5 +16,6 @@
 #define SWIOFF_PageSize 3
 #define SWIOFF_Render   4
 #define SWIOFF_ExtractText 5
+#define SWIOFF_ExtractLinks 6
 
 #endif

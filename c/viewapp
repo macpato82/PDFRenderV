@@ -54,6 +54,13 @@ typedef s32 fix;
 #define PDFRenderV_PageSize  0x5B743
 #define PDFRenderV_Render    0x5B744
 #define PDFRenderV_ExtractText 0x5B745
+#define PDFRenderV_ExtractLinks 0x5B746
+
+/* AcornURI: the configured handler decides which browser opens it.
+   R0 = flags (0: fire and forget), R1 = the URL, R2 = 0; bit 0 of the
+   returned R0 means the dispatch failed.                            */
+#define XURI_Dispatch           (0x4E381)
+#define URI_DISPATCH_FAILED     1
 
 #define XOS_File                (0x08)
 #define XOS_ReadVarVal          (0x23)
@@ -132,6 +139,7 @@ static const struct { int x0, x1; } toollayout[] = {
 #define Msg_ClaimEntity     0xF
 #define Msg_DataRequest     0x10
 #define Msg_ModeChange      0x400C1
+#define Msg_URLOpen         0x4AF80      /* the older ANT broadcast  */
 /* Private to the viewer, for finding an existing icon bar instance.
    Placeholder numbers from our SWI chunk - they need a proper
    allocation alongside it.                                          */
@@ -145,6 +153,13 @@ typedef struct {
     s32 x0, y0, x1, y1;
     u32 ch;
 } Glyph;
+
+/* One /Link annotation as PDFRenderV_ExtractLinks returns it: the same
+   device space as Glyph, with uoff a byte offset into the same block. */
+typedef struct {
+    s32 x0, y0, x1, y1;
+    u32 uoff;
+} Link;
 
 /* toolbar icon numbers (creation order below) */
 #define IC_PREV  0
@@ -179,6 +194,10 @@ typedef struct {
     /* text selection */
     Glyph *glyphs;
     u32 nglyphs;
+    u8 *links;                  /* Link records then the URI strings  */
+    u32 nlinks;
+    char pendurl[512];          /* URL awaiting an ANT bounce         */
+    int pendref;
     int selfrom, selto;         /* glyph indices, -1 = no selection   */
     int dragging;
     int anchor;
@@ -271,6 +290,7 @@ ensure_doc(void)
 }
 
 static void load_glyphs(fix zoomfix);
+static void load_links(fix zoomfix);
 static void free_glyphs(void);
 static void clipboard_copy(void);
 static void save_selection(void);
@@ -355,9 +375,149 @@ render_page(void)
     }
     vw.sprw = w;
     vw.sprh = h;
-    /* selection follows the page, at the same zoom as the pixels    */
+    /* selection and links follow the page, at the same zoom as the
+       pixels they have to line up with                              */
     load_glyphs((fix) (((s64) vw.zoom << 16) / 80));
+    load_links((fix) (((s64) vw.zoom << 16) / 80));
     return 0;
+}
+
+
+/* --- links ------------------------------------------------------------ */
+
+static void
+free_links(void)
+{
+    free(vw.links);
+    vw.links = NULL;
+    vw.nlinks = 0;
+}
+
+/* Pull the page's URI links at the zoom the sprite was rendered with,
+   so the boxes line up with the pixels on screen - same convention as
+   the glyphs.                                                        */
+static void
+load_links(fix zoomfix)
+{
+    int need = 0, count = 0;
+    _kernel_oserror *e;
+
+    free_links();
+    e = _swix(PDFRenderV_ExtractLinks, _INR(0, 5) | _OUT(0) | _OUT(1),
+              0, vw.handle, vw.page + 1, zoomfix, 0, 0, &need, &count);
+    if (e != NULL || need <= 0 || count <= 0) {
+        return;                         /* most pages have no links   */
+    }
+    vw.links = malloc((u32) need);
+    if (vw.links == NULL) {
+        return;
+    }
+    e = _swix(PDFRenderV_ExtractLinks, _INR(0, 5) | _OUT(0) | _OUT(1),
+              0, vw.handle, vw.page + 1, zoomfix, vw.links, need,
+              &need, &count);
+    if (e != NULL) {
+        free_links();
+        return;
+    }
+    vw.nlinks = (u32) count;
+}
+
+/* Which link is at this work-area point, or -1.  Work-area y runs
+   downwards from 0, the same mapping glyph_at uses.                 */
+static int
+link_at(int wx, int wy)
+{
+    const Link *l = (const Link *) vw.links;
+    int top = -(vw.sprh << vw.yeig);
+    u32 i;
+
+    for (i = 0; i < vw.nlinks; i++) {
+        int x0 = (FX_TOINT(l[i].x0)) << vw.xeig;
+        int x1 = (FX_TOINT(l[i].x1)) << vw.xeig;
+        int y0 = top + ((FX_TOINT(l[i].y0)) << vw.yeig);
+        int y1 = top + ((FX_TOINT(l[i].y1)) << vw.yeig);
+
+        if (wx >= x0 && wx < x1 && wy >= y0 && wy < y1) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+/* Open a URL the way RISC OS expects, trying each mechanism in turn
+   because which one works depends on what the user has installed:
+
+     1. AcornURI's URI_Dispatch - the modern route, and the one that
+        respects the configured handler.  Absent on plenty of systems,
+        including the machine this was developed on, in which case the
+        SWI is simply not known.
+     2. the older ANT broadcast, which NetSurf and its contemporaries
+        still answer.  Sent "recorded" so we hear about it bouncing.
+     3. if it bounces, nobody is listening, so start the browser
+        through the URLOpen_<scheme> alias its !Boot sets up.
+
+   Steps 2 and 3 are split across the poll loop: the bounce arrives as
+   a User_Message_Acknowledge, handled there.                        */
+static void
+start_urlopen(const char *url)
+{
+    char cmd[600];
+    const char *colon = strchr(url, ':');
+    int n = colon ? (int) (colon - url) : 0;
+
+    if (n <= 0 || n > 16) {
+        report("That link has no scheme this can open");
+        return;
+    }
+    sprintf(cmd, "URLOpen_%.*s %.500s", n, url, url);
+    if (_swix(XWimp_StartTask, _IN(0), cmd) != NULL) {
+        report("Nothing here is set up to open that kind of link");
+    }
+}
+
+static void
+open_link(int idx)
+{
+    const Link *l = (const Link *) vw.links;
+    const char *url;
+    int flags = 0;
+
+    if (idx < 0 || (u32) idx >= vw.nlinks) {
+        return;
+    }
+    url = (const char *) (vw.links + l[idx].uoff);
+
+    if (_swix(XURI_Dispatch, _INR(0, 2) | _OUT(0), 0, url, 0,
+              &flags) == NULL &&
+        (flags & URI_DISPATCH_FAILED) == 0) {
+        return;                         /* AcornURI took it          */
+    }
+
+    /* ANT: the URL goes straight in the message body when it fits    */
+    {
+        int blk[64];
+        u32 len = strlen(url);
+
+        if (len + 1 > sizeof vw.pendurl) {
+            start_urlopen(url);
+            return;
+        }
+        strcpy(vw.pendurl, url);
+        if (len < 232) {
+            memset(blk, 0, sizeof blk);
+            blk[0] = (int) (20 + ((len + 4) & ~3u));
+            blk[3] = 0;                 /* your_ref: a new message   */
+            blk[4] = Msg_URLOpen;
+            strcpy((char *) &blk[5], url);
+            if (_swix(XWimp_SendMessage, _INR(0, 2), 18, blk, 0)
+                == NULL) {
+                vw.pendref = blk[2];    /* my_ref, filled in by the
+                                           Wimp: match the bounce    */
+                return;
+            }
+        }
+        start_urlopen(url);
+    }
 }
 
 /* --- text selection -------------------------------------------------- */
@@ -1320,6 +1480,16 @@ poll_loop(void)
                    keyboard shortcuts reach us                      */
                 _swix(XWimp_SetCaretPosition, _INR(0, 5),
                       vw.win, -1, 0, 0, (1 << 25) | 40, 0);
+                /* a link takes the click before any selection does,
+                   but only on the press - not on a drag through it */
+                if ((blk[2] & 4) != 0) {
+                    int li = link_at(wx, wy);
+
+                    if (li >= 0) {
+                        open_link(li);
+                        break;
+                    }
+                }
                 idx = glyph_at(wx, wy);
                 if (idx >= 0) {
                     vw.anchor = idx;
@@ -1366,6 +1536,16 @@ poll_loop(void)
                 toolbar_click(IC_PREV);
             } else {
                 _swix(0x400E6, _INR(0, 1), 0, blk);     /* pass on   */
+            }
+            break;
+        case 19:                        /* our message came back     */
+            if (blk[4] == Msg_URLOpen && blk[2] == vw.pendref &&
+                vw.pendurl[0] != 0) {
+                /* nobody answered the ANT broadcast: fall back to
+                   starting the browser through its alias          */
+                vw.pendref = 0;
+                start_urlopen(vw.pendurl);
+                vw.pendurl[0] = 0;
             }
             break;
         case 17:
