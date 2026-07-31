@@ -1,0 +1,46 @@
+/*
+  PDFRender - JBIG2 generic region decoding.
+
+  JBIG2 is a big standard, and most of it is about coding text as a
+  dictionary of symbols and a list of placements.  This decodes the
+  other half: the generic region, which codes a bitmap directly with
+  an adaptive arithmetic coder and a template of already-decoded
+  neighbouring pixels.  That is what an MRC-compressed scan uses for
+  the stencil that separates text from background, and it is the one
+  part of JBIG2 that stands on its own - no dictionaries, no tables,
+  no cross-segment state.
+
+  In: the embedded-stream segment organisation PDF uses, page
+  information and immediate generic region segments, arithmetic
+  coding, all four templates, adaptive template pixels anywhere, and
+  typical prediction.
+
+  Out: symbol dictionaries and text regions, halftone regions,
+  refinement, and MMR-coded generic regions (MMR is T.6, a codec of
+  its own).  Those return PDF_E_UNSUP, which leaves the caller with
+  an image it can still draw rather than no image at all.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFJBIG2_H
+#define PDFJBIG2_H
+
+#include "pdftypes.h"
+
+/* Decode an embedded JBIG2 stream to w x h packed 1bpp rows.
+
+   glob/glen are the /JBIG2Globals stream, already filter-decoded, or
+   NULL/0 if the image has none.
+
+   The result is *outp, malloc'd, ((w + 7) / 8) * h bytes, MSB first,
+   and in PDF's sense rather than JBIG2's: JBIG2 codes a 1 for a black
+   pixel, a PDF 1-bit image sample of 0 is black, so the bits are
+   inverted on the way out and the buffer can be handed straight to
+   the ordinary image expansion.                                    */
+int pdfjbig2_decode(const u8 *glob, u32 glen, const u8 *data, u32 dlen,
+                    int w, int h, u8 **outp, u32 *outlenp);
+
+#endif

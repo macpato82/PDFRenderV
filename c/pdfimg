@@ -8,8 +8,10 @@
   buffer, then hand that to expand_pixels(), the one shared pixel-
   expansion core.  A DCTDecode-terminated stream is passed through
   untouched for SpriteExtend's JPEG plotter; a JPXDecode-terminated
-  one goes to c/pdfjpx (OpenJPEG) and comes back as pixels; the
-  remaining image-only filters (CCITTFax/JBIG2) are refused.
+  one goes to c/pdfjpx (OpenJPEG) and comes back as pixels; a
+  JBIG2Decode-terminated one goes to c/pdfjbig2 and comes back as the
+  1-bit samples it codes, which the expansion core can take as they
+  stand.  CCITTFax is refused.
 
   Copyright (c) RISC OS Technologies 2026.
   SPDX-License-Identifier: CDDL-1.0
@@ -25,6 +27,7 @@
 #include "pdffile.h"
 #include "pdfimg.h"
 #include "pdfjpx.h"
+#include "pdfjbig2.h"
 
 enum { CS_GRAY = 0, CS_RGB, CS_CMYK, CS_INDEXED, CS_UNKNOWN };
 
@@ -716,6 +719,190 @@ plane_at(const u8 *p, int w, int h, int x, int y, int dw, int dh)
     return p[(u32) sy * (u32) w + (u32) sx];
 }
 
+/* Build the coverage plane straight from the mask's samples.
+
+   A stencil is one bit a pixel at scan resolution, so it is routinely
+   four times the size of the image it applies to - expanding it
+   through the ordinary image path would cost a word a pixel, tens of
+   megabytes, to carry one bit of information each.  Reading the
+   samples here costs the packed rows and nothing else.
+
+   Minifying is done by averaging the source footprint rather than
+   picking one pixel out of it.  At a quarter scale a 300dpi glyph
+   stroke is a fraction of a pixel wide, and nearest-neighbour
+   sampling of it gives a scatter of dots; the average gives partial
+   coverage, which is what makes the text legible when it is
+   composited.                                                      */
+static int
+mask_plane_direct(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
+                  int stencil, u8 **outp)
+{
+    PdfBuf buf = { 0 };
+    char stopflt[16];
+    PdfObj *o;
+    s32 mw, mh, bpc;
+    u32 rowbytes;
+    u8 *plane;
+    int *xmap = NULL, *ymap = NULL;
+    int inv = 0, x, y, err;
+
+    *outp = NULL;
+    mw = pdfobj_int_of(pdf_resolve(doc, pdf_dictget(mobj, "Width")));
+    mh = pdfobj_int_of(pdf_resolve(doc, pdf_dictget(mobj, "Height")));
+    if (mw < 1 || mh < 1) {
+        return PDF_E_SYNTAX;
+    }
+    if (num_nonzero(pdf_resolve(doc, pdf_dictget(mobj, "ImageMask")))) {
+        bpc = 1;
+    } else {
+        bpc = pdfobj_int_of(pdf_resolve(doc, pdf_dictget(mobj,
+                                                        "BitsPerComponent")));
+        if (bpc != 1 && bpc != 8) {
+            return PDF_E_UNSUP;         /* leave it to the pixel path  */
+        }
+        /* only a single-component mask can be read this way           */
+        o = pdf_resolve(doc, pdf_dictget(mobj, "ColorSpace"));
+        if (o != NULL) {
+            int kind = CS_UNKNOWN, ncomp = 1;
+
+            if (plain_cs_kind(doc, o, &kind, &ncomp) != PDF_OK || ncomp != 1) {
+                return PDF_E_UNSUP;
+            }
+        }
+    }
+    o = pdf_resolve(doc, pdf_dictget(mobj, "Decode"));
+    if (o != NULL && o->type == PDF_ARRAY && pdf_arrlen(o) >= 1) {
+        inv = num_nonzero(pdf_resolve(doc, pdf_arrget(o, 0)));
+    }
+
+    err = pdf_streamdata(doc, mobj, &buf, stopflt);
+    if (err != PDF_OK) {
+        pdfbuf_free(&buf);
+        return err;
+    }
+    if (stopflt[0] != 0) {
+        if (strcmp(stopflt, "JBIG2Decode") != 0) {
+            pdfbuf_free(&buf);
+            return PDF_E_UNSUP;
+        }
+        {
+            u8 *bits = NULL;
+            u32 blen = 0;
+            PdfBuf gbuf = { 0 };
+            PdfObj *parms = pdf_resolve(doc, pdf_dictget(mobj, "DecodeParms"));
+            PdfObj *g = NULL;
+
+            if (parms != NULL && parms->type == PDF_DICT) {
+                g = pdf_resolve(doc, pdf_dictget(parms, "JBIG2Globals"));
+            }
+            if (g != NULL && g->type == PDF_STREAM &&
+                pdf_streamdata(doc, g, &gbuf, NULL) != PDF_OK) {
+                pdfbuf_free(&gbuf);
+            }
+            err = pdfjbig2_decode(gbuf.p, gbuf.len, buf.p, buf.len,
+                                  (int) mw, (int) mh, &bits, &blen);
+            pdfbuf_free(&gbuf);
+            pdfbuf_free(&buf);
+            if (err != PDF_OK) {
+                return err;
+            }
+            buf.p = bits;
+            buf.len = blen;
+            buf.cap = blen;
+            bpc = 1;
+        }
+    }
+    rowbytes = ((u32) mw * (u32) bpc + 7u) / 8u;
+    if (buf.len < rowbytes * (u32) mh) {
+        pdfbuf_free(&buf);
+        return PDF_E_DATA;
+    }
+    plane = malloc((u32) basew * (u32) baseh);
+    if (plane == NULL) {
+        pdfbuf_free(&buf);
+        return PDF_E_NOMEM;
+    }
+    /* Where each destination pixel's footprint starts, worked out
+       once.  Doing it in the loop costs two 64-bit divisions per
+       pixel, and a division on an ARM without one is a called
+       routine: at a couple of million pixels that is most of the
+       time this function takes.                                    */
+    xmap = malloc(((u32) basew + 1) * sizeof *xmap);
+    ymap = malloc(((u32) baseh + 1) * sizeof *ymap);
+    if (xmap == NULL || ymap == NULL) {
+        free(xmap);
+        free(ymap);
+        free(plane);
+        pdfbuf_free(&buf);
+        return PDF_E_NOMEM;
+    }
+    for (x = 0; x <= basew; x++) {
+        xmap[x] = (int) (((s64) x * mw) / basew);
+    }
+    for (y = 0; y <= baseh; y++) {
+        ymap[y] = (int) (((s64) y * mh) / baseh);
+    }
+
+    for (y = 0; y < baseh; y++) {
+        int sy0 = ymap[y];
+        int sy1 = ymap[y + 1];
+        int ystep;
+
+        if (sy1 <= sy0) {
+            sy1 = sy0 + 1;
+        }
+        if (sy1 > mh) {
+            sy1 = (int) mh;
+        }
+        ystep = (sy1 - sy0 + 7) / 8;    /* at most 8 rows sampled     */
+        for (x = 0; x < basew; x++) {
+            int sx0 = xmap[x];
+            int sx1 = xmap[x + 1];
+            u32 sum = 0, n = 0;
+            int sx, sy, xstep;
+
+            if (sx1 <= sx0) {
+                sx1 = sx0 + 1;
+            }
+            if (sx1 > mw) {
+                sx1 = (int) mw;
+            }
+            xstep = (sx1 - sx0 + 7) / 8;
+            for (sy = sy0; sy < sy1; sy += ystep) {
+                const u8 *row = buf.p + (u32) sy * rowbytes;
+
+                for (sx = sx0; sx < sx1; sx += xstep) {
+                    u32 v;
+
+                    if (bpc == 1) {
+                        v = (row[sx >> 3] >> (7 - (sx & 7))) & 1u;
+                        if (inv) {
+                            v ^= 1u;
+                        }
+                        /* a sample of 0 paints, and painted is the
+                           part of the base image that is kept       */
+                        sum += stencil ? (v ? 0u : 255u) : (v ? 255u : 0u);
+                    } else {
+                        v = row[sx];
+                        if (inv) {
+                            v = 255u - v;
+                        }
+                        sum += stencil ? (v < 128u ? 255u : 0u) : v;
+                    }
+                    n++;
+                }
+            }
+            plane[(u32) y * (u32) basew + (u32) x] =
+                (u8) (n ? sum / n : 0u);
+        }
+    }
+    free(xmap);
+    free(ymap);
+    pdfbuf_free(&buf);
+    *outp = plane;
+    return PDF_OK;
+}
+
 /* Decode a mask image (soft or stencil) to a coverage plane the size
    of the base image.  stencil means 1-bit /ImageMask semantics.    */
 static int
@@ -728,6 +915,15 @@ load_mask_plane(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
     int x, y, err;
 
     *outp = NULL;
+    /* Ordinary masks are plain samples and are read as such; only a
+       JPEG- or JPEG 2000-coded soft mask needs the pixel path.      */
+    err = mask_plane_direct(doc, mobj, basew, baseh, stencil, outp);
+    if (err == PDF_OK) {
+        return PDF_OK;
+    }
+    if (err != PDF_E_UNSUP) {
+        return err;
+    }
     memset(&m, 0, sizeof m);
     /* A stencil mask is an ImageMask; loading it with a black fill
        gives 0 where it paints and white where it does not, which is
@@ -890,27 +1086,6 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
     if (doc == NULL || xobj == NULL || xobj->type != PDF_STREAM) {
         return PDF_E_SYNTAX;
     }
-    /* already decoded at this size?                                  */
-    {
-        /* Identify the image by where its stream sits in the file:
-           always available, unique, and it does not depend on the
-           resource entry being an indirect reference (it often is
-           not, and the object number then comes back as zero).     */
-        int slot = cache_find(doc, xobj->u.stm.off, hintw, hinth);
-        if (slot >= 0) {
-            u32 bytes = (u32) img_cache[slot].w *
-                        (u32) img_cache[slot].h * 4;
-            img->pix = malloc(bytes);
-            if (img->pix != NULL) {
-                memcpy(img->pix, img_cache[slot].pix, bytes);
-                img->kind = PDFIMG_XRGB32;
-                img->w = img_cache[slot].w;
-                img->h = img_cache[slot].h;
-                return PDF_OK;
-            }
-        }
-    }
-
     wobj   = pdf_resolve(doc, pdf_dictget(xobj, "Width"));
     hobj   = pdf_resolve(doc, pdf_dictget(xobj, "Height"));
     bpcobj = pdf_resolve(doc, pdf_dictget(xobj, "BitsPerComponent"));
@@ -935,10 +1110,80 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
         maskinvert = num_nonzero(pdf_arrget(decobj, 0));
     }
 
+    /* Already decoded at this size?  The cache holds pixels only, so
+       the mask is rebuilt here as well - it is cheap next to decoding
+       the image, and returning cached pixels without it would make an
+       image lose its transparency the second time it is drawn.
+
+       The image is identified by where its stream sits in the file:
+       always available, unique, and it does not depend on the resource
+       entry being an indirect reference (it often is not, and the
+       object number then comes back as zero).                      */
+    {
+        int slot = cache_find(doc, xobj->u.stm.off, hintw, hinth);
+
+        if (slot >= 0) {
+            u32 bytes = (u32) img_cache[slot].w *
+                        (u32) img_cache[slot].h * 4;
+
+            img->pix = malloc(bytes);
+            if (img->pix != NULL) {
+                memcpy(img->pix, img_cache[slot].pix, bytes);
+                img->kind = PDFIMG_XRGB32;
+                img->w = img_cache[slot].w;
+                img->h = img_cache[slot].h;
+                attach_mask(doc, xobj, img, (int) bpc);
+                return PDF_OK;
+            }
+        }
+    }
+
     err = pdf_streamdata(doc, xobj, &buf, stopflt);
     if (err) {
         pdfbuf_free(&buf);
         return err;
+    }
+
+    if (stopflt[0] != 0 && strcmp(stopflt, "JBIG2Decode") == 0) {
+        /* JBIG2 is a whole codec, but its output is ordinary 1-bit
+           image data, so decoding it here turns the stream back into
+           something the expansion below can take.  A failure leaves
+           stopflt set and falls into the refusal underneath.        */
+        u8 *bits = NULL;
+        u32 blen = 0;
+        PdfBuf gbuf = { 0 };
+        PdfObj *parms = pdf_resolve(doc, pdf_dictget(xobj, "DecodeParms"));
+        PdfObj *g = NULL;
+
+        if (parms != NULL && parms->type == PDF_ARRAY) {
+            u32 i;
+
+            for (i = 0; i < pdf_arrlen(parms) && g == NULL; i++) {
+                PdfObj *e = pdf_resolve(doc, pdf_arrget(parms, i));
+
+                if (e != NULL && e->type == PDF_DICT) {
+                    g = pdf_resolve(doc, pdf_dictget(e, "JBIG2Globals"));
+                }
+            }
+        } else if (parms != NULL) {
+            g = pdf_resolve(doc, pdf_dictget(parms, "JBIG2Globals"));
+        }
+        if (g != NULL && g->type == PDF_STREAM) {
+            if (pdf_streamdata(doc, g, &gbuf, NULL) != PDF_OK) {
+                pdfbuf_free(&gbuf);
+            }
+        }
+        err = pdfjbig2_decode(gbuf.p, gbuf.len, buf.p, buf.len,
+                              (int) w, (int) h, &bits, &blen);
+        pdfbuf_free(&gbuf);
+        if (err == PDF_OK) {
+            pdfbuf_free(&buf);
+            buf.p = bits;
+            buf.len = blen;
+            buf.cap = blen;
+            bpc = 1;
+            stopflt[0] = 0;
+        }
     }
 
     if (stopflt[0] != 0) {
@@ -981,6 +1226,10 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
             img->h = jh;
             img->pix = pix;
             cache_put(doc, xobj->u.stm.off, hintw, hinth, jw, jh, pix);
+            /* JPEG 2000 is what an MRC scan codes its foreground with,
+               and that foreground is exactly the layer that carries a
+               mask: attach it here too, not only on the plain path. */
+            attach_mask(doc, xobj, img, 8);
             return PDF_OK;
         }
         pdfbuf_free(&buf);

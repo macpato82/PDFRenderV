@@ -1,0 +1,719 @@
+/*
+  PDFRender - JBIG2 generic region decoding.  See h/pdfjbig2.
+
+  Two pieces.  The MQ coder is the same adaptive binary arithmetic
+  coder JPEG 2000 uses, driven by a table of probability states.  The
+  generic region procedure decodes one pixel at a time, choosing the
+  coder's context from a fixed template of pixels above and to the
+  left - all of them already decoded, which is what lets the decoder
+  form the same context the encoder did without being told it.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfjbig2.h"
+
+/* --- MQ arithmetic decoder (ITU-T T.88 annex E) --------------------- */
+
+typedef struct {
+    u16 qe;                             /* LPS probability estimate    */
+    u8 nmps, nlps, sw;
+} MqState;
+
+static const MqState mq_tab[47] = {
+    { 0x5601,  1,  1, 1 }, { 0x3401,  2,  6, 0 }, { 0x1801,  3,  9, 0 },
+    { 0x0AC1,  4, 12, 0 }, { 0x0521,  5, 29, 0 }, { 0x0221, 38, 33, 0 },
+    { 0x5601,  7,  6, 1 }, { 0x5401,  8, 14, 0 }, { 0x4801,  9, 14, 0 },
+    { 0x3801, 10, 14, 0 }, { 0x3001, 11, 17, 0 }, { 0x2401, 12, 18, 0 },
+    { 0x1C01, 13, 20, 0 }, { 0x1601, 29, 21, 0 }, { 0x5601, 15, 14, 1 },
+    { 0x5401, 16, 14, 0 }, { 0x5101, 17, 15, 0 }, { 0x4801, 18, 16, 0 },
+    { 0x3801, 19, 17, 0 }, { 0x3401, 20, 18, 0 }, { 0x3001, 21, 19, 0 },
+    { 0x2801, 22, 19, 0 }, { 0x2401, 23, 20, 0 }, { 0x2201, 24, 21, 0 },
+    { 0x1C01, 25, 22, 0 }, { 0x1801, 26, 23, 0 }, { 0x1601, 27, 24, 0 },
+    { 0x1401, 28, 25, 0 }, { 0x1201, 29, 26, 0 }, { 0x1101, 30, 27, 0 },
+    { 0x0AC1, 31, 28, 0 }, { 0x09C1, 32, 29, 0 }, { 0x08A1, 33, 30, 0 },
+    { 0x0521, 34, 31, 0 }, { 0x0441, 35, 32, 0 }, { 0x02A1, 36, 33, 0 },
+    { 0x0221, 37, 34, 0 }, { 0x0141, 38, 35, 0 }, { 0x0111, 39, 36, 0 },
+    { 0x0085, 40, 37, 0 }, { 0x0049, 41, 38, 0 }, { 0x0025, 42, 39, 0 },
+    { 0x0015, 43, 40, 0 }, { 0x0009, 44, 41, 0 }, { 0x0005, 45, 42, 0 },
+    { 0x0001, 45, 43, 0 }, { 0x5601, 46, 46, 0 }
+};
+
+typedef struct {
+    const u8 *bp, *end;
+    u32 c, a;
+    int ct;
+} Mq;
+
+/* Past the end of the data the coder is defined to see &FF, which is
+   the start of a marker: a truncated stream then decodes to something
+   rather than reading off the end of the buffer.                    */
+static u8
+mq_b(const Mq *mq, int i)
+{
+    return mq->bp + i < mq->end ? mq->bp[i] : 0xFF;
+}
+
+static void
+mq_bytein(Mq *mq)
+{
+    if (mq_b(mq, 0) == 0xFF) {
+        if (mq_b(mq, 1) > 0x8F) {
+            mq->c += 0xFF00;
+            mq->ct = 8;
+        } else {
+            mq->bp++;
+            mq->c += (u32) mq_b(mq, 0) << 9;
+            mq->ct = 7;
+        }
+    } else {
+        mq->bp++;
+        mq->c += (u32) mq_b(mq, 0) << 8;
+        mq->ct = 8;
+    }
+}
+
+static void
+mq_init(Mq *mq, const u8 *data, u32 len)
+{
+    mq->bp = data;
+    mq->end = data + len;
+    mq->c = (u32) mq_b(mq, 0) << 16;
+    mq->ct = 0;
+    mq_bytein(mq);
+    mq->c <<= 7;
+    mq->ct -= 7;
+    mq->a = 0x8000;
+}
+
+static void
+mq_renorm(Mq *mq)
+{
+    do {
+        if (mq->ct == 0) {
+            mq_bytein(mq);
+        }
+        mq->a <<= 1;
+        mq->c <<= 1;
+        mq->ct--;
+    } while ((mq->a & 0x8000) == 0);
+    mq->a &= 0xFFFF;
+}
+
+/* A context is one byte: the state index in bits 1-7, the sense of
+   the more probable symbol in bit 0.                                */
+static int
+mq_decode(Mq *mq, u8 *cxp)
+{
+    u32 i = (u32) (*cxp >> 1);
+    u32 mps = (u32) (*cxp & 1);
+    u32 qe = mq_tab[i].qe;
+    int d;
+
+    mq->a -= qe;
+    if (((mq->c >> 16) & 0xFFFF) < qe) {
+        if (mq->a < qe) {               /* LPS exchange, MPS decoded  */
+            d = (int) mps;
+            *cxp = (u8) ((mq_tab[i].nmps << 1) | mps);
+        } else {
+            d = (int) (1 - mps);
+            if (mq_tab[i].sw) {
+                mps ^= 1;
+            }
+            *cxp = (u8) ((mq_tab[i].nlps << 1) | mps);
+        }
+        mq->a = qe;
+        mq_renorm(mq);
+    } else {
+        mq->c -= (u32) qe << 16;
+        if ((mq->a & 0x8000) == 0) {
+            if (mq->a < qe) {           /* MPS exchange, LPS decoded  */
+                d = (int) (1 - mps);
+                if (mq_tab[i].sw) {
+                    mps ^= 1;
+                }
+                *cxp = (u8) ((mq_tab[i].nlps << 1) | mps);
+            } else {
+                d = (int) mps;
+                *cxp = (u8) ((mq_tab[i].nmps << 1) | mps);
+            }
+            mq_renorm(mq);
+        } else {
+            d = (int) mps;
+        }
+    }
+    return d;
+}
+
+/* --- bitmaps -------------------------------------------------------- */
+
+typedef struct {
+    int w, h;
+    u32 stride;
+    u8 *bits;                           /* MSB first, 1 = black       */
+} Bm;
+
+static int
+bm_alloc(Bm *b, int w, int h, int fill)
+{
+    b->w = w;
+    b->h = h;
+    b->stride = (u32) ((w + 7) / 8);
+    b->bits = malloc(b->stride * (u32) h);
+    if (b->bits == NULL) {
+        return PDF_E_NOMEM;
+    }
+    memset(b->bits, fill ? 0xFF : 0x00, b->stride * (u32) h);
+    return PDF_OK;
+}
+
+static void
+bm_free(Bm *b)
+{
+    free(b->bits);
+    b->bits = NULL;
+}
+
+static int
+bm_get(const Bm *b, int x, int y)
+{
+    if (x < 0 || y < 0 || x >= b->w || y >= b->h) {
+        return 0;
+    }
+    return (b->bits[(u32) y * b->stride + (u32) (x >> 3)] >> (7 - (x & 7))) & 1;
+}
+
+static void
+bm_set(Bm *b, int x, int y, int v)
+{
+    u8 *p;
+
+    if (x < 0 || y < 0 || x >= b->w || y >= b->h) {
+        return;
+    }
+    p = &b->bits[(u32) y * b->stride + (u32) (x >> 3)];
+    if (v) {
+        *p |= (u8) (0x80 >> (x & 7));
+    } else {
+        *p &= (u8) ~(0x80 >> (x & 7));
+    }
+}
+
+/* Pack a row of one-byte-per-pixel values into the bitmap.          */
+static void
+bm_packrow(Bm *b, int y, const u8 *row)
+{
+    u8 *out = b->bits + (u32) y * b->stride;
+    int x;
+    u32 i;
+
+    for (i = 0; i < b->stride; i++) {
+        out[i] = 0;
+    }
+    for (x = 0; x < b->w; x++) {
+        if (row[x]) {
+            out[x >> 3] |= (u8) (0x80 >> (x & 7));
+        }
+    }
+}
+
+#define COMB_OR         0
+#define COMB_AND        1
+#define COMB_XOR        2
+#define COMB_XNOR       3
+#define COMB_REPLACE    4
+
+static void
+bm_compose(Bm *page, const Bm *r, int x0, int y0, int op)
+{
+    int x, y;
+
+    if ((x0 & 7) == 0) {
+        /* byte aligned, which is the usual case: whole bytes at a
+           time, with the region's padding bits masked off the last  */
+        u8 last = (u8) (r->w & 7 ? 0xFF << (8 - (r->w & 7)) : 0xFF);
+
+        for (y = 0; y < r->h; y++) {
+            int py = y0 + y;
+            u32 i, n = r->stride;
+            const u8 *s;
+            u8 *d;
+
+            if (py < 0 || py >= page->h) {
+                continue;
+            }
+            s = r->bits + (u32) y * r->stride;
+            d = page->bits + (u32) py * page->stride + (u32) (x0 >> 3);
+            if ((u32) (x0 >> 3) + n > page->stride) {
+                n = page->stride - (u32) (x0 >> 3);
+            }
+            for (i = 0; i < n; i++) {
+                u8 m = i == r->stride - 1 ? last : 0xFF;
+                u8 v = s[i];
+
+                switch (op) {
+                case COMB_AND:     d[i] &= (u8) (v | ~m);           break;
+                case COMB_XOR:     d[i] ^= (u8) (v & m);            break;
+                case COMB_XNOR:    d[i] ^= (u8) (~v & m);           break;
+                case COMB_REPLACE: d[i] = (u8) ((d[i] & ~m) | (v & m)); break;
+                default:           d[i] |= (u8) (v & m);            break;
+                }
+            }
+        }
+        return;
+    }
+    for (y = 0; y < r->h; y++) {
+        for (x = 0; x < r->w; x++) {
+            int s = bm_get(r, x, y);
+            int d = bm_get(page, x0 + x, y0 + y);
+            int v;
+
+            switch (op) {
+            case COMB_AND:     v = d & s;        break;
+            case COMB_XOR:     v = d ^ s;        break;
+            case COMB_XNOR:    v = (d ^ s) ^ 1;  break;
+            case COMB_REPLACE: v = s;            break;
+            default:           v = d | s;        break;
+            }
+            bm_set(page, x0 + x, y0 + y, v);
+        }
+    }
+}
+
+/* --- generic region decoding (6.2.5.7) ------------------------------ */
+
+/* The context is the template's pixels read in raster order, the
+   top-left one most significant.  With the adaptive pixels at their
+   nominal positions every row of the template is a contiguous run,
+   which is what makes the sliding update below possible.           */
+typedef struct { int dy, lo, hi; } Span;
+
+static const Span tmpl_span[4][3] = {
+    { { -2, -2,  2 }, { -1, -3,  3 }, {  0, -4, -1 } },
+    { { -2, -1,  2 }, { -1, -2,  3 }, {  0, -3, -1 } },
+    { { -2, -1,  1 }, { -1, -2,  2 }, {  0, -2, -1 } },
+    { { -1, -3,  2 }, {  0, -4, -1 }, {  0,  0, -1 } }
+};
+static const int tmpl_nspan[4] = { 3, 3, 3, 2 };
+
+/* The adaptive pixels' nominal positions, as x,y pairs.             */
+static const s8 tmpl_at[4][8] = {
+    {  3, -1, -3, -1,  2, -2, -2, -2 },
+    {  3, -1,  0,  0,  0,  0,  0,  0 },
+    {  2, -1,  0,  0,  0,  0,  0,  0 },
+    {  2, -1,  0,  0,  0,  0,  0,  0 }
+};
+static const int tmpl_nat[4] = { 4, 1, 1, 1 };
+
+/* Context used for the typical-prediction bit, from table 6.        */
+static const u16 tmpl_sltp[4] = { 0x9B25, 0x0795, 0x00E5, 0x0195 };
+
+static int
+at_is_nominal(int tmpl, const s8 *at)
+{
+    int i, n = tmpl_nat[tmpl] * 2;
+
+    for (i = 0; i < n; i++) {
+        if (at[i] != tmpl_at[tmpl][i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The slow path: any adaptive pixel anywhere.  One gather of the
+   whole template per pixel, which costs several times what the
+   sliding path does, but keeps unusual encoders working.           */
+typedef struct { int dx, dy; } Pix;
+
+static int
+build_template(int tmpl, const s8 *at, Pix *p)
+{
+    /* the fixed part of each template, in raster order               */
+    static const Pix fixed[4][12] = {
+        { {-1,-2},{0,-2},{1,-2},{-2,-1},{-1,-1},{0,-1},{1,-1},{2,-1},
+          {-4,0},{-3,0},{-2,0},{-1,0} },
+        { {-1,-2},{0,-2},{1,-2},{2,-2},{-2,-1},{-1,-1},{0,-1},{1,-1},
+          {2,-1},{-3,0},{-2,0},{-1,0} },
+        { {-1,-2},{0,-2},{1,-2},{-2,-1},{-1,-1},{0,-1},{1,-1},{-2,0},
+          {-1,0},{0,0},{0,0},{0,0} },
+        { {-3,-1},{-2,-1},{-1,-1},{0,-1},{1,-1},{-4,0},{-3,0},{-2,0},
+          {-1,0},{0,0},{0,0},{0,0} }
+    };
+    static const int nfixed[4] = { 12, 12, 9, 9 };
+    int n = nfixed[tmpl];
+    int i, j;
+
+    for (i = 0; i < n; i++) {
+        p[i] = fixed[tmpl][i];
+    }
+    for (i = 0; i < tmpl_nat[tmpl]; i++) {
+        p[n].dx = at[i * 2];
+        p[n].dy = at[i * 2 + 1];
+        n++;
+    }
+    /* raster order, so that the nominal case agrees with the sliding
+       path and with the typical-prediction context values           */
+    for (i = 1; i < n; i++) {
+        Pix t = p[i];
+
+        for (j = i; j > 0 && (p[j - 1].dy > t.dy ||
+                              (p[j - 1].dy == t.dy && p[j - 1].dx > t.dx));
+             j--) {
+            p[j] = p[j - 1];
+        }
+        p[j] = t;
+    }
+    return n;
+}
+
+static int
+decode_generic(Mq *mq, u8 *cx, int tmpl, int tpgdon, const s8 *at, Bm *bm)
+{
+    u8 *rows[3] = { NULL, NULL, NULL };  /* y-2, y-1 and the current   */
+    u8 *store = NULL;
+    int w = bm->w, h = bm->h;
+    int ltp = 0;
+    int x, y, r;
+    int nominal = at_is_nominal(tmpl, at);
+    Pix tp[16];
+    int ntp = 0;
+
+    store = calloc(3, (u32) w + 8);
+    if (store == NULL) {
+        return PDF_E_NOMEM;
+    }
+    for (r = 0; r < 3; r++) {
+        rows[r] = store + (u32) r * ((u32) w + 8);
+    }
+    if (!nominal) {
+        ntp = build_template(tmpl, at, tp);
+    }
+
+    for (y = 0; y < h; y++) {
+        u8 *cur = rows[2];
+        u8 *m1 = rows[1];               /* y - 1                      */
+        u8 *m2 = rows[0];               /* y - 2                      */
+
+        if (tpgdon) {
+            ltp ^= mq_decode(mq, &cx[tmpl_sltp[tmpl]]);
+            if (ltp) {
+                memcpy(cur, m1, (u32) w);
+                bm_packrow(bm, y, cur);
+                { u8 *t = rows[0]; rows[0] = rows[1]; rows[1] = rows[2];
+                  rows[2] = t; }
+                continue;
+            }
+        }
+        memset(cur, 0, (u32) w);
+
+        if (nominal) {
+            int ns = tmpl_nspan[tmpl];
+            const Span *sp = tmpl_span[tmpl];
+            u8 *src[3];
+            u32 acc[3], msk[3];
+            int sh[3], wid[3];
+            int k;
+
+            for (r = 0; r < ns; r++) {
+                wid[r] = sp[r].hi - sp[r].lo + 1;
+                msk[r] = (1u << wid[r]) - 1;
+                src[r] = sp[r].dy == 0 ? cur
+                       : sp[r].dy == -1 ? (y >= 1 ? m1 : NULL)
+                                        : (y >= 2 ? m2 : NULL);
+            }
+            sh[ns - 1] = 0;
+            for (r = ns - 2; r >= 0; r--) {
+                sh[r] = sh[r + 1] + wid[r + 1];
+            }
+            for (r = 0; r < ns; r++) {
+                acc[r] = 0;
+                for (k = sp[r].lo; k <= sp[r].hi; k++) {
+                    int v = src[r] != NULL && k >= 0 && k < w ? src[r][k] : 0;
+
+                    acc[r] = (acc[r] << 1) | (u32) v;
+                }
+                acc[r] &= msk[r];
+            }
+            for (x = 0; x < w; x++) {
+                u32 ctx = 0;
+                int bit;
+
+                for (r = 0; r < ns; r++) {
+                    ctx |= acc[r] << sh[r];
+                }
+                bit = mq_decode(mq, &cx[ctx]);
+                cur[x] = (u8) bit;
+                for (r = 0; r < ns; r++) {
+                    int nx = x + 1 + sp[r].hi;
+                    int v = src[r] != NULL && nx >= 0 && nx < w
+                            ? src[r][nx] : 0;
+
+                    acc[r] = ((acc[r] << 1) | (u32) v) & msk[r];
+                }
+            }
+        } else {
+            for (x = 0; x < w; x++) {
+                u32 ctx = 0;
+                int i, bit;
+
+                for (i = 0; i < ntp; i++) {
+                    int sx = x + tp[i].dx, sy = y + tp[i].dy;
+                    int v;
+
+                    if (sx < 0 || sx >= w || sy < 0) {
+                        v = 0;
+                    } else if (sy == y) {
+                        v = cur[sx];
+                    } else if (sy == y - 1) {
+                        v = m1[sx];
+                    } else if (sy == y - 2) {
+                        v = m2[sx];
+                    } else {
+                        v = bm_get(bm, sx, sy);
+                    }
+                    ctx = (ctx << 1) | (u32) v;
+                }
+                bit = mq_decode(mq, &cx[ctx]);
+                cur[x] = (u8) bit;
+            }
+        }
+        bm_packrow(bm, y, cur);
+        { u8 *t = rows[0]; rows[0] = rows[1]; rows[1] = rows[2]; rows[2] = t; }
+    }
+    free(store);
+    return PDF_OK;
+}
+
+/* --- segments ------------------------------------------------------- */
+
+static u32
+rd32(const u8 *p)
+{
+    return ((u32) p[0] << 24) | ((u32) p[1] << 16) | ((u32) p[2] << 8) | p[3];
+}
+
+#define SEG_SYMBOL_DICT         0
+#define SEG_GENERIC_INTER       36
+#define SEG_GENERIC_IMM         38
+#define SEG_GENERIC_IMM_LL      39
+#define SEG_PAGE_INFO           48
+#define SEG_END_PAGE            49
+#define SEG_END_STRIPE          50
+#define SEG_END_FILE            51
+#define SEG_PROFILES            52
+#define SEG_TABLES              53
+#define SEG_EXTENSION           62
+
+static int
+region_segment(const u8 *b, u32 blen, Bm *page)
+{
+    u32 rw, rh, rx, ry;
+    u8 comb, gflags;
+    int mmr, tmpl, tpgdon;
+    s8 at[8];
+    u32 off;
+    Bm r;
+    Mq mq;
+    u8 *cx;
+    int err;
+
+    if (blen < 18) {
+        return PDF_E_DATA;
+    }
+    rw = rd32(b);
+    rh = rd32(b + 4);
+    rx = rd32(b + 8);
+    ry = rd32(b + 12);
+    comb = (u8) (b[16] & 7);
+    gflags = b[17];
+    mmr = gflags & 1;
+    tmpl = (gflags >> 1) & 3;
+    tpgdon = (gflags >> 3) & 1;
+    off = 18;
+
+    if (mmr) {
+        return PDF_E_UNSUP;             /* T.6 coding: a codec of its own */
+    }
+    if (rw == 0 || rh == 0 || rw > 20000u || rh > 20000u ||
+        (u32) rw * rh > 64000000u) {
+        return PDF_E_DATA;
+    }
+    memset(at, 0, sizeof at);
+    {
+        int nat = tmpl_nat[tmpl] * 2;
+        int i;
+
+        if (off + (u32) nat > blen) {
+            return PDF_E_DATA;
+        }
+        for (i = 0; i < nat; i++) {
+            at[i] = (s8) b[off + (u32) i];
+        }
+        off += (u32) nat;
+    }
+
+    err = bm_alloc(&r, (int) rw, (int) rh, 0);
+    if (err != PDF_OK) {
+        return err;
+    }
+    cx = calloc(1, 1u << 16);
+    if (cx == NULL) {
+        bm_free(&r);
+        return PDF_E_NOMEM;
+    }
+    mq_init(&mq, b + off, blen - off);
+    err = decode_generic(&mq, cx, tmpl, tpgdon, at, &r);
+    free(cx);
+    if (err == PDF_OK) {
+        bm_compose(page, &r, (int) rx, (int) ry, comb);
+    }
+    bm_free(&r);
+    return err;
+}
+
+/* Walk one embedded-format stream.  Headers are immediately followed
+   by their data, which is what PDF's organisation guarantees.       */
+static int
+parse_stream(const u8 *d, u32 len, Bm *page, int *pagedone)
+{
+    u32 o = 0;
+
+    while (o + 11 <= len) {
+        u32 num, cnt, dlen, i;
+        u8 flags;
+        int stype, pa4, rsize;
+        const u8 *body;
+
+        num = rd32(d + o);
+        o += 4;
+        flags = d[o++];
+        stype = flags & 0x3F;
+        pa4 = (flags >> 6) & 1;
+
+        if (o >= len) {
+            return PDF_E_DATA;
+        }
+        cnt = (u32) (d[o] >> 5);
+        if (cnt == 7) {
+            if (o + 4 > len) {
+                return PDF_E_DATA;
+            }
+            cnt = rd32(d + o) & 0x1FFFFFFFu;
+            if (cnt > 1000000u) {
+                return PDF_E_DATA;
+            }
+            o += 4 + (cnt + 8) / 8;
+        } else {
+            o += 1;
+        }
+        rsize = num <= 256 ? 1 : (num <= 65536 ? 2 : 4);
+        if (o + cnt * (u32) rsize > len) {
+            return PDF_E_DATA;
+        }
+        o += cnt * (u32) rsize;
+        i = pa4 ? 4u : 1u;
+        if (o + i + 4 > len) {
+            return PDF_E_DATA;
+        }
+        o += i;
+        dlen = rd32(d + o);
+        o += 4;
+        if (dlen == 0xFFFFFFFFu || o + dlen > len) {
+            return PDF_E_DATA;          /* unknown length: not seen here */
+        }
+        body = d + o;
+
+        switch (stype) {
+        case SEG_PAGE_INFO:
+            if (dlen >= 17 && !*pagedone) {
+                /* bit 2 of the flags is the page's default pixel      */
+                if ((body[16] >> 2) & 1) {
+                    memset(page->bits, 0xFF, page->stride * (u32) page->h);
+                }
+                *pagedone = 1;
+            }
+            break;
+
+        case SEG_GENERIC_INTER:
+        case SEG_GENERIC_IMM:
+        case SEG_GENERIC_IMM_LL:
+            {
+                int err = region_segment(body, dlen, page);
+
+                if (err != PDF_OK) {
+                    return err;
+                }
+            }
+            break;
+
+        case SEG_END_PAGE:
+        case SEG_END_STRIPE:
+        case SEG_END_FILE:
+        case SEG_PROFILES:
+        case SEG_TABLES:
+        case SEG_EXTENSION:
+            break;
+
+        default:
+            /* symbol dictionaries, text, halftone and refinement
+               regions: everything that needs state we do not keep   */
+            return PDF_E_UNSUP;
+        }
+        o += dlen;
+    }
+    return PDF_OK;
+}
+
+int
+pdfjbig2_decode(const u8 *glob, u32 glen, const u8 *data, u32 dlen,
+                int w, int h, u8 **outp, u32 *outlenp)
+{
+    Bm page;
+    int pagedone = 0;
+    int err;
+    u32 i, n;
+
+    *outp = NULL;
+    if (outlenp != NULL) {
+        *outlenp = 0;
+    }
+    if (data == NULL || w < 1 || h < 1) {
+        return PDF_E_SYNTAX;
+    }
+    err = bm_alloc(&page, w, h, 0);
+    if (err != PDF_OK) {
+        return err;
+    }
+    /* The globals stream holds segments the page stream refers to.
+       Nothing a generic region needs lives there, but walking it
+       still reports the unsupported segment types honestly.        */
+    if (glob != NULL && glen > 0) {
+        err = parse_stream(glob, glen, &page, &pagedone);
+        if (err != PDF_OK) {
+            bm_free(&page);
+            return err;
+        }
+    }
+    err = parse_stream(data, dlen, &page, &pagedone);
+    if (err != PDF_OK) {
+        bm_free(&page);
+        return err;
+    }
+    /* JBIG2 codes black as 1, a PDF image sample of 0 is black      */
+    n = page.stride * (u32) h;
+    for (i = 0; i < n; i++) {
+        page.bits[i] = (u8) ~page.bits[i];
+    }
+    *outp = page.bits;
+    if (outlenp != NULL) {
+        *outlenp = n;
+    }
+    return PDF_OK;
+}

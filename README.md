@@ -281,10 +281,23 @@ coverage into the sprite it owns rather than plotting over it, so an
 image can sit on top of what was drawn before it.
 
 That is what MRC-compressed scans need: a faint background image with a
-masked foreground carrying the text. Note the mask itself has to be
-decodable - such scans very often code the stencil with **JBIG2**,
-which is a codec in its own right and is not implemented, so those
-pages still render as flat tone.
+masked foreground carrying the text, where the stencil that separates
+them is usually **JBIG2**-coded at scan resolution. The generic region
+- the half of JBIG2 that codes a bitmap directly, with an adaptive
+arithmetic coder and a template of already-decoded neighbours - is
+implemented, which is what those scans use. The other half, symbol
+dictionaries and text regions, is not, nor are halftone regions,
+refinement, or MMR coding (MMR is T.6, a codec of its own); a page
+using them keeps its image and loses only the transparency.
+
+A stencil is one bit a pixel at scan resolution, routinely four times
+the size of the image it applies to, so mask samples are read as
+samples rather than expanded through the image path - at a word a
+pixel a 2480x3506 stencil would cost 35MB to carry one bit of
+information each. Minifying averages the source footprint instead of
+picking one pixel out of it: at a quarter scale a 300dpi glyph stroke
+is a fraction of a pixel wide, and sampling gives a scatter of dots
+where averaging gives legible text.
 
 Out (v1): user-supplied passwords, embedded font programs (mapped to
 metric-equivalent RISC OS fonts instead), /Differences encodings,

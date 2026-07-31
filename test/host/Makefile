@@ -17,10 +17,11 @@ OJSRCS  := bio cio dwt event function_list ht_dec image invert j2k jp2 \
 OJOBJ   := $(addprefix obj/oj_,$(addsuffix .o,$(OJSRCS)))
 CFLAGS  := -std=c99 -O1 -g -Wall -Wextra -Wno-unused-parameter \
            -fsanitize=address,undefined -Ihostinc -Iojinc
-CORE    := pdfflt pdfobj pdfcrypt pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng pdfpage
+CORE    := pdfflt pdfobj pdfcrypt pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng \
+           pdfjbig2 pdfpage
 COREOBJ := $(addprefix obj/,$(addsuffix .o,$(CORE)))
 
-all: headers testflt testpdf testtext
+all: headers testflt testpdf testtext testjbig2
 
 headers:
 	@mkdir -p hostinc obj ojinc
@@ -49,6 +50,9 @@ testpdf: testpdf.c $(COREOBJ) $(OJOBJ)
 testtext: testtext.c $(COREOBJ) $(OJOBJ)
 	$(CC) $(CFLAGS) testtext.c $(COREOBJ) $(OJOBJ) -o $@
 
+testjbig2: testjbig2.c obj/pdfjbig2.o
+	$(CC) $(CFLAGS) testjbig2.c obj/pdfjbig2.o -o $@
+
 vectors: mkvectors.py
 	python3 mkvectors.py
 
@@ -57,6 +61,6 @@ run: all vectors
 	./testpdf
 
 clean:
-	rm -rf obj hostinc ojinc testflt testpdf testtext vectors
+	rm -rf obj hostinc ojinc testflt testpdf testtext testjbig2 vectors
 
 .PHONY: all headers run clean vectors
