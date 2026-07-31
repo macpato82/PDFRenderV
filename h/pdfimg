@@ -37,14 +37,19 @@ typedef struct {
     u32 cachekey;
     int w, h;
     u32 *pix;                   /* XRGB32: malloc'd w*h words         */
+    /* Per-pixel coverage, malloc'd w*h bytes, or NULL when the image
+       is opaque.  Built from /SMask (a greyscale soft mask), a
+       stencil /Mask stream, or a colour-key /Mask array; whichever it
+       came from, the backend just blends by it.                      */
+    u8 *alpha;
     const u8 *jpeg;             /* JPEG: pointer into jpegbuf         */
     u32 jpeglen;
     PdfBuf jpegbuf;             /* owns DCT bytes when filters preceded */
 } PdfImg;
 
 /* Decode an image XObject (stream) to img.  fillrgb paints /ImageMask
-   images (1 = paint fill colour, 0 = white in this version - no
-   transparency yet).  Caller must pdfimg_free().                     */
+   images.  Any /SMask or /Mask becomes img->alpha.  Caller must
+   pdfimg_free().                                                     */
 int pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img);
 
 /* Decode an inline image (BI/ID/EI): dict is the parsed BI dict with

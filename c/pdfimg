@@ -687,6 +687,192 @@ out:
 
 /* The caller passes the XObject; we key the cache on the object
    number it came from, which pdf_objnum_of() recovers.              */
+
+/* --- masks -----------------------------------------------------------
+
+   Three ways a PDF says "part of this image is not there":
+
+     /SMask     a greyscale image whose samples are the coverage
+     /Mask      a 1-bit stencil, where a 1 sample means masked OUT
+     /Mask      an array of colour ranges to treat as transparent
+
+   All three end up as one byte of coverage per pixel of the base
+   image, scaled up or down as needed - a soft mask is very often a
+   different size from the image it applies to, which is the whole
+   point of it being a separate image.                              */
+
+/* Nearest-neighbour sample of a w x h byte plane at the position
+   corresponding to (x, y) in a dw x dh image.                      */
+static u8
+plane_at(const u8 *p, int w, int h, int x, int y, int dw, int dh)
+{
+    int sx = dw > 0 ? (int) (((s64) x * w) / dw) : 0;
+    int sy = dh > 0 ? (int) (((s64) y * h) / dh) : 0;
+
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx >= w) sx = w - 1;
+    if (sy >= h) sy = h - 1;
+    return p[(u32) sy * (u32) w + (u32) sx];
+}
+
+/* Decode a mask image (soft or stencil) to a coverage plane the size
+   of the base image.  stencil means 1-bit /ImageMask semantics.    */
+static int
+load_mask_plane(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
+                int stencil, u8 **outp)
+{
+    PdfImg m;
+    u8 *plane = NULL;
+    u8 *src = NULL;
+    int x, y, err;
+
+    *outp = NULL;
+    memset(&m, 0, sizeof m);
+    /* A stencil mask is an ImageMask; loading it with a black fill
+       gives 0 where it paints and white where it does not, which is
+       all we need to tell the two apart.                           */
+    err = pdfimg_load(doc, mobj, 0x000000u, &m);
+    if (err != PDF_OK) {
+        return err;
+    }
+    if (m.kind != PDFIMG_XRGB32 || m.pix == NULL || m.w < 1 || m.h < 1) {
+        pdfimg_free(&m);
+        return PDF_E_UNSUP;             /* a JPEG-coded mask: rare     */
+    }
+    src = malloc((u32) m.w * (u32) m.h);
+    if (src == NULL) {
+        pdfimg_free(&m);
+        return PDF_E_NOMEM;
+    }
+    for (y = 0; y < m.h; y++) {
+        for (x = 0; x < m.w; x++) {
+            u32 p = m.pix[(u32) y * (u32) m.w + (u32) x];
+            u32 lum = p & 0xFF;         /* grey, so any channel does  */
+
+            /* A stencil paints where the sample is 0, and those are
+               the pixels of the BASE image we must keep; where it
+               did not paint, the base is masked out.  A soft mask is
+               simply its own grey level.                           */
+            src[(u32) y * (u32) m.w + (u32) x] =
+                stencil ? (u8) (lum < 128 ? 255 : 0) : (u8) lum;
+        }
+    }
+    plane = malloc((u32) basew * (u32) baseh);
+    if (plane == NULL) {
+        free(src);
+        pdfimg_free(&m);
+        return PDF_E_NOMEM;
+    }
+    for (y = 0; y < baseh; y++) {
+        for (x = 0; x < basew; x++) {
+            plane[(u32) y * (u32) basew + (u32) x] =
+                plane_at(src, m.w, m.h, x, y, basew, baseh);
+        }
+    }
+    free(src);
+    pdfimg_free(&m);
+    *outp = plane;
+    return PDF_OK;
+}
+
+/* Colour-key masking: /Mask is an array of min/max pairs, one pair
+   per colour component, in SOURCE sample values.  We only have the
+   converted RGB by this point, so the ranges are applied to it -
+   exact for the 8-bit device colour spaces this meets in practice. */
+static int
+colourkey_plane(PdfDoc *doc, PdfObj *arr, const u32 *pix, int w, int h,
+                int bpc, u8 **outp)
+{
+    u32 n = pdf_arrlen(arr);
+    s32 lo[3], hi[3];
+    u8 *plane;
+    int i, x, y;
+    int maxv = (1 << bpc) - 1;
+
+    *outp = NULL;
+    if (n < 2 || n > 8 || (n & 1) != 0) {
+        return PDF_E_UNSUP;
+    }
+    for (i = 0; i < 3; i++) {
+        lo[i] = 0;
+        hi[i] = -1;                     /* an impossible range        */
+    }
+    for (i = 0; i < (int) (n / 2) && i < 3; i++) {
+        lo[i] = pdfobj_int_of(pdf_resolve(doc, pdf_arrget(arr, i * 2)));
+        hi[i] = pdfobj_int_of(pdf_resolve(doc, pdf_arrget(arr, i * 2 + 1)));
+        /* the ranges are in sample values; scale to 0..255           */
+        if (maxv > 0 && maxv != 255) {
+            lo[i] = lo[i] * 255 / maxv;
+            hi[i] = hi[i] * 255 / maxv;
+        }
+    }
+    plane = malloc((u32) w * (u32) h);
+    if (plane == NULL) {
+        return PDF_E_NOMEM;
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            u32 p = pix[(u32) y * (u32) w + (u32) x];
+            s32 c[3];
+            int inrange = 1;
+
+            c[0] = (s32) (p & 0xFF);
+            c[1] = (s32) ((p >> 8) & 0xFF);
+            c[2] = (s32) ((p >> 16) & 0xFF);
+            for (i = 0; i < 3; i++) {
+                if (hi[i] < lo[i] || c[i] < lo[i] || c[i] > hi[i]) {
+                    inrange = 0;
+                    break;
+                }
+            }
+            plane[(u32) y * (u32) w + (u32) x] = (u8) (inrange ? 0 : 255);
+        }
+    }
+    *outp = plane;
+    return PDF_OK;
+}
+
+/* Attach whatever mask the image dictionary asks for.  A failure to
+   read the mask is not a failure to read the image: better a page
+   with an opaque image on it than no page.                         */
+static void
+attach_mask(PdfDoc *doc, PdfObj *dict, PdfImg *img, int bpc)
+{
+    PdfObj *o;
+
+    if (img->kind != PDFIMG_XRGB32 || img->pix == NULL) {
+        return;                         /* JPEG passthrough: not ours */
+    }
+    o = pdf_resolve(doc, pdf_dictget(dict, "SMask"));
+    if (o != NULL && o->type == PDF_STREAM) {
+        u8 *plane = NULL;
+
+        if (load_mask_plane(doc, o, img->w, img->h, 0, &plane) == PDF_OK) {
+            img->alpha = plane;
+        }
+        return;
+    }
+    o = pdf_resolve(doc, pdf_dictget(dict, "Mask"));
+    if (o == NULL) {
+        return;
+    }
+    if (o->type == PDF_STREAM) {
+        u8 *plane = NULL;
+
+        if (load_mask_plane(doc, o, img->w, img->h, 1, &plane) == PDF_OK) {
+            img->alpha = plane;
+        }
+    } else if (o->type == PDF_ARRAY) {
+        u8 *plane = NULL;
+
+        if (colourkey_plane(doc, o, img->pix, img->w, img->h, bpc,
+                            &plane) == PDF_OK) {
+            img->alpha = plane;
+        }
+    }
+}
+
 int
 pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
 {
@@ -816,6 +1002,9 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
         img->pix = pix;
         cache_put(doc, xobj->u.stm.off, hintw, hinth, (int) w, (int) h,
                   pix);
+        /* the cache holds pixels only; the mask is rebuilt each time,
+           which is cheap next to decoding the image itself         */
+        attach_mask(doc, xobj, img, (int) bpc);
         return PDF_OK;
     }
 }
@@ -907,6 +1096,7 @@ pdfimg_inline(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
         img->w = w;
         img->h = h;
         img->pix = pix;
+        attach_mask(doc, dict, img, bpc);
         return PDF_OK;
     }
 }
@@ -918,6 +1108,7 @@ pdfimg_free(PdfImg *img)
         return;
     }
     free(img->pix);
+    free(img->alpha);
     pdfbuf_free(&img->jpegbuf);
     memset(img, 0, sizeof *img);
 }

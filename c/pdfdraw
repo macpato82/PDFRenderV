@@ -546,6 +546,80 @@ typedef struct {
     u32 mode;
 } SpriteBlock;
 
+
+/* Draw an image that has per-pixel coverage, blending it into the
+   sprite we own rather than plotting over it.  OS_SpriteOp could do
+   this with an alpha-masked sprite, but only where the OS supports
+   them; doing it here works the same everywhere and costs one pass
+   over the destination rectangle.
+
+   Source pixels are picked nearest-neighbour, which is what the
+   scaled sprite plot would do anyway.                              */
+static void
+plot_alpha(RoRender *rr, const u32 *pix, const u8 *alpha, int sw, int sh,
+           int dx, int dy, int dw, int dh, int flipv)
+{
+    const u32 *hdr = rr->sprite;
+    u8 *base;
+    int w = rr->devw, h = rr->devh;
+    int x0 = dx, y0 = dy, x1 = dx + dw, y1 = dy + dh;
+    int x, y;
+
+    if (rr->sprite == NULL || sw < 1 || sh < 1 || dw < 1 || dh < 1) {
+        return;
+    }
+    if (x0 < rr->clip[rr->csp].x0) x0 = rr->clip[rr->csp].x0;
+    if (y0 < rr->clip[rr->csp].y0) y0 = rr->clip[rr->csp].y0;
+    if (x1 > rr->clip[rr->csp].x1 + 1) x1 = rr->clip[rr->csp].x1 + 1;
+    if (y1 > rr->clip[rr->csp].y1 + 1) y1 = rr->clip[rr->csp].y1 + 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+    base = (u8 *) rr->sprite + hdr[8];
+
+    for (y = y0; y < y1; y++) {
+        u32 *row = (u32 *) (base + (u32) (h - 1 - y) * (u32) w * 4);
+        /* device y counts up from the bottom of the image            */
+        int iy = (int) (((s64) (y - dy) * sh) / dh);
+        int sy;
+
+        if (iy < 0) iy = 0;
+        if (iy >= sh) iy = sh - 1;
+        sy = flipv ? iy : sh - 1 - iy;
+
+        for (x = x0; x < x1; x++) {
+            int ix = (int) (((s64) (x - dx) * sw) / dw);
+            u32 src, a, dr, dg, db, sr, sg, sb;
+
+            if (ix < 0) ix = 0;
+            if (ix >= sw) ix = sw - 1;
+            a = alpha[(u32) sy * (u32) sw + (u32) ix];
+            if (a == 0) {
+                continue;               /* fully masked out           */
+            }
+            src = pix[(u32) sy * (u32) sw + (u32) ix];
+            if (a == 255) {
+                row[x] = src;
+                continue;
+            }
+            dr = row[x] & 0xff;
+            dg = (row[x] >> 8) & 0xff;
+            db = (row[x] >> 16) & 0xff;
+            sr = src & 0xff;
+            sg = (src >> 8) & 0xff;
+            sb = (src >> 16) & 0xff;
+            sr = (dr * (255u - a) + sr * a) / 255u;
+            sg = (dg * (255u - a) + sg * a) / 255u;
+            sb = (db * (255u - a) + sb * a) / 255u;
+            row[x] = sr | (sg << 8) | (sb << 16);
+        }
+    }
+}
+
 /* Wrap a block of XRGB32 pixels in a temporary sprite and plot it
    scaled.  Shared by the decoded-image path and the fallback when
    SpriteExtend refuses a JPEG.                                      */
@@ -661,6 +735,11 @@ be_image(void *ctx, const PdfImg *img, const fix m[6])
         return;
     }
 
+    if (img->alpha != NULL && rr->sprite != NULL) {
+        plot_alpha(rr, img->pix, img->alpha, img->w, img->h,
+                   dx, dy, dw, dh, flipv);
+        return;
+    }
     plot_xrgb(rr, img->pix, img->w, img->h, dx, dy, dw, dh, flipv);
 }
 

@@ -272,6 +272,20 @@ standard-handler flavours are covered: RC4 40-bit (/V 1 /R 2), RC4
 password is refused with a clear error; supplying one is not
 implemented.
 
+Images carry transparency where they claim it. `/SMask` (a greyscale
+soft mask), a stencil `/Mask` stream, and a colour-key `/Mask` array
+all become one byte of coverage per pixel, scaled to the image they
+apply to - a soft mask is very often a different size from its image,
+which is the point of it being separate. The backend blends by that
+coverage into the sprite it owns rather than plotting over it, so an
+image can sit on top of what was drawn before it.
+
+That is what MRC-compressed scans need: a faint background image with a
+masked foreground carrying the text. Note the mask itself has to be
+decodable - such scans very often code the stencil with **JBIG2**,
+which is a codec in its own right and is not implemented, so those
+pages still render as flat tone.
+
 Out (v1): user-supplied passwords, embedded font programs (mapped to
 metric-equivalent RISC OS fonts instead), /Differences encodings,
 Type3 glyph rendering, shadings/patterns (skipped or grey),
