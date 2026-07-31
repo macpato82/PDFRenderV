@@ -141,6 +141,23 @@ typedef struct {
     u32 uoff;
 } PdfLink;
 
+/* One entry in the document's outline (its "bookmarks" or table of
+   contents).  level 0 is a top-level entry; page is 1-based, or 0
+   when the destination could not be resolved; toff is a byte offset
+   into the title blob returned alongside.                           */
+typedef struct {
+    u32 level;
+    u32 page;
+    u32 toff;
+} PdfOutlineEnt;
+
+/* Walk /Outlines depth first.  *outp gets a malloc'd array and
+   *titles a malloc'd blob of NUL-terminated strings, both owned by
+   the caller.  A document without an outline succeeds with
+   *nout == 0.                                                       */
+int pdf_extractoutline(PdfDoc *doc, PdfOutlineEnt **outp, u32 *nout,
+                       char **titles, u32 *titlelen);
+
 /* Collect the page's URI links.  *outp gets a malloc'd array and
    *uris a malloc'd blob of NUL-terminated strings; the caller owns
    both.  A page with no links succeeds with *nout == 0.             */

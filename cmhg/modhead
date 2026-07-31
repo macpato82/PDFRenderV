@@ -15,9 +15,9 @@ help-string:   PDFRenderV 1.00 Fast PDF page renderer
 swi-chunk-base-number:  &05B740
 
 swi-handler-code:       mod_swi
-; Offsets 0..6, matching SWIOFF_* in h/module.
+; Offsets 0..7, matching SWIOFF_* in h/module.
 swi-decoding-table:     PDFRenderV Open, Close, Info, PageSize, Render,
-                        ExtractText, ExtractLinks
+                        ExtractText, ExtractLinks, ExtractOutline
 
 initialisation-code:    mod_init
 finalisation-code:      mod_final

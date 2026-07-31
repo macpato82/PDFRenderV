@@ -155,6 +155,10 @@ _kernel_oserror *mod_swi(int number, _kernel_swi_regs *r, void *pw);
 #undef XPDFRenderV_ExtractLinks
 #define PDFRenderV_ExtractLinks   (0x0005b746)
 #define XPDFRenderV_ExtractLinks  (0x0007b746)
+#undef PDFRenderV_ExtractOutline
+#undef XPDFRenderV_ExtractOutline
+#define PDFRenderV_ExtractOutline  (0x0005b747)
+#define XPDFRenderV_ExtractOutline (0x0007b747)
 
 /* Special error for 'SWI values out of range for this module' */
 #define error_BAD_SWI ((_kernel_oserror *) -1)

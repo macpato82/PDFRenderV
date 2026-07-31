@@ -104,6 +104,16 @@ window of the wrong shape.  On a PDF the Menu button
 over the page also offers Copy / Select all / Save text, with
 click-drag text selection.
 
+A PDF that carries an outline - bookmarks, a table of contents - opens
+a **Contents** window beside the document listing its entries, indented
+by depth; clicking one jumps to its page. `/Outlines` is walked depth
+first through `/First` and `/Next`, and each entry's destination is
+resolved to a page whether it is an array, a dictionary, or a name
+looked up in `/Root /Dests` or the `/Root /Names /Dests` name tree.
+Titles arrive as UTF-16BE or PDFDocEncoded and are folded to Latin-1
+for display. The window is deliberately a sibling rather than a nested
+pane, so it can be moved and closed without reshaping the document.
+
 The toolbar is embedded in the window's horizontal scroll bar, the
 way Ovation and NetSurf do it: the pane is a nested-Wimp *furniture
 window* (window flag bit 23), which is what lets a child encroach on

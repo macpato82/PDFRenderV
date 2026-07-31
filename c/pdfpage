@@ -1491,6 +1491,297 @@ pdf_extracttext(PdfDoc *doc, u32 pageidx, fix zoom, PdfGlyph **outp,
 }
 
 
+
+/* --- outline (bookmarks) -----------------------------------------------
+
+   /Root /Outlines is a doubly-linked tree: /First and /Last bound each
+   level, /Next walks a level, and an entry's /First opens a nested
+   one.  Each entry has a /Title and either a /Dest or a /A action of
+   /S /GoTo carrying one.  A destination is either an array whose first
+   element references the page, or a name to look up - in /Root /Dests
+   for old files, or the /Root /Names /Dests name tree for new ones. */
+
+/* Which page index does this reference point at?  Compares resolved
+   pointers against the flattened page list, so an unusual page tree
+   makes no difference.  Returns 1-based, or 0 if not found.        */
+static u32
+page_of_ref(PdfDoc *doc, PdfObj *ref)
+{
+    PdfObj *pg = pdf_resolve(doc, ref);
+    u32 i;
+
+    if (pg == NULL) {
+        return 0;
+    }
+    for (i = 0; i < doc->npages; i++) {
+        if (doc->pages[i] == pg) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static u32 dest_to_page(PdfDoc *doc, PdfObj *dest, int depth);
+
+/* Search a name tree (/Kids and /Names) for one key.               */
+static PdfObj *
+nametree_find(PdfDoc *doc, PdfObj *node, const u8 *key, u32 keylen,
+              int depth)
+{
+    PdfObj *names, *kids;
+    u32 i, n;
+
+    if (node == NULL || node->type != PDF_DICT || depth > 16) {
+        return NULL;
+    }
+    names = pdf_resolve(doc, pdf_dictget(node, "Names"));
+    if (names != NULL && names->type == PDF_ARRAY) {
+        n = pdf_arrlen(names);
+        for (i = 0; i + 1 < n; i += 2) {
+            PdfObj *k = pdf_resolve(doc, pdf_arrget(names, i));
+
+            if (k != NULL && k->type == PDF_STRING &&
+                k->u.str.len == keylen &&
+                memcmp(k->u.str.p, key, keylen) == 0) {
+                return pdf_resolve(doc, pdf_arrget(names, i + 1));
+            }
+        }
+    }
+    kids = pdf_resolve(doc, pdf_dictget(node, "Kids"));
+    if (kids != NULL && kids->type == PDF_ARRAY) {
+        n = pdf_arrlen(kids);
+        for (i = 0; i < n; i++) {
+            PdfObj *r = nametree_find(doc,
+                                      pdf_resolve(doc, pdf_arrget(kids, i)),
+                                      key, keylen, depth + 1);
+            if (r != NULL) {
+                return r;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* A named destination, from either of the two places they live.    */
+static u32
+named_dest_page(PdfDoc *doc, const u8 *name, u32 namelen, int depth)
+{
+    PdfObj *root = doc->root, *d;
+
+    if (root == NULL) {
+        return 0;
+    }
+    d = pdf_resolve(doc, pdf_dictget(root, "Dests"));
+    if (d != NULL && d->type == PDF_DICT) {
+        char key[128];
+
+        if (namelen < sizeof key) {
+            memcpy(key, name, namelen);
+            key[namelen] = 0;
+            {
+                PdfObj *v = pdf_resolve(doc, pdf_dictget(d, key));
+
+                if (v != NULL) {
+                    return dest_to_page(doc, v, depth + 1);
+                }
+            }
+        }
+    }
+    {
+        PdfObj *names = pdf_resolve(doc, pdf_dictget(root, "Names"));
+        PdfObj *dests = names ? pdf_resolve(doc, pdf_dictget(names, "Dests"))
+                              : NULL;
+        PdfObj *v = nametree_find(doc, dests, name, namelen, 0);
+
+        if (v != NULL) {
+            return dest_to_page(doc, v, depth + 1);
+        }
+    }
+    return 0;
+}
+
+static u32
+dest_to_page(PdfDoc *doc, PdfObj *dest, int depth)
+{
+    if (dest == NULL || depth > 8) {
+        return 0;
+    }
+    if (dest->type == PDF_REF) {
+        /* the destination array may itself be indirect              */
+        PdfObj *r = pdf_resolve(doc, dest);
+
+        return r != dest ? dest_to_page(doc, r, depth + 1) : 0;
+    }
+    if (dest->type == PDF_ARRAY) {
+        PdfObj *first = pdf_arrget(dest, 0);
+
+        if (first == NULL) {
+            return 0;
+        }
+        if (first->type == PDF_INT) {
+            /* a bare page index, as remote destinations use         */
+            s32 i = first->u.i;
+
+            return (i >= 0 && (u32) i < doc->npages) ? (u32) i + 1 : 0;
+        }
+        return page_of_ref(doc, first);
+    }
+    if (dest->type == PDF_DICT) {
+        return dest_to_page(doc, pdf_dictget(dest, "D"), depth + 1);
+    }
+    if (dest->type == PDF_NAME || dest->type == PDF_STRING) {
+        return named_dest_page(doc, dest->u.str.p, dest->u.str.len,
+                               depth);
+    }
+    return 0;
+}
+
+/* PDF text strings are either UTF-16BE with a byte-order mark or
+   PDFDocEncoded, which agrees with Latin-1 over the range a RISC OS
+   window can show.  Anything outside becomes '?'.                  */
+static u32
+title_to_latin1(const u8 *s, u32 len, char *out, u32 outmax)
+{
+    u32 n = 0;
+
+    if (len >= 2 && s[0] == 0xFE && s[1] == 0xFF) {
+        u32 i;
+
+        for (i = 2; i + 1 < len && n + 1 < outmax; i += 2) {
+            u32 c = ((u32) s[i] << 8) | s[i + 1];
+
+            out[n++] = (char) (c < 256 ? c : '?');
+        }
+    } else {
+        u32 i;
+
+        for (i = 0; i < len && n + 1 < outmax; i++) {
+            out[n++] = (char) (s[i] < 32 ? ' ' : s[i]);
+        }
+    }
+    while (n > 0 && out[n - 1] == ' ') {
+        n--;                            /* trailing space is noise   */
+    }
+    out[n] = 0;
+    return n;
+}
+
+typedef struct {
+    PdfOutlineEnt *ent;
+    u32 n, cap;
+    char *blob;
+    u32 bl, bcap;
+    int oom;
+} OutlineCol;
+
+static void
+outline_walk(PdfDoc *doc, PdfObj *item, u32 level, OutlineCol *c,
+             int depth)
+{
+    int guard = 0;
+
+    while (item != NULL && item->type == PDF_DICT && !c->oom &&
+           guard++ < 4096) {
+        PdfObj *title = pdf_resolve(doc, pdf_dictget(item, "Title"));
+        u32 page = 0;
+
+        {
+            PdfObj *dest = pdf_dictget(item, "Dest");
+
+            if (dest == NULL) {
+                PdfObj *a = pdf_resolve(doc, pdf_dictget(item, "A"));
+
+                if (a != NULL && a->type == PDF_DICT &&
+                    pdf_isname(pdf_resolve(doc, pdf_dictget(a, "S")),
+                               "GoTo")) {
+                    dest = pdf_dictget(a, "D");
+                }
+            }
+            page = dest_to_page(doc, dest, 0);
+        }
+
+        if (title != NULL && title->type == PDF_STRING) {
+            char text[512];
+            u32 tl = title_to_latin1(title->u.str.p, title->u.str.len,
+                                     text, sizeof text);
+
+            if (tl > 0) {
+                if (c->n == c->cap) {
+                    u32 ncap = c->cap ? c->cap * 2 : 32;
+                    PdfOutlineEnt *ne = realloc(c->ent, ncap * sizeof *ne);
+
+                    if (ne == NULL) {
+                        c->oom = 1;
+                        return;
+                    }
+                    c->ent = ne;
+                    c->cap = ncap;
+                }
+                if (c->bl + tl + 1 > c->bcap) {
+                    u32 ncap = c->bcap ? c->bcap * 2 : 1024;
+                    char *nb;
+
+                    while (c->bl + tl + 1 > ncap) {
+                        ncap *= 2;
+                    }
+                    nb = realloc(c->blob, ncap);
+                    if (nb == NULL) {
+                        c->oom = 1;
+                        return;
+                    }
+                    c->blob = nb;
+                    c->bcap = ncap;
+                }
+                c->ent[c->n].level = level;
+                c->ent[c->n].page = page;
+                c->ent[c->n].toff = c->bl;
+                memcpy(c->blob + c->bl, text, tl + 1);
+                c->bl += tl + 1;
+                c->n++;
+            }
+        }
+
+        if (depth < 8) {
+            outline_walk(doc, pdf_resolve(doc, pdf_dictget(item, "First")),
+                         level + 1, c, depth + 1);
+        }
+        item = pdf_resolve(doc, pdf_dictget(item, "Next"));
+    }
+}
+
+int
+pdf_extractoutline(PdfDoc *doc, PdfOutlineEnt **outp, u32 *nout,
+                   char **titles, u32 *titlelen)
+{
+    OutlineCol c;
+    PdfObj *ol;
+
+    *outp = NULL;
+    *nout = 0;
+    *titles = NULL;
+    *titlelen = 0;
+    if (doc == NULL || doc->root == NULL) {
+        return PDF_E_RANGE;
+    }
+    memset(&c, 0, sizeof c);
+    ol = pdf_resolve(doc, pdf_dictget(doc->root, "Outlines"));
+    if (ol == NULL || ol->type != PDF_DICT) {
+        return PDF_OK;                  /* no outline at all         */
+    }
+    outline_walk(doc, pdf_resolve(doc, pdf_dictget(ol, "First")), 0,
+                 &c, 0);
+    if (c.oom) {
+        free(c.ent);
+        free(c.blob);
+        return PDF_E_NOMEM;
+    }
+    *outp = c.ent;
+    *nout = c.n;
+    *titles = c.blob;
+    *titlelen = c.bl;
+    return PDF_OK;
+}
+
 /* --- link annotations --------------------------------------------------
 
    /Annots entries of /Subtype /Link whose /A action is /S /URI.  The
