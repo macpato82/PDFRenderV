@@ -1,0 +1,294 @@
+/*
+  PDFRender - GIF decoding.  See h/pdfgif.
+
+  Written from the GIF89a specification.  The LZW here is GIF's own:
+  codes are read least-significant-bit first, the code size starts at
+  the image's minimum plus one, the clear and end codes sit at
+  2^minimum and 2^minimum+1, and the code size grows when the next
+  code would not fit.  A clear code resets the table mid-stream, which
+  real files use constantly.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfgif.h"
+
+#define GIF_MAXCODES 4096
+
+int
+pdfgif_size(const u8 *src, u32 len, int *w, int *h)
+{
+    *w = *h = 0;
+    if (len < 13 || memcmp(src, "GIF8", 4) != 0) {
+        return PDF_E_DATA;
+    }
+    *w = (int) ((u32) src[6] | ((u32) src[7] << 8));
+    *h = (int) ((u32) src[8] | ((u32) src[9] << 8));
+    if (*w < 1 || *h < 1) {
+        return PDF_E_DATA;
+    }
+    return PDF_OK;
+}
+
+/* Skip a chain of sub-blocks (each a length byte then that many
+   bytes, ending with a zero length).                                */
+static u32
+skip_blocks(const u8 *src, u32 len, u32 p)
+{
+    while (p < len && src[p] != 0) {
+        p += 1 + src[p];
+    }
+    return p < len ? p + 1 : len;
+}
+
+int
+pdfgif_decode(const u8 *src, u32 len, int *wp, int *hp, u32 **pixp)
+{
+    u32 p, gctsize = 0, bg = 0;
+    const u8 *gct = NULL;
+    int sw = 0, sh = 0;
+    int transparent = -1;
+    u32 *pix = NULL;
+
+    *wp = *hp = 0;
+    *pixp = NULL;
+    if (pdfgif_size(src, len, &sw, &sh) != PDF_OK) {
+        return PDF_E_DATA;
+    }
+    if ((u32) sw * (u32) sh > 16000000u) {
+        return PDF_E_LIMIT;
+    }
+    if (src[10] & 0x80) {
+        gctsize = 2u << (src[10] & 7);
+        gct = src + 13;
+        if (13 + gctsize * 3 > len) {
+            return PDF_E_DATA;
+        }
+    }
+    bg = src[11];
+    p = 13 + gctsize * 3;
+
+    /* the frame is painted onto the logical screen, which starts as
+       the background colour - or white when there is no table       */
+    pix = malloc((u32) sw * (u32) sh * sizeof *pix);
+    if (pix == NULL) {
+        return PDF_E_NOMEM;
+    }
+    {
+        u32 fill = 0xFFFFFFu;
+        u32 i, n = (u32) sw * (u32) sh;
+
+        if (gct != NULL && bg < gctsize) {
+            fill = (u32) gct[bg * 3] | ((u32) gct[bg * 3 + 1] << 8) |
+                   ((u32) gct[bg * 3 + 2] << 16);
+        }
+        for (i = 0; i < n; i++) {
+            pix[i] = fill;
+        }
+    }
+
+    while (p < len) {
+        u8 tag = src[p];
+
+        if (tag == 0x3B) {              /* trailer                   */
+            break;
+        }
+        if (tag == 0x21) {              /* extension                 */
+            u8 label;
+
+            if (p + 2 > len) {
+                break;
+            }
+            label = src[p + 1];
+            if (label == 0xF9 && p + 6 < len && src[p + 2] >= 4) {
+                /* graphic control: transparency for the next frame  */
+                if (src[p + 3] & 1) {
+                    transparent = src[p + 6];
+                }
+            }
+            p = skip_blocks(src, len, p + 2);
+            continue;
+        }
+        if (tag != 0x2C) {              /* not an image: give up     */
+            break;
+        }
+
+        /* --- image descriptor --- */
+        {
+            u32 ix, iy, iw, ih, lctsize = 0;
+            const u8 *ct = gct;
+            u32 ctsize = gctsize;
+            int interlaced;
+            int minsize;
+            u32 clearcode, endcode, next, codesize;
+            u32 prefix[GIF_MAXCODES];
+            u8 suffix[GIF_MAXCODES];
+            u8 stack[GIF_MAXCODES];
+            u32 sp = 0;
+            u32 bitbuf = 0;
+            int bitcnt = 0;
+            u32 blkend;
+            u32 prev = 0xFFFFFFFFu;
+            int outx = 0, outy = 0, pass = 0;
+
+            if (p + 10 > len) {
+                break;
+            }
+            ix = (u32) src[p + 1] | ((u32) src[p + 2] << 8);
+            iy = (u32) src[p + 3] | ((u32) src[p + 4] << 8);
+            iw = (u32) src[p + 5] | ((u32) src[p + 6] << 8);
+            ih = (u32) src[p + 7] | ((u32) src[p + 8] << 8);
+            interlaced = (src[p + 9] & 0x40) != 0;
+            if (src[p + 9] & 0x80) {
+                lctsize = 2u << (src[p + 9] & 7);
+                ct = src + p + 10;
+                ctsize = lctsize;
+                if (p + 10 + lctsize * 3 > len) {
+                    break;
+                }
+            }
+            p += 10 + lctsize * 3;
+            if (p >= len || ct == NULL || iw == 0 || ih == 0) {
+                break;
+            }
+            minsize = src[p++];
+            if (minsize < 2 || minsize > 8) {
+                break;
+            }
+            clearcode = 1u << minsize;
+            endcode = clearcode + 1;
+            next = endcode + 1;
+            codesize = (u32) minsize + 1;
+
+            /* the LZW data arrives in sub-blocks; walk them as one
+               continuous bit stream                                 */
+            blkend = p;
+            for (;;) {
+                u32 code;
+
+                while (bitcnt < (int) codesize) {
+                    if (blkend >= len) {
+                        goto done;
+                    }
+                    if (p >= blkend) {
+                        u32 blen = src[blkend];
+
+                        if (blen == 0) {
+                            goto done;
+                        }
+                        p = blkend + 1;
+                        blkend = p + blen;
+                        if (blkend > len) {
+                            goto done;
+                        }
+                    }
+                    bitbuf |= (u32) src[p++] << bitcnt;
+                    bitcnt += 8;
+                }
+                code = bitbuf & ((1u << codesize) - 1);
+                bitbuf >>= codesize;
+                bitcnt -= (int) codesize;
+
+                if (code == clearcode) {
+                    next = endcode + 1;
+                    codesize = (u32) minsize + 1;
+                    prev = 0xFFFFFFFFu;
+                    continue;
+                }
+                if (code == endcode) {
+                    break;
+                }
+                {
+                    u32 c;
+                    u8 first;
+
+                    sp = 0;
+                    if (code == next && prev != 0xFFFFFFFFu) {
+                        /* KwKwK: the code being defined right now.
+                           Its string is the previous one with its own
+                           first byte appended, so push that byte
+                           first - the stack is emitted in reverse. */
+                        u32 t = prev;
+
+                        while (t >= clearcode) {
+                            t = prefix[t];
+                        }
+                        stack[sp++] = (u8) t;
+                        c = prev;
+                    } else if (code > next || code == clearcode ||
+                               code == endcode) {
+                        break;                  /* corrupt          */
+                    } else {
+                        c = code;
+                    }
+                    while (c >= clearcode && sp < GIF_MAXCODES) {
+                        stack[sp++] = suffix[c];
+                        c = prefix[c];
+                    }
+                    if (sp < GIF_MAXCODES) {
+                        stack[sp++] = (u8) c;
+                    }
+                    first = (u8) c;
+
+                    if (prev != 0xFFFFFFFFu && next < GIF_MAXCODES) {
+                        prefix[next] = prev;
+                        suffix[next] = first;
+                        next++;
+                        if (next == (1u << codesize) && codesize < 12) {
+                            codesize++;
+                        }
+                    }
+                }
+                /* emit, top of stack first                          */
+                while (sp > 0) {
+                    u32 idx = stack[--sp];
+                    int px = (int) ix + outx;
+                    int py = (int) iy + outy;
+
+                    if (px >= 0 && px < sw && py >= 0 && py < sh &&
+                        (int) idx != transparent) {
+                        u32 rgb = idx < ctsize
+                                ? (u32) ct[idx * 3] |
+                                  ((u32) ct[idx * 3 + 1] << 8) |
+                                  ((u32) ct[idx * 3 + 2] << 16)
+                                : 0;
+                        pix[(u32) py * (u32) sw + (u32) px] = rgb;
+                    }
+                    outx++;
+                    if ((u32) outx >= iw) {
+                        outx = 0;
+                        if (interlaced) {
+                            static const int start[4] = { 0, 4, 2, 1 };
+                            static const int step[4] = { 8, 8, 4, 2 };
+
+                            outy += step[pass];
+                            while ((u32) outy >= ih && pass < 3) {
+                                pass++;
+                                outy = start[pass];
+                            }
+                        } else {
+                            outy++;
+                        }
+                    }
+                }
+                prev = code;
+            }
+        done:
+            *wp = sw;
+            *hp = sh;
+            *pixp = pix;
+            return PDF_OK;              /* first frame only          */
+        }
+    }
+    /* no image block found */
+    *wp = sw;
+    *hp = sh;
+    *pixp = pix;
+    return PDF_OK;
+}

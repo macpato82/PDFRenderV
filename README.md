@@ -126,8 +126,26 @@ binary, so N open documents do not give N identical icons.
 | PDF | &ADF | this engine |
 | JPEG | &C85 | SpriteExtend (`JPEG_PlotScaled`) |
 | PNG | &B60 | `c/pdfpng`, reusing our inflate and PNG predictors |
-| Sprite | &FF9 | `OS_SpriteOp 52` |
+| Sprite | &FF9 | `OS_SpriteOp 52`, mask honoured |
 | Draw | &AFF | `DrawFile_Render` |
+| BMP | &69C | `c/pdfbmp` |
+| GIF | &695 | `c/pdfgif` |
+| anything else | | `ImageFileRender`, when the machine has it |
+
+`c/pdfbmp` covers BITMAPCOREHEADER and BITMAPINFOHEADER (and the V4/V5
+extensions), 1/4/8/16/24/32bpp, top-down and bottom-up, RLE4 and RLE8,
+and BI_BITFIELDS with arbitrary masks. `c/pdfgif` decodes the first
+frame of 87a and 89a, de-interlacing and compositing the transparent
+colour; GIF's LZW is not PDF's - little-endian codes, its own code
+sizes - so it has its own decoder rather than reusing `c/pdfflt`.
+
+Anything else is offered to **ImageFileRender** (`ImageFileRender_BBox`
+for the size, `ImageFileRender_Render` with a to-fit block to draw), so
+whatever renderers or ImageFileConvert converters the machine has -
+SVG, TIFF, ArtWorks - open in the viewer too. It is entirely optional:
+plenty of ROMs do not have it, including the RiscPC-class 5.31 this was
+developed on, and its absence simply means those filetypes are not
+supported.
 
 `PDFRenderV$Claim` lists which filetypes the module takes over
 (default: all five).  An application whose `!Boot` runs after ours can

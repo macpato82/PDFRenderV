@@ -51,7 +51,7 @@ build_modhead() {
     [ -s o/modhead ]
 }
 
-SRCS="module pdfobj pdfflt pdfcrypt pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng pdfpage pdfdraw"
+SRCS="module pdfobj pdfflt pdfcrypt pdffile pdffont pdfimg pdfjpx pdfjpg pdfpng pdfbmp pdfgif pdfpage pdfdraw"
 
 echo "== module header (CMunge) =="
 build_modhead || { echo "CMunge FAILED"; exit 1; }

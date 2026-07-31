@@ -35,6 +35,8 @@
 #include "pdfpage.h"
 #include "pdfdraw.h"
 #include "pdfpng.h"
+#include "pdfbmp.h"
+#include "pdfgif.h"
 #include "modhead.h"
 #include "module.h"
 
@@ -52,6 +54,22 @@
 #define XJPEG_Info       (0x49980)
 #define XJPEG_PlotScaled (0x49982)
 
+/* ImageFileRender: the OS-wide "render any image file" interface.  It
+   is not in every ROM - this RiscPC-class 5.31 has neither it nor
+   ImageFileConvert - so everything through it is strictly optional
+   and a missing SWI just means the filetype is not supported.
+   Where it is present, any renderer the user has installed (and,
+   through the ConvertSprite proxy, any ImageFileConvert converter)
+   becomes a format the viewer can open.                             */
+#define XImageFileRender_Render (0x562C0)
+#define XImageFileRender_BBox   (0x562C1)
+#define IFR_TYPE_SIZE           (0 << 0)    /* "fit this box"        */
+#define IFR_TYPE_SCALE          (1 << 0)
+#define IFR_IGNORE_ORIGIN       (1 << 4)
+#define IFR_RETURN_OSUNITS      (1 << 5)
+#define IFR_QUALITY_SHIFT       6
+#define IFR_SEQUENCE_LAST       (-1)
+
 /* Filetypes we open.  The viewer is a previewer, not just a PDF
    reader: everything here appears in the same window with the same
    zoom and print controls.                                          */
@@ -60,6 +78,11 @@
 #define FT_PNG     0xB60
 #define FT_SPRITE  0xFF9
 #define FT_DRAW    0xAFF
+#define FT_BMP     0x69C
+#define FT_GIF     0x695
+/* Anything else the OS can render for us.  ds->filetype holds what it
+   really is.                                                        */
+#define FT_OTHER   0x1000
 
 #define RUNTYPE_VAR   "Alias$@RunType_ADF"
 #define CLAIM_VAR     "PDFRenderV$Claim"
@@ -70,11 +93,15 @@
 
 #define MAXDOCS 8
 
+/* filetypes claim_filetypes()/mod_final walk                        */
+#define NTYPES 7
+
 /* A document is a PDF or a single-page image/drawing.  Everything
    below the SWI layer works the same way for both.                  */
 typedef struct {
     int inuse;
     int kind;                   /* FT_* of the opened file           */
+    int filetype;               /* the real type, for FT_OTHER       */
     PdfDoc *doc;                /* FT_PDF only                       */
     u8 *buf;                    /* whole file                        */
     u32 len;
@@ -173,6 +200,7 @@ sniff_kind(int filetype, const u8 *buf, u32 len)
     switch (filetype) {
     case FT_PDF: case FT_JPEG: case FT_PNG:
     case FT_SPRITE: case FT_DRAW:
+    case FT_BMP: case FT_GIF:
         return filetype;
     default:
         break;
@@ -189,7 +217,42 @@ sniff_kind(int filetype, const u8 *buf, u32 len)
     if (len >= 4 && memcmp(buf, "Draw", 4) == 0) {
         return FT_DRAW;
     }
-    return -1;
+    if (len >= 2 && buf[0] == 'B' && buf[1] == 'M') {
+        return FT_BMP;
+    }
+    if (len >= 6 && memcmp(buf, "GIF8", 4) == 0) {
+        return FT_GIF;
+    }
+    /* Not one of ours.  If it has a filetype at all, ImageFileRender
+       may still know how to draw it - measure_doc finds out.       */
+    return filetype > 0 ? FT_OTHER : -1;
+}
+
+/* Ask ImageFileRender how big the image is, in OS units.  Our page
+   sprite is 180dpi, where one OS unit is one pixel, so the numbers
+   carry straight across.  An error here means no renderer for this
+   filetype, which is how an unsupported file is rejected.          */
+static _kernel_oserror *
+measure_via_ifr(DocSlot *ds)
+{
+    int scale[4], bbox[4];
+    _kernel_oserror *e;
+
+    scale[0] = 1; scale[1] = 1; scale[2] = 1; scale[3] = 1;
+    bbox[0] = bbox[1] = bbox[2] = bbox[3] = 0;
+    e = _swix(XImageFileRender_BBox, _INR(0, 7),
+              IFR_TYPE_SCALE | IFR_IGNORE_ORIGIN | IFR_RETURN_OSUNITS,
+              ds->filetype, ds->buf, ds->len, 0, IFR_SEQUENCE_LAST,
+              scale, bbox);
+    if (e != NULL) {
+        return e;
+    }
+    ds->w = bbox[2] - bbox[0];
+    ds->h = bbox[3] - bbox[1];
+    if (ds->w < 1 || ds->h < 1) {
+        return err_BadPDF;
+    }
+    return NULL;
 }
 
 /* Image geometry, so PageSize can answer before anything is drawn.  */
@@ -197,6 +260,14 @@ static _kernel_oserror *
 measure_doc(DocSlot *ds)
 {
     switch (ds->kind) {
+    case FT_OTHER:
+        return measure_via_ifr(ds);
+    case FT_BMP:
+        return pdfbmp_size(ds->buf, ds->len, &ds->w, &ds->h) == PDF_OK
+               ? NULL : err_BadPDF;
+    case FT_GIF:
+        return pdfgif_size(ds->buf, ds->len, &ds->w, &ds->h) == PDF_OK
+               ? NULL : err_BadPDF;
     case FT_JPEG:
         {
             int w = 0, h = 0;
@@ -294,6 +365,7 @@ open_doc(const char *name, int *handlep)
         return err_BadPDF;
     }
     docs[i].kind = kind;
+    docs[i].filetype = filetype;
     docs[i].buf = buf;
     docs[i].len = len;
     if (kind == FT_PDF) {
@@ -495,6 +567,39 @@ plot_pixels(u32 *pix, int w, int h, int dx, int dy, int dw, int dh)
     return e;
 }
 
+
+static _kernel_oserror *
+plot_bmp(DocSlot *ds, int dx, int dy, int dw, int dh)
+{
+    int w = 0, h = 0, err;
+    u32 *pix = NULL;
+    _kernel_oserror *e;
+
+    err = pdfbmp_decode(ds->buf, ds->len, &w, &h, &pix);
+    if (err != PDF_OK) {
+        return pdferr_to_os(err);
+    }
+    e = plot_pixels(pix, w, h, dx, dy, dw, dh);
+    free(pix);
+    return e;
+}
+
+static _kernel_oserror *
+plot_gif(DocSlot *ds, int dx, int dy, int dw, int dh)
+{
+    int w = 0, h = 0, err;
+    u32 *pix = NULL;
+    _kernel_oserror *e;
+
+    err = pdfgif_decode(ds->buf, ds->len, &w, &h, &pix);
+    if (err != PDF_OK) {
+        return pdferr_to_os(err);
+    }
+    e = plot_pixels(pix, w, h, dx, dy, dw, dh);
+    free(pix);
+    return e;
+}
+
 static _kernel_oserror *
 plot_png(DocSlot *ds, int dx, int dy, int dw, int dh)
 {
@@ -542,6 +647,25 @@ render_image(DocSlot *ds, int devw, int devh)
     }
     if (ds->kind == FT_PNG) {
         return plot_png(ds, dx, dy, dw, dh);
+    }
+    if (ds->kind == FT_BMP) {
+        return plot_bmp(ds, dx, dy, dw, dh);
+    }
+    if (ds->kind == FT_GIF) {
+        return plot_gif(ds, dx, dy, dw, dh);
+    }
+    if (ds->kind == FT_OTHER) {
+        int tofit[4];
+
+        tofit[0] = dw;                  /* width, OS units           */
+        tofit[1] = dh;                  /* height                    */
+        tofit[2] = 0;                   /* no border                 */
+        tofit[3] = 0;                   /* no rotation               */
+        return _swix(XImageFileRender_Render, _INR(0, 9),
+                     IFR_TYPE_SIZE | IFR_IGNORE_ORIGIN |
+                     (15 << IFR_QUALITY_SHIFT),
+                     ds->filetype, ds->buf, ds->len, 0,
+                     IFR_SEQUENCE_LAST, dx, dy, tofit, 0);
     }
     return err_BadPDF;
 }
@@ -653,7 +777,7 @@ claim_filetypes(void)
               VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
               &len) == NULL && len > 0) {
         static const char *const types[] = {
-            "ADF", "C85", "B60", "FF9", "AFF"
+            "ADF", "C85", "B60", "FF9", "AFF", "69C", "695"
         };
         char claim[128];
         int clen = 0, i;
@@ -662,11 +786,11 @@ claim_filetypes(void)
         if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
                   CLAIM_VAR, claim, (int) sizeof claim - 1, 0, 0,
                   &clen) != NULL || clen <= 0) {
-            strcpy(claim, "ADF,C85,B60,FF9,AFF");
+            strcpy(claim, "ADF,C85,B60,FF9,AFF,69C,695");
         } else {
             claim[clen] = 0;
         }
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < NTYPES; i++) {
             char var[40], alias[256];
 
             if (strstr(claim, types[i]) == NULL) {
@@ -707,7 +831,7 @@ mod_final(int fatal, int podule, void *pw)
        still points at our viewer - never stamp on another app.     */
     {
         static const char *const types[] = {
-            "ADF", "C85", "B60", "FF9", "AFF"
+            "ADF", "C85", "B60", "FF9", "AFF", "69C", "695"
         };
         char viewer[200];
         int vlen = 0, i;
@@ -716,7 +840,7 @@ mod_final(int fatal, int podule, void *pw)
                   VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
                   &vlen) == NULL && vlen > 0) {
             viewer[vlen] = 0;
-            for (i = 0; i < 5; i++) {
+            for (i = 0; i < NTYPES; i++) {
                 char var[40], cur[256];
                 int len = 0;
                 sprintf(var, "Alias$@RunType_%s", types[i]);

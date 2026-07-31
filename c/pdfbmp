@@ -1,0 +1,349 @@
+/*
+  PDFRender - Windows BMP decoding.  See h/pdfbmp.
+
+  Written from the documented BITMAPFILEHEADER / BITMAPINFOHEADER
+  layouts.  The awkward corners that real files hit are handled:
+  bottom-up storage (the usual case) and top-down (negative height),
+  4-byte row padding, palettes shorter than the depth implies, RLE4/8
+  including their delta and absolute escapes, and BI_BITFIELDS with
+  arbitrary channel masks rather than only the 555/565 defaults.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfbmp.h"
+
+#define BMP_RGB         0
+#define BMP_RLE8        1
+#define BMP_RLE4        2
+#define BMP_BITFIELDS   3
+
+static u32
+rd16(const u8 *p)
+{
+    return (u32) p[0] | ((u32) p[1] << 8);
+}
+
+static u32
+rd32(const u8 *p)
+{
+    return (u32) p[0] | ((u32) p[1] << 8) |
+           ((u32) p[2] << 16) | ((u32) p[3] << 24);
+}
+
+/* Shift and scale for one BI_BITFIELDS channel: how far right to move
+   it, and what to multiply by so the channel fills 0..255.          */
+static void
+mask_info(u32 mask, int *shift, u32 *maxv)
+{
+    int s = 0;
+    u32 m = mask;
+
+    if (mask == 0) {
+        *shift = 0;
+        *maxv = 0;
+        return;
+    }
+    while ((m & 1) == 0) {
+        m >>= 1;
+        s++;
+    }
+    *shift = s;
+    *maxv = m;
+}
+
+static u32
+chan(u32 v, int shift, u32 maxv)
+{
+    if (maxv == 0) {
+        return 0;
+    }
+    v = (v >> shift) & maxv;
+    return (v * 255u) / maxv;
+}
+
+/* Parse the headers.  Returns the offset of the pixel data, or 0.   */
+static u32
+bmp_header(const u8 *src, u32 len, int *wp, int *hp, int *flip,
+           int *bpp, u32 *comp, const u8 **pal, u32 *palnum,
+           u32 masks[3])
+{
+    u32 dataoff, hdrsize, palsize;
+    s32 h;
+
+    if (len < 26 || src[0] != 'B' || src[1] != 'M') {
+        return 0;
+    }
+    dataoff = rd32(src + 10);
+    hdrsize = rd32(src + 14);
+    if (hdrsize < 12 || 14 + hdrsize > len) {
+        return 0;
+    }
+    if (hdrsize == 12) {                /* BITMAPCOREHEADER          */
+        *wp = (int) rd16(src + 18);
+        h = (s32) (s16) rd16(src + 20);
+        *bpp = (int) rd16(src + 24);
+        *comp = BMP_RGB;
+        palsize = 3;                    /* RGBTRIPLE entries         */
+    } else {
+        *wp = (int) (s32) rd32(src + 18);
+        h = (s32) rd32(src + 22);
+        *bpp = (int) rd16(src + 28);
+        *comp = rd32(src + 30);
+        palsize = 4;                    /* RGBQUAD entries           */
+    }
+    *flip = h < 0 ? 0 : 1;              /* positive height = bottom-up */
+    *hp = h < 0 ? -(int) h : (int) h;
+
+    if (*wp < 1 || *hp < 1 || *wp > 20000 || *hp > 20000) {
+        return 0;
+    }
+    switch (*bpp) {
+    case 1: case 4: case 8: case 16: case 24: case 32:
+        break;
+    default:
+        return 0;
+    }
+
+    masks[0] = masks[1] = masks[2] = 0;
+    if (*comp == BMP_BITFIELDS && hdrsize >= 40) {
+        if (14 + hdrsize + 12 <= len && hdrsize == 40) {
+            /* the three masks follow the header                     */
+            masks[0] = rd32(src + 14 + 40);
+            masks[1] = rd32(src + 14 + 44);
+            masks[2] = rd32(src + 14 + 48);
+        } else if (hdrsize >= 52) {
+            masks[0] = rd32(src + 14 + 40);
+            masks[1] = rd32(src + 14 + 44);
+            masks[2] = rd32(src + 14 + 48);
+        }
+        if (masks[0] == 0 && masks[1] == 0 && masks[2] == 0) {
+            masks[0] = *bpp == 16 ? 0x7C00u : 0xFF0000u;
+            masks[1] = *bpp == 16 ? 0x03E0u : 0x00FF00u;
+            masks[2] = *bpp == 16 ? 0x001Fu : 0x0000FFu;
+        }
+    }
+
+    *pal = NULL;
+    *palnum = 0;
+    if (*bpp <= 8) {
+        u32 used = hdrsize >= 40 ? rd32(src + 46) : 0;
+        u32 palstart = 14 + hdrsize;
+
+        if (*comp == BMP_BITFIELDS && hdrsize == 40) {
+            palstart += 12;
+        }
+        if (used == 0) {
+            used = 1u << *bpp;
+        }
+        if (palstart >= len) {
+            return 0;
+        }
+        if (used > (len - palstart) / palsize) {
+            used = (len - palstart) / palsize;
+        }
+        *pal = src + palstart;
+        *palnum = used;
+        if (used == 0) {
+            return 0;
+        }
+    }
+    if (dataoff == 0 || dataoff >= len) {
+        /* some writers leave it zero: assume the data follows       */
+        dataoff = 14 + hdrsize + *palnum * palsize;
+        if (dataoff >= len) {
+            return 0;
+        }
+    }
+    (void) palsize;
+    return dataoff;
+}
+
+int
+pdfbmp_size(const u8 *src, u32 len, int *w, int *h)
+{
+    int bpp, flip;
+    u32 comp, palnum, masks[3];
+    const u8 *pal;
+
+    *w = *h = 0;
+    if (bmp_header(src, len, w, h, &flip, &bpp, &comp, &pal, &palnum,
+                   masks) == 0) {
+        return PDF_E_DATA;
+    }
+    return PDF_OK;
+}
+
+/* Look a palette entry up; entries are BGR(A) in file order.        */
+static u32
+palette_at(const u8 *pal, u32 palnum, u32 entsize, u32 idx)
+{
+    const u8 *p;
+
+    if (idx >= palnum) {
+        return 0;
+    }
+    p = pal + idx * entsize;
+    return (u32) p[2] | ((u32) p[1] << 8) | ((u32) p[0] << 16);
+}
+
+int
+pdfbmp_decode(const u8 *src, u32 len, int *wp, int *hp, u32 **pixp)
+{
+    int w = 0, h = 0, bpp = 0, flip = 1;
+    u32 comp = 0, palnum = 0, masks[3], dataoff, entsize;
+    const u8 *pal = NULL;
+    const u8 *d;
+    u32 avail, rowbytes;
+    u32 *pix;
+    int y;
+    int shift[3];
+    u32 maxv[3];
+
+    *wp = *hp = 0;
+    *pixp = NULL;
+    dataoff = bmp_header(src, len, &w, &h, &flip, &bpp, &comp, &pal,
+                         &palnum, masks);
+    if (dataoff == 0) {
+        return PDF_E_DATA;
+    }
+    if ((u32) w * (u32) h > 16000000u) {
+        return PDF_E_LIMIT;
+    }
+    entsize = rd32(src + 14) == 12 ? 3 : 4;
+    d = src + dataoff;
+    avail = len - dataoff;
+
+    pix = malloc((u32) w * (u32) h * sizeof *pix);
+    if (pix == NULL) {
+        return PDF_E_NOMEM;
+    }
+    memset(pix, 0xFF, (u32) w * (u32) h * sizeof *pix);  /* white     */
+
+    for (y = 0; y < 3; y++) {
+        mask_info(masks[y], &shift[y], &maxv[y]);
+    }
+
+    if (comp == BMP_RLE8 || comp == BMP_RLE4) {
+        u32 i = 0;
+        int x = 0;
+        int row = 0;
+
+        while (i + 1 < avail && row < h) {
+            u32 n = d[i], v = d[i + 1];
+            u32 *out = pix + (u32) (flip ? (h - 1 - row) : row) * (u32) w;
+
+            i += 2;
+            if (n != 0) {               /* a run                     */
+                u32 k;
+
+                for (k = 0; k < n && x < w; k++, x++) {
+                    u32 idx = comp == BMP_RLE8 ? v
+                            : ((k & 1) ? (v & 15) : (v >> 4));
+                    out[x] = palette_at(pal, palnum, entsize, idx);
+                }
+            } else if (v == 0) {        /* end of line               */
+                row++;
+                x = 0;
+            } else if (v == 1) {        /* end of bitmap             */
+                break;
+            } else if (v == 2) {        /* delta                     */
+                if (i + 1 >= avail) {
+                    break;
+                }
+                x += d[i];
+                row += d[i + 1];
+                i += 2;
+            } else {                    /* absolute run              */
+                u32 k;
+                u32 bytes = comp == BMP_RLE8 ? v : ((v + 1) / 2);
+
+                if (i + bytes > avail) {
+                    break;
+                }
+                for (k = 0; k < v && x < w; k++, x++) {
+                    u32 idx = comp == BMP_RLE8 ? d[i + k]
+                            : ((k & 1) ? (d[i + k / 2] & 15)
+                                       : (d[i + k / 2] >> 4));
+                    out[x] = palette_at(pal, palnum, entsize, idx);
+                }
+                i += bytes;
+                if (bytes & 1) {
+                    i++;                /* runs are word... byte aligned */
+                }
+            }
+        }
+        *wp = w;
+        *hp = h;
+        *pixp = pix;
+        return PDF_OK;
+    }
+
+    rowbytes = (((u32) w * (u32) bpp + 31) / 32) * 4;
+    for (y = 0; y < h; y++) {
+        const u8 *row = d + (u32) y * rowbytes;
+        u32 *out = pix + (u32) (flip ? (h - 1 - y) : y) * (u32) w;
+        int x;
+
+        if ((u32) (y + 1) * rowbytes > avail) {
+            break;                      /* truncated: keep what we got */
+        }
+        for (x = 0; x < w; x++) {
+            u32 v;
+
+            switch (bpp) {
+            case 1:
+                v = (row[x >> 3] >> (7 - (x & 7))) & 1;
+                out[x] = palette_at(pal, palnum, entsize, v);
+                break;
+            case 4:
+                v = (x & 1) ? (row[x >> 1] & 15) : (row[x >> 1] >> 4);
+                out[x] = palette_at(pal, palnum, entsize, v);
+                break;
+            case 8:
+                out[x] = palette_at(pal, palnum, entsize, row[x]);
+                break;
+            case 16:
+                v = rd16(row + x * 2);
+                if (masks[0] == 0) {    /* plain 555                 */
+                    u32 r = (v >> 10) & 31, g = (v >> 5) & 31, b = v & 31;
+                    out[x] = ((r * 255 / 31)) |
+                             ((g * 255 / 31) << 8) |
+                             ((b * 255 / 31) << 16);
+                } else {
+                    out[x] = chan(v, shift[0], maxv[0]) |
+                             (chan(v, shift[1], maxv[1]) << 8) |
+                             (chan(v, shift[2], maxv[2]) << 16);
+                }
+                break;
+            case 24:
+                out[x] = (u32) row[x * 3 + 2] |
+                         ((u32) row[x * 3 + 1] << 8) |
+                         ((u32) row[x * 3] << 16);
+                break;
+            default:                    /* 32                        */
+                v = rd32(row + x * 4);
+                if (masks[0] == 0) {
+                    out[x] = ((v >> 16) & 0xFF) |
+                             (((v >> 8) & 0xFF) << 8) |
+                             ((v & 0xFF) << 16);
+                } else {
+                    out[x] = chan(v, shift[0], maxv[0]) |
+                             (chan(v, shift[1], maxv[1]) << 8) |
+                             (chan(v, shift[2], maxv[2]) << 16);
+                }
+                break;
+            }
+        }
+    }
+    *wp = w;
+    *hp = h;
+    *pixp = pix;
+    return PDF_OK;
+}

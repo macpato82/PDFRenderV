@@ -1,0 +1,29 @@
+/*
+  PDFRender - GIF decoding (87a and 89a, first frame).
+
+  GIF's LZW is not PDF's: the code size starts from the image's own
+  minimum, codes are packed little-endian rather than big-endian, and
+  the clear and end codes sit immediately above the palette.  So this
+  has its own decoder rather than reusing c/pdfflt's.
+
+  Only the first frame is decoded - this is a previewer, not an
+  animator - with its transparent colour composited onto white.
+  Interlaced images are de-interlaced.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFGIF_H
+#define PDFGIF_H
+
+#include "pdftypes.h"
+
+/* Logical screen size, without decoding.                            */
+int pdfgif_size(const u8 *src, u32 len, int *w, int *h);
+
+/* Decode the first frame to a malloc'd XRGB32 buffer.               */
+int pdfgif_decode(const u8 *src, u32 len, int *wp, int *hp, u32 **pixp);
+
+#endif

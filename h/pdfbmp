@@ -1,0 +1,26 @@
+/*
+  PDFRender - Windows BMP decoding.
+
+  Covers what BMP files in the wild actually use: BITMAPCOREHEADER and
+  BITMAPINFOHEADER (and the V4/V5 extensions, whose extra fields we
+  skip), 1/4/8/16/24/32 bits per pixel, bottom-up and top-down, RLE4
+  and RLE8, and BI_BITFIELDS masks.  Output is always XRGB32, one word
+  per pixel, top row first - the same shape c/pdfpng produces.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFBMP_H
+#define PDFBMP_H
+
+#include "pdftypes.h"
+
+/* Width and height without decoding the pixels.                     */
+int pdfbmp_size(const u8 *src, u32 len, int *w, int *h);
+
+/* Decode to a malloc'd XRGB32 buffer the caller owns.               */
+int pdfbmp_decode(const u8 *src, u32 len, int *wp, int *hp, u32 **pixp);
+
+#endif
