@@ -38,6 +38,7 @@
 #include "pdffile.h"
 #include "pdffont.h"
 #include "pdfimg.h"
+#include "pdfjpg.h"
 #include "pdfpage.h"
 #include "pdfdraw.h"
 
@@ -545,6 +546,64 @@ typedef struct {
     u32 mode;
 } SpriteBlock;
 
+/* Wrap a block of XRGB32 pixels in a temporary sprite and plot it
+   scaled.  Shared by the decoded-image path and the fallback when
+   SpriteExtend refuses a JPEG.                                      */
+static void
+plot_xrgb(RoRender *rr, const u32 *pix, int w, int h,
+          int dx, int dy, int dw, int dh, int flipv)
+{
+    u32 rowbytes = (u32) w * 4;
+    u32 imgbytes = rowbytes * (u32) h;
+    u32 total = sizeof(SpriteBlock) + imgbytes;
+    SpriteBlock *sb;
+    u32 scale[4];
+    u32 *dst;
+    int y;
+
+    (void) rr;
+    if (pix == NULL || w < 1 || h < 1) {
+        return;
+    }
+    sb = malloc(total);
+    if (sb == NULL) {
+        return;
+    }
+    memset(sb, 0, sizeof *sb);
+    sb->size = total;
+    sb->count = 1;
+    sb->first = 16;
+    sb->free = total;
+    sb->next = total - 16;
+    memcpy(sb->name, "pdfimg", 6);
+    sb->wwords = (u32) w - 1;
+    sb->hlines = (u32) h - 1;
+    sb->firstbit = 0;
+    sb->lastbit = 31;
+    sb->imgoff = sizeof(SpriteBlock) - 16;
+    sb->maskoff = sb->imgoff;
+    sb->mode = SPRITE_MODE_32BPP_180;
+    dst = (u32 *) ((u8 *) sb + sizeof(SpriteBlock));
+    /* row 0 is the top in both forms; a negative-height matrix means
+       the PDF wants it flipped                                      */
+    if (!flipv) {
+        memcpy(dst, pix, imgbytes);
+    } else {
+        for (y = 0; y < h; y++) {
+            memcpy(dst + (u32) y * (u32) w,
+                   pix + (u32) (h - 1 - y) * (u32) w, rowbytes);
+        }
+    }
+    scale[0] = (u32) dw;
+    scale[1] = (u32) dh;
+    scale[2] = (u32) w;
+    scale[3] = (u32) h;
+    /* +512: R1 = user area, R2 = sprite pointer                     */
+    _swix(XOS_SpriteOp, _INR(0, 7),
+          52 + 512, sb, (u8 *) sb + 16, dx, dy, 0, scale, 0);
+    free(sb);
+}
+
 static void
 be_image(void *ctx, const PdfImg *img, const fix m[6])
 {
@@ -576,9 +635,21 @@ be_image(void *ctx, const PdfImg *img, const fix m[6])
 
     if (img->kind == PDFIMG_JPEG) {
         int jw = 0, jh = 0;
+
         if (_swix(XJPEG_Info, _INR(0, 2) | _OUT(2) | _OUT(3),
                   1, img->jpeg, img->jpeglen, &jw, &jh) != NULL ||
             jw < 1 || jh < 1) {
+            /* SpriteExtend will not take it - an older version
+               without CMYK support, or a variant it rejects.  Decode
+               it ourselves rather than leaving a hole in the page. */
+            u32 *pix = NULL;
+            int pw = 0, ph = 0;
+
+            if (pdfjpg_decode(img->jpeg, img->jpeglen, dw, dh,
+                              &pw, &ph, &pix) == PDF_OK) {
+                plot_xrgb(rr, pix, pw, ph, dx, dy, dw, dh, 0);
+                free(pix);
+            }
             return;
         }
         scale[0] = (u32) dw;
@@ -590,53 +661,7 @@ be_image(void *ctx, const PdfImg *img, const fix m[6])
         return;
     }
 
-    /* XRGB32: wrap the pixel buffer in a temporary sprite            */
-    {
-        u32 rowbytes = (u32) img->w * 4;
-        u32 imgbytes = rowbytes * (u32) img->h;
-        u32 total = sizeof(SpriteBlock) + imgbytes;
-        SpriteBlock *sb = malloc(total);
-        u32 *dst;
-        int y;
-
-        if (sb == NULL) {
-            return;
-        }
-        memset(sb, 0, sizeof *sb);
-        sb->size = total;
-        sb->count = 1;
-        sb->first = 16;
-        sb->free = total;
-        sb->next = total - 16;
-        memcpy(sb->name, "pdfimg", 6);
-        sb->wwords = (u32) img->w - 1;
-        sb->hlines = (u32) img->h - 1;
-        sb->firstbit = 0;
-        sb->lastbit = 31;
-        sb->imgoff = sizeof(SpriteBlock) - 16;
-        sb->maskoff = sb->imgoff;
-        sb->mode = SPRITE_MODE_32BPP_180;
-        dst = (u32 *) ((u8 *) sb + sizeof(SpriteBlock));
-        /* PdfImg row 0 is the top; sprite row 0 is also the top.
-           A negative-height matrix means the PDF wants it flipped.  */
-        if (!flipv) {
-            memcpy(dst, img->pix, imgbytes);
-        } else {
-            for (y = 0; y < img->h; y++) {
-                memcpy(dst + (u32) y * (u32) img->w,
-                       img->pix + (u32) (img->h - 1 - y) * (u32) img->w,
-                       rowbytes);
-            }
-        }
-        scale[0] = (u32) dw;
-        scale[1] = (u32) dh;
-        scale[2] = (u32) img->w;
-        scale[3] = (u32) img->h;
-        /* +512: R1 = user area, R2 = sprite pointer                  */
-        _swix(XOS_SpriteOp, _INR(0, 7),
-              52 + 512, sb, (u8 *) sb + 16, dx, dy, 0, scale, 0);
-        free(sb);
-    }
+    plot_xrgb(rr, img->pix, img->w, img->h, dx, dy, dw, dh, flipv);
 }
 
 /* --- begin / end ---------------------------------------------------- */

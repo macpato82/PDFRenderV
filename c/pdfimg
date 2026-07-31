@@ -25,53 +25,8 @@
 #include "pdffile.h"
 #include "pdfimg.h"
 #include "pdfjpx.h"
-#include "pdfjpg.h"
 
 enum { CS_GRAY = 0, CS_RGB, CS_CMYK, CS_INDEXED, CS_UNKNOWN };
-
-/* How many components does this JPEG have?  Walk the markers to the
-   frame header; returns 0 if it cannot tell.  Cheap: it reads only
-   marker lengths, never the entropy-coded data.                     */
-static int
-jpeg_components(const u8 *d, u32 len)
-{
-    u32 i = 2;                          /* past SOI                   */
-
-    if (len < 4 || d[0] != 0xFF || d[1] != 0xD8) {
-        return 0;
-    }
-    while (i + 3 < len) {
-        u8 m;
-        u32 seg;
-
-        if (d[i] != 0xFF) {
-            i++;
-            continue;
-        }
-        m = d[i + 1];
-        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
-            i += 2;
-            continue;
-        }
-        if (i + 4 >= len) {
-            break;
-        }
-        seg = ((u32) d[i + 2] << 8) | d[i + 3];
-        /* SOF0..SOF15 except the DHT/DAC/RST markers                */
-        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 &&
-            m != 0xCC) {
-            if (i + 9 < len) {
-                return d[i + 9];        /* Nf, component count        */
-            }
-            return 0;
-        }
-        if (m == 0xDA || seg < 2) {
-            break;                      /* scan data starts here      */
-        }
-        i += 2 + seg;
-    }
-    return 0;
-}
 
 /* --- decoded-image cache -------------------------------------------- */
 
@@ -802,37 +757,18 @@ pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
 
     if (stopflt[0] != 0) {
         if (strcmp(stopflt, "DCTDecode") == 0) {
-            /* Which decoder?  MEASURED on an emulated StrongARM with
-               a 2550x3300 scan: SpriteExtend takes ~19s, our own
-               pdfjpg at quarter scale ~26-33s.  Scaled decoding saves
-               the IDCT and colour conversion but NOT the Huffman
-               pass, which dominates at that size and which
-               SpriteExtend does in hand-written ARM.  So the OS
-               decoder wins for ordinary JPEGs and we keep it.
+            /* Hand every JPEG to SpriteExtend.  MEASURED on an
+               emulated StrongARM with a 2550x3300 scan: the OS takes
+               ~19s, our own pdfjpg at quarter scale 26-33s - scaled
+               decoding saves the IDCT and the colour conversion but
+               not the Huffman pass, which dominates at that size and
+               which SpriteExtend does in hand-written ARM.  It also
+               handles CMYK and YCCK (1.88 restored the RGB
+               approximation upstream libjpeg does not provide), so
+               there is nothing left for us to add here.
 
-               pdfjpg earns its place elsewhere: SpriteExtend cannot
-               decode 4-component (CMYK/YCCK) JPEGs at all, and those
-               would otherwise be a blank space on the page.        */
-            if (jpeg_components(buf.p, buf.len) == 4) {
-                int jw = 0, jh = 0;
-                u32 *pix = NULL;
-
-                if (pdfjpg_decode(buf.p, buf.len,
-                                  hintw > 0 ? hintw : w,
-                                  hinth > 0 ? hinth : h,
-                                  &jw, &jh, &pix) == PDF_OK) {
-                    pdfbuf_free(&buf);
-                    img->kind = PDFIMG_XRGB32;
-                    img->w = jw;
-                    img->h = jh;
-                    img->pix = pix;
-                    cache_put(doc, xobj->u.stm.off, hintw, hinth,
-                              jw, jh, pix);
-                    return PDF_OK;
-                }
-                /* progressive or otherwise unsupported: fall back
-                   to SpriteExtend, which at least draws something  */
-            }
+               c/pdfjpg remains as the fallback when the OS refuses a
+               file - see the backend, which tries JPEG_Info first.  */
             img->kind = PDFIMG_JPEG;
             img->w = w;
             img->h = h;
