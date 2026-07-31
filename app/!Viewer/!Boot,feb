@@ -29,8 +29,8 @@ Set File$Type_ADF PDF
 | initialises.  Remove entries here to leave a type with its usual
 | application - for example drop FF9 to keep Paint on sprites.
 | Types: ADF PDF, C85 JPEG, B60 PNG, FF9 Sprite, AFF Draw,
-| 69C BMP, 695 GIF.
-If "<PDFRenderV$Claim>" = "" Then Set PDFRenderV$Claim ADF,C85,B60,FF9,AFF,69C,695
+| 69C BMP, 695 GIF, FF0 TIFF, 1B0 PSD.
+If "<PDFRenderV$Claim>" = "" Then Set PDFRenderV$Claim ADF,C85,B60,FF9,AFF,69C,695,FF0,1B0
 
 | Re-assert the filetype claims.  Another application booted after us
 | can take one back (ChangeFSI claims JPEG, for instance); running

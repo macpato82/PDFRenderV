@@ -1,0 +1,27 @@
+/*
+  PDFRender - Photoshop PSD decoding.
+
+  A PSD is a stack of layers, but every file ends with a flattened
+  composite of the whole image - which is what Photoshop puts there so
+  that other software can show the picture without understanding
+  layers, and is exactly what a previewer wants.  That composite is
+  what this reads.
+
+  Greyscale, RGB, indexed and CMYK, 8 or 16 bits a channel, raw or
+  PackBits.  Layers, masks, adjustment layers and colour profiles are
+  all ignored: the composite already has them applied.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFPSD_H
+#define PDFPSD_H
+
+#include "pdftypes.h"
+
+int pdfpsd_size(const u8 *src, u32 len, int *w, int *h);
+int pdfpsd_decode(const u8 *src, u32 len, int *wp, int *hp, u32 **pixp);
+
+#endif

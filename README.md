@@ -158,6 +158,8 @@ binary, so N open documents do not give N identical icons.
 | Draw | &AFF | `DrawFile_Render` |
 | BMP | &69C | `c/pdfbmp` |
 | GIF | &695 | `c/pdfgif` |
+| TIFF | &FF0 | `c/pdftiff` |
+| PSD | &1B0 | `c/pdfpsd` |
 | anything else | | `ImageFileRender`, when the machine has it |
 
 `c/pdfbmp` covers BITMAPCOREHEADER and BITMAPINFOHEADER (and the V4/V5
@@ -166,6 +168,20 @@ and BI_BITFIELDS with arbitrary masks. `c/pdfgif` decodes the first
 frame of 87a and 89a, de-interlacing and compositing the transparent
 colour; GIF's LZW is not PDF's - little-endian codes, its own code
 sizes - so it has its own decoder rather than reusing `c/pdfflt`.
+
+`c/pdftiff` reads baseline TIFF: both byte orders, 1/2/4/8/16 bits a
+sample, grey either way round, RGB and palette, strips and tiles, the
+horizontal-differencing predictor, and the four compressions that
+matter - none, LZW, Deflate and PackBits. Those three compressed forms
+are the filters the PDF side already had, which is most of why TIFF
+costs so little here. Out: CCITT G3/G4 and JPEG-in-TIFF, which are
+whole codecs in their own right.
+
+`c/pdfpsd` reads the flattened composite every PSD ends with - the one
+Photoshop writes so that software which knows nothing about layers can
+still show the picture. Greyscale, RGB, indexed and CMYK, 8 or 16 bits
+a channel, raw or PackBits. Layers and adjustment layers are ignored
+because the composite already has them applied.
 
 Anything else is offered to **ImageFileRender** (`ImageFileRender_BBox`
 for the size, `ImageFileRender_Render` with a to-fit block to draw), so
@@ -269,6 +285,13 @@ what is under it - CCITT/JBIG2 images.
   including streams lifted from real PDFs), truncation sweep, LZW
   spec vector, predictor/ASCII85/Hex/RLE unit tests. ASan/UBSan.
 - `test/host/testpdf` - opens real PDFs, dumps/counts backend ops.
+- `test/host/testimg` - BMP, GIF, TIFF and PSD against Python PIL,
+  pixel for pixel. Eleven variants: BMP at 1/4/8/24 bit and a
+  hand-built 32bpp top-down BI_BITFIELDS one; GIF plain and
+  interlaced; TIFF uncompressed, LZW, Deflate, PackBits, greyscale,
+  palette, big-endian, 16-bit and with the predictor; PSD raw and
+  PackBits. Also fuzzed: every truncation of a file plus 20,000
+  single-byte corruptions each, under a watchdog, all returning.
 - `test/host/testcrypt` - MD5/SHA-256/384/512 against Python hashlib
   (18 lengths around every block boundary, plus streaming in awkward
   chunk sizes), RC4 and AES-128/192/256 against the FIPS-197 vectors.

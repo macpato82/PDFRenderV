@@ -37,6 +37,8 @@
 #include "pdfpng.h"
 #include "pdfbmp.h"
 #include "pdfgif.h"
+#include "pdftiff.h"
+#include "pdfpsd.h"
 #include "modhead.h"
 #include "module.h"
 
@@ -80,6 +82,8 @@
 #define FT_DRAW    0xAFF
 #define FT_BMP     0x69C
 #define FT_GIF     0x695
+#define FT_TIFF    0xFF0
+#define FT_PSD     0x1B0
 /* Anything else the OS can render for us.  ds->filetype holds what it
    really is.                                                        */
 #define FT_OTHER   0x1000
@@ -94,7 +98,7 @@
 #define MAXDOCS 8
 
 /* filetypes claim_filetypes()/mod_final walk                        */
-#define NTYPES 7
+#define NTYPES 9
 
 /* A document is a PDF or a single-page image/drawing.  Everything
    below the SWI layer works the same way for both.                  */
@@ -201,6 +205,7 @@ sniff_kind(int filetype, const u8 *buf, u32 len)
     case FT_PDF: case FT_JPEG: case FT_PNG:
     case FT_SPRITE: case FT_DRAW:
     case FT_BMP: case FT_GIF:
+    case FT_TIFF: case FT_PSD:
         return filetype;
     default:
         break;
@@ -222,6 +227,13 @@ sniff_kind(int filetype, const u8 *buf, u32 len)
     }
     if (len >= 6 && memcmp(buf, "GIF8", 4) == 0) {
         return FT_GIF;
+    }
+    if (len >= 8 && ((buf[0] == 'I' && buf[1] == 'I' && buf[2] == 42) ||
+                     (buf[0] == 'M' && buf[1] == 'M' && buf[3] == 42))) {
+        return FT_TIFF;
+    }
+    if (len >= 6 && memcmp(buf, "8BPS", 4) == 0) {
+        return FT_PSD;
     }
     /* Not one of ours.  If it has a filetype at all, ImageFileRender
        may still know how to draw it - measure_doc finds out.       */
@@ -267,6 +279,12 @@ measure_doc(DocSlot *ds)
                ? NULL : err_BadPDF;
     case FT_GIF:
         return pdfgif_size(ds->buf, ds->len, &ds->w, &ds->h) == PDF_OK
+               ? NULL : err_BadPDF;
+    case FT_TIFF:
+        return pdftiff_size(ds->buf, ds->len, &ds->w, &ds->h) == PDF_OK
+               ? NULL : err_BadPDF;
+    case FT_PSD:
+        return pdfpsd_size(ds->buf, ds->len, &ds->w, &ds->h) == PDF_OK
                ? NULL : err_BadPDF;
     case FT_JPEG:
         {
@@ -568,6 +586,39 @@ plot_pixels(u32 *pix, int w, int h, int dx, int dy, int dw, int dh)
 }
 
 
+
+static _kernel_oserror *
+plot_tiff(DocSlot *ds, int dx, int dy, int dw, int dh)
+{
+    int w = 0, h = 0, err;
+    u32 *pix = NULL;
+    _kernel_oserror *e;
+
+    err = pdftiff_decode(ds->buf, ds->len, &w, &h, &pix);
+    if (err != PDF_OK) {
+        return pdferr_to_os(err);
+    }
+    e = plot_pixels(pix, w, h, dx, dy, dw, dh);
+    free(pix);
+    return e;
+}
+
+static _kernel_oserror *
+plot_psd(DocSlot *ds, int dx, int dy, int dw, int dh)
+{
+    int w = 0, h = 0, err;
+    u32 *pix = NULL;
+    _kernel_oserror *e;
+
+    err = pdfpsd_decode(ds->buf, ds->len, &w, &h, &pix);
+    if (err != PDF_OK) {
+        return pdferr_to_os(err);
+    }
+    e = plot_pixels(pix, w, h, dx, dy, dw, dh);
+    free(pix);
+    return e;
+}
+
 static _kernel_oserror *
 plot_bmp(DocSlot *ds, int dx, int dy, int dw, int dh)
 {
@@ -653,6 +704,12 @@ render_image(DocSlot *ds, int devw, int devh)
     }
     if (ds->kind == FT_GIF) {
         return plot_gif(ds, dx, dy, dw, dh);
+    }
+    if (ds->kind == FT_TIFF) {
+        return plot_tiff(ds, dx, dy, dw, dh);
+    }
+    if (ds->kind == FT_PSD) {
+        return plot_psd(ds, dx, dy, dw, dh);
     }
     if (ds->kind == FT_OTHER) {
         int tofit[4];
@@ -777,7 +834,7 @@ claim_filetypes(void)
               VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
               &len) == NULL && len > 0) {
         static const char *const types[] = {
-            "ADF", "C85", "B60", "FF9", "AFF", "69C", "695"
+            "ADF", "C85", "B60", "FF9", "AFF", "69C", "695", "FF0", "1B0"
         };
         char claim[128];
         int clen = 0, i;
@@ -786,7 +843,7 @@ claim_filetypes(void)
         if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
                   CLAIM_VAR, claim, (int) sizeof claim - 1, 0, 0,
                   &clen) != NULL || clen <= 0) {
-            strcpy(claim, "ADF,C85,B60,FF9,AFF,69C,695");
+            strcpy(claim, "ADF,C85,B60,FF9,AFF,69C,695,FF0,1B0");
         } else {
             claim[clen] = 0;
         }
@@ -831,7 +888,7 @@ mod_final(int fatal, int podule, void *pw)
        still points at our viewer - never stamp on another app.     */
     {
         static const char *const types[] = {
-            "ADF", "C85", "B60", "FF9", "AFF", "69C", "695"
+            "ADF", "C85", "B60", "FF9", "AFF", "69C", "695", "FF0", "1B0"
         };
         char viewer[200];
         int vlen = 0, i;

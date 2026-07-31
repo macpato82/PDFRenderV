@@ -1,0 +1,32 @@
+/*
+  PDFRender - baseline TIFF decoding.
+
+  Covers what a TIFF actually needs to be readable rather than the
+  whole of TIFF 6, which is a family of formats rather than one: both
+  byte orders, 1/2/4/8/16 bits per sample, greyscale either way round,
+  RGB, palette, strips and tiles, the horizontal-differencing
+  predictor, and the four compressions that matter - none, LZW,
+  Deflate and PackBits.  Those three compressed forms are exactly the
+  filters the PDF side already has, which is why TIFF costs so little
+  here.
+
+  Out: CCITT G3/G4 and JPEG-in-TIFF (which are whole codecs of their
+  own), and floating-point or >16-bit samples.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFTIFF_H
+#define PDFTIFF_H
+
+#include "pdftypes.h"
+
+/* Size of the first image, without decoding the pixels.             */
+int pdftiff_size(const u8 *src, u32 len, int *w, int *h);
+
+/* Decode the first image to a malloc'd XRGB32 buffer.               */
+int pdftiff_decode(const u8 *src, u32 len, int *wp, int *hp, u32 **pixp);
+
+#endif

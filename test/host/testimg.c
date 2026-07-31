@@ -13,6 +13,8 @@
 #include "pdftypes.h"
 #include "pdfbmp.h"
 #include "pdfgif.h"
+#include "pdftiff.h"
+#include "pdfpsd.h"
 
 static u8 *slurp(const char *p, u32 *len)
 {
@@ -44,9 +46,13 @@ int main(int argc, char **argv)
         int w = 0, h = 0, rw = 0, rh = 0, bad = 0, x, y;
         u32 *pix = NULL; u8 *rgb;
         int isgif = strstr(img, ".gif") != NULL;
+        int istif = strstr(img, ".tif") != NULL;
+        int ispsd = strstr(img, ".psd") != NULL;
         int err;
         if (!src) { printf("FAIL %s: unreadable\n", img); fails++; continue; }
-        err = isgif ? pdfgif_decode(src, len, &w, &h, &pix)
+        err = istif ? pdftiff_decode(src, len, &w, &h, &pix)
+            : ispsd ? pdfpsd_decode(src, len, &w, &h, &pix)
+            : isgif ? pdfgif_decode(src, len, &w, &h, &pix)
                     : pdfbmp_decode(src, len, &w, &h, &pix);
         if (err != PDF_OK) { printf("FAIL %s: decode err %d\n", img, err); fails++; free(src); continue; }
         rgb = readppm(ref, &rw, &rh);
