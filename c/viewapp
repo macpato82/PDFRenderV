@@ -1246,7 +1246,8 @@ redraw_outline(int *blk)
     while (more) {
         int ox = blk[1] - blk[5];       /* work-area origin           */
         int oy = blk[4] - blk[6];
-        int y0 = blk[9], y1 = blk[11];  /* the clip rectangle         */
+        /* the clip rectangle: block words 7..10 are its x0,y0,x1,y1 */
+        int y0 = blk[8], y1 = blk[10];
         u32 i;
         int first, last;
 

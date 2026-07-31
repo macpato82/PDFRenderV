@@ -10,6 +10,17 @@ ARMv5 (Iyonix/XScale) through ARMv7 (iMX6/ARMX6, Titanium, Pi) to
 ARMv8 AArch32: the core is integer-only 16.16 fixed point (no FPA, no
 VFP), and the Norcroft build emits no ARMv6+ encodings.
 
+One exception, and it matters on hardware without an FPU: the vendored
+OpenJPEG uses floating point for the irreversible 9/7 wavelet and the
+colour transform, so `rm/PDFRenderV` carries about 1300 FPA
+instructions that are none of our doing. On a machine with no FPU
+every one of them traps into FPEmulator, and a multi-megapixel
+JPEG 2000 image - tens of millions of float operations - stops being
+slow and starts being unusable. A scanned PDF whose pages are 9/7 JPX
+will appear to hang a RiscPC-class machine. Nothing else in the tree
+is affected: PDF, JPEG, PNG, BMP, GIF, Sprite and Draw are all integer
+paths.
+
 Copyright (c) RISC OS Technologies 2026.
 SPDX-License-Identifier: CDDL-1.0
 
