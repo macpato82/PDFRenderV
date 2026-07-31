@@ -42,6 +42,7 @@
 
 #define OPJ_SKIP_POISON
 #include "opj_includes.h"
+#include "opj_fixed.h"
 
 #ifdef __SSE__
 #include <xmmintrin.h>
@@ -3074,6 +3075,27 @@ static void opj_v8dwt_decode_step2_sse(opj_v8_t* l, opj_v8_t* w,
 
 #else
 
+#ifdef OPJ_FIXED_97
+static void opj_v8dwt_decode_step1(opj_v8_t* w,
+                                   OPJ_UINT32 start,
+                                   OPJ_UINT32 end,
+                                   const OPJ_INT32 c)
+{
+    OPJ_INT32* OPJ_RESTRICT fw = (OPJ_INT32*) w;
+    OPJ_UINT32 i;
+    /* To be adapted if NB_ELTS_V8 changes */
+    for (i = start; i < end; ++i) {
+        fw[i * 2 * 8    ] = opj_fp_mul(fw[i * 2 * 8    ], c);
+        fw[i * 2 * 8 + 1] = opj_fp_mul(fw[i * 2 * 8 + 1], c);
+        fw[i * 2 * 8 + 2] = opj_fp_mul(fw[i * 2 * 8 + 2], c);
+        fw[i * 2 * 8 + 3] = opj_fp_mul(fw[i * 2 * 8 + 3], c);
+        fw[i * 2 * 8 + 4] = opj_fp_mul(fw[i * 2 * 8 + 4], c);
+        fw[i * 2 * 8 + 5] = opj_fp_mul(fw[i * 2 * 8 + 5], c);
+        fw[i * 2 * 8 + 6] = opj_fp_mul(fw[i * 2 * 8 + 6], c);
+        fw[i * 2 * 8 + 7] = opj_fp_mul(fw[i * 2 * 8 + 7], c);
+    }
+}
+#else
 static void opj_v8dwt_decode_step1(opj_v8_t* w,
                                    OPJ_UINT32 start,
                                    OPJ_UINT32 end,
@@ -3093,7 +3115,50 @@ static void opj_v8dwt_decode_step1(opj_v8_t* w,
         fw[i * 2 * 8 + 7] = fw[i * 2 * 8 + 7] * c;
     }
 }
+#endif
 
+#ifdef OPJ_FIXED_97
+static void opj_v8dwt_decode_step2(opj_v8_t* l, opj_v8_t* w,
+                                   OPJ_UINT32 start,
+                                   OPJ_UINT32 end,
+                                   OPJ_UINT32 m,
+                                   OPJ_INT32 c)
+{
+    OPJ_INT32* fl = (OPJ_INT32*) l;
+    OPJ_INT32* fw = (OPJ_INT32*) w;
+    OPJ_UINT32 i;
+    OPJ_UINT32 imax = opj_uint_min(end, m);
+    if (start > 0) {
+        fw += 2 * NB_ELTS_V8 * start;
+        fl = fw - 2 * NB_ELTS_V8;
+    }
+    /* To be adapted if NB_ELTS_V8 changes */
+    for (i = start; i < imax; ++i) {
+        fw[-8] = fw[-8] + opj_fp_mul(fl[0] + fw[0], c);
+        fw[-7] = fw[-7] + opj_fp_mul(fl[1] + fw[1], c);
+        fw[-6] = fw[-6] + opj_fp_mul(fl[2] + fw[2], c);
+        fw[-5] = fw[-5] + opj_fp_mul(fl[3] + fw[3], c);
+        fw[-4] = fw[-4] + opj_fp_mul(fl[4] + fw[4], c);
+        fw[-3] = fw[-3] + opj_fp_mul(fl[5] + fw[5], c);
+        fw[-2] = fw[-2] + opj_fp_mul(fl[6] + fw[6], c);
+        fw[-1] = fw[-1] + opj_fp_mul(fl[7] + fw[7], c);
+        fl = fw;
+        fw += 2 * NB_ELTS_V8;
+    }
+    if (m < end) {
+        assert(m + 1 == end);
+        c += c;
+        fw[-8] = fw[-8] + opj_fp_mul(fl[0], c);
+        fw[-7] = fw[-7] + opj_fp_mul(fl[1], c);
+        fw[-6] = fw[-6] + opj_fp_mul(fl[2], c);
+        fw[-5] = fw[-5] + opj_fp_mul(fl[3], c);
+        fw[-4] = fw[-4] + opj_fp_mul(fl[4], c);
+        fw[-3] = fw[-3] + opj_fp_mul(fl[5], c);
+        fw[-2] = fw[-2] + opj_fp_mul(fl[6], c);
+        fw[-1] = fw[-1] + opj_fp_mul(fl[7], c);
+    }
+}
+#else
 static void opj_v8dwt_decode_step2(opj_v8_t* l, opj_v8_t* w,
                                    OPJ_UINT32 start,
                                    OPJ_UINT32 end,
@@ -3134,6 +3199,7 @@ static void opj_v8dwt_decode_step2(opj_v8_t* l, opj_v8_t* w,
         fw[-1] = fw[-1] + fl[7] * c;
     }
 }
+#endif   /* OPJ_FIXED_97 */
 
 #endif
 
@@ -3150,7 +3216,17 @@ static void opj_v8dwt_decode(opj_v8dwt_t* OPJ_RESTRICT dwt)
     /* accepted value */
     /* Due to using two_invK instead of invK, we have to compensate in tcd.c */
     /* the computation of the stepsize for the non LL subbands */
+#ifdef OPJ_FIXED_97
+    /* the same constants, Q16 and folded at compile time            */
+    const OPJ_INT32 fp_K        = OPJ_FP_C(1.230174105);
+    const OPJ_INT32 fp_two_invK = OPJ_FP_C(1.625732422);
+    const OPJ_INT32 fp_m_delta  = OPJ_FP_C(-0.443506852);
+    const OPJ_INT32 fp_m_gamma  = OPJ_FP_C(-0.882911075);
+    const OPJ_INT32 fp_m_beta   = OPJ_FP_C(0.052980118);
+    const OPJ_INT32 fp_m_alpha  = OPJ_FP_C(1.586134342);
+#else
     const float two_invK = 1.625732422f;
+#endif
     if (dwt->cas == 0) {
         if (!((dwt->dn > 0) || (dwt->sn > 1))) {
             return;
@@ -3186,6 +3262,28 @@ static void opj_v8dwt_decode(opj_v8dwt_t* OPJ_RESTRICT dwt)
                                (OPJ_UINT32)opj_int_min(dwt->dn, dwt->sn - b),
                                _mm_set1_ps(-opj_dwt_alpha));
 #else
+#ifdef OPJ_FIXED_97
+    opj_v8dwt_decode_step1(dwt->wavelet + a, dwt->win_l_x0, dwt->win_l_x1,
+                           fp_K);
+    opj_v8dwt_decode_step1(dwt->wavelet + b, dwt->win_h_x0, dwt->win_h_x1,
+                           fp_two_invK);
+    opj_v8dwt_decode_step2(dwt->wavelet + b, dwt->wavelet + a + 1,
+                           dwt->win_l_x0, dwt->win_l_x1,
+                           (OPJ_UINT32)opj_int_min(dwt->sn, dwt->dn - a),
+                           fp_m_delta);
+    opj_v8dwt_decode_step2(dwt->wavelet + a, dwt->wavelet + b + 1,
+                           dwt->win_h_x0, dwt->win_h_x1,
+                           (OPJ_UINT32)opj_int_min(dwt->dn, dwt->sn - b),
+                           fp_m_gamma);
+    opj_v8dwt_decode_step2(dwt->wavelet + b, dwt->wavelet + a + 1,
+                           dwt->win_l_x0, dwt->win_l_x1,
+                           (OPJ_UINT32)opj_int_min(dwt->sn, dwt->dn - a),
+                           fp_m_beta);
+    opj_v8dwt_decode_step2(dwt->wavelet + a, dwt->wavelet + b + 1,
+                           dwt->win_h_x0, dwt->win_h_x1,
+                           (OPJ_UINT32)opj_int_min(dwt->dn, dwt->sn - b),
+                           fp_m_alpha);
+#else
     opj_v8dwt_decode_step1(dwt->wavelet + a, dwt->win_l_x0, dwt->win_l_x1,
                            opj_K);
     opj_v8dwt_decode_step1(dwt->wavelet + b, dwt->win_h_x0, dwt->win_h_x1,
@@ -3206,6 +3304,7 @@ static void opj_v8dwt_decode(opj_v8dwt_t* OPJ_RESTRICT dwt)
                            dwt->win_h_x0, dwt->win_h_x1,
                            (OPJ_UINT32)opj_int_min(dwt->dn, dwt->sn - b),
                            -opj_dwt_alpha);
+#endif
 #endif
 }
 

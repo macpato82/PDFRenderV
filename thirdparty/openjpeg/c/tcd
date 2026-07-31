@@ -40,6 +40,7 @@
  */
 
 #include "opj_includes.h"
+#include "opj_fixed.h"
 #include "opj_common.h"
 
 // #define DEBUG_RATE_ALLOC
@@ -2332,6 +2333,13 @@ static OPJ_BOOL opj_tcd_dc_level_shift_decode(opj_tcd_t *p_tcd)
         } else {
             for (j = 0; j < l_height; ++j) {
                 for (i = 0; i < l_width; ++i) {
+#ifdef OPJ_FIXED_97
+                    /* Q11 fixed point, so rounding is a shift; the
+                       sum is done in 64 bits as it was before.     */
+                    OPJ_INT64 l_value_int = (OPJ_INT64)opj_fp_round(*l_current_ptr);
+                    *l_current_ptr = (OPJ_INT32)opj_int64_clamp(
+                                         l_value_int + l_tccp->m_dc_level_shift, l_min, l_max);
+#else
                     OPJ_FLOAT32 l_value = *((OPJ_FLOAT32 *) l_current_ptr);
                     if (l_value > (OPJ_FLOAT32)INT_MAX) {
                         *l_current_ptr = l_max;
@@ -2343,6 +2351,7 @@ static OPJ_BOOL opj_tcd_dc_level_shift_decode(opj_tcd_t *p_tcd)
                         *l_current_ptr = (OPJ_INT32)opj_int64_clamp(
                                              l_value_int + l_tccp->m_dc_level_shift, l_min, l_max);
                     }
+#endif
                     ++l_current_ptr;
                 }
                 l_current_ptr += l_stride;

@@ -48,6 +48,7 @@
 #endif
 
 #include "opj_includes.h"
+#include "opj_fixed.h"
 
 /* <summary> */
 /* This table contains the norms of the basis function of the reversible MCT. */
@@ -324,6 +325,26 @@ void opj_mct_decode_real(
     }
     n &= 7;
 #endif
+#ifdef OPJ_FIXED_97
+    {
+        OPJ_INT32* OPJ_RESTRICT i0 = (OPJ_INT32*) c0;
+        OPJ_INT32* OPJ_RESTRICT i1 = (OPJ_INT32*) c1;
+        OPJ_INT32* OPJ_RESTRICT i2 = (OPJ_INT32*) c2;
+
+        for (i = 0; i < n; ++i) {
+            OPJ_INT32 y = i0[i];
+            OPJ_INT32 u = i1[i];
+            OPJ_INT32 v = i2[i];
+            OPJ_INT32 r = y + opj_fp_mul(v, OPJ_FP_C(1.402));
+            OPJ_INT32 g = y - opj_fp_mul(u, OPJ_FP_C(0.34413))
+                            - opj_fp_mul(v, OPJ_FP_C(0.71414));
+            OPJ_INT32 b = y + opj_fp_mul(u, OPJ_FP_C(1.772));
+            i0[i] = r;
+            i1[i] = g;
+            i2[i] = b;
+        }
+    }
+#else
     for (i = 0; i < n; ++i) {
         OPJ_FLOAT32 y = c0[i];
         OPJ_FLOAT32 u = c1[i];
@@ -335,6 +356,7 @@ void opj_mct_decode_real(
         c1[i] = g;
         c2[i] = b;
     }
+#endif
 }
 
 /* <summary> */

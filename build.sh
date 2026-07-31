@@ -69,7 +69,8 @@ mkdir -p "$OJ_DIR/o"
 for n in $OJ_SRCS; do
     if [ -s "$OJ_DIR/o/$n" ]; then continue; fi     # cached: rarely changes
     printf '   %s\n' "$n"
-    run "$D/bin/cc,ff8" -c -zps1 -arch 4 -W -Ithirdparty.openjpeg \
+    run "$D/bin/cc,ff8" -c -zps1 -arch 4 -W -DOPJ_FIXED_97 \
+        -Ithirdparty.openjpeg \
         -o "thirdparty.openjpeg.o.$n" "thirdparty.openjpeg.c.$n"
     [ -s "$OJ_DIR/o/$n" ] || { echo "cc produced no object for $n"; exit 1; }
 done

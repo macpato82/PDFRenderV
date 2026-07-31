@@ -10,16 +10,23 @@ ARMv5 (Iyonix/XScale) through ARMv7 (iMX6/ARMX6, Titanium, Pi) to
 ARMv8 AArch32: the core is integer-only 16.16 fixed point (no FPA, no
 VFP), and the Norcroft build emits no ARMv6+ encodings.
 
-One exception, and it matters on hardware without an FPU: the vendored
-OpenJPEG uses floating point for the irreversible 9/7 wavelet and the
-colour transform, so `rm/PDFRenderV` carries about 1300 FPA
-instructions that are none of our doing. On a machine with no FPU
-every one of them traps into FPEmulator, and a multi-megapixel
-JPEG 2000 image - tens of millions of float operations - stops being
-slow and starts being unusable. A scanned PDF whose pages are 9/7 JPX
-will appear to hang a RiscPC-class machine. Nothing else in the tree
-is affected: PDF, JPEG, PNG, BMP, GIF, Sprite and Draw are all integer
-paths.
+That includes JPEG 2000. The vendored OpenJPEG decodes the
+irreversible 9/7 wavelet in floating point, which on a machine with no
+FPU means every operation traps into FPEmulator: a multi-megapixel JPX
+image is tens of millions of traps, and a scanned page simply never
+finished. Building with `-DOPJ_FIXED_97` switches the four places that
+carry the per-coefficient cost - t1's dequantisation, the 9/7 lifting
+in dwt, mct's inverse colour transform, and tcd's rounding back to
+samples - to Q11 fixed point in `OPJ_INT32`, multiplying through
+`OPJ_INT64` so nothing can overflow. See
+`thirdparty/openjpeg/h/opj_fixed`.
+
+Measured: a 1240x1753 JPX page that previously never completed now
+renders in **27 seconds** on the emulated StrongARM, and the emulator
+logs **no floating-point traps at all** during the decode. Against the
+unmodified float build on the host, 0.06% of samples differ on a
+greyscale image and 0.9% on a colour one, every one of them by a single
+level out of 255.
 
 Copyright (c) RISC OS Technologies 2026.
 SPDX-License-Identifier: CDDL-1.0

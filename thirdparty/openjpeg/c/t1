@@ -40,6 +40,7 @@
 
 #define OPJ_SKIP_POISON
 #include "opj_includes.h"
+#include "opj_fixed.h"
 
 #ifdef __SSE__
 #include <xmmintrin.h>
@@ -1813,6 +1814,24 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
             }
         }
     } else {        /* if (tccp->qmfbid == 0) */
+#ifdef OPJ_FIXED_97
+        /* The band stepsize is a float from the codestream header;
+           converting it to Q16 here costs one conversion per code
+           block instead of one multiply per coefficient.           */
+        const OPJ_INT32 stepsize = (OPJ_INT32)(0.5 * (double)band->stepsize
+                                               * 65536.0 + 0.5);
+        OPJ_INT32* OPJ_RESTRICT tiledp = &tilec->data[(OPJ_SIZE_T)y *
+                                                      tile_w + (OPJ_SIZE_T)x];
+        for (j = 0; j < cblk_h; ++j) {
+            OPJ_INT32* OPJ_RESTRICT tiledp2 = tiledp;
+            for (i = 0; i < cblk_w; ++i) {
+                *tiledp2 = opj_fp_from_int(*datap, stepsize);
+                datap++;
+                tiledp2++;
+            }
+            tiledp += tile_w;
+        }
+#else
         const float stepsize = 0.5f * band->stepsize;
         OPJ_FLOAT32* OPJ_RESTRICT tiledp = (OPJ_FLOAT32*) &tilec->data[(OPJ_SIZE_T)y *
                                                          tile_w + (OPJ_SIZE_T)x];
@@ -1826,6 +1845,7 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
             }
             tiledp += tile_w;
         }
+#endif
     }
 
     opj_free(job);

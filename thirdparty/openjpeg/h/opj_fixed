@@ -1,0 +1,69 @@
+/*
+  Fixed-point arithmetic for OpenJPEG's irreversible (9/7) decode path.
+
+  Not part of upstream OpenJPEG.  Added for PDFRenderV because the
+  target has no FPU: on a RiscPC-class machine every floating-point
+  instruction traps into FPEmulator, and the 9/7 inverse wavelet over a
+  multi-megapixel image is tens of millions of them - minutes of
+  trap-and-emulate for one page.
+
+  Defining OPJ_FIXED_97 switches four places from OPJ_FLOAT32 to the
+  Q-format integers below, which between them are the whole
+  per-coefficient cost of an irreversible decode:
+
+      c/t1    dequantisation      coefficient * stepsize
+      c/dwt   opj_v8dwt_decode    the 9/7 lifting steps
+      c/mct   opj_mct_decode_real the inverse colour transform
+      c/tcd   the final rounding back to integer samples
+
+  Everything else keeps its float code, including the whole encoder,
+  which a decoder never calls, and the per-image header arithmetic,
+  which is a handful of operations rather than tens of millions.
+
+  The format is Q11: 11 fractional bits in an OPJ_INT32.  That leaves
+  20 bits of integer range, which covers 16-bit samples and the gain a
+  wavelet coefficient can carry above them, and the multiply is done
+  through OPJ_INT64 so the intermediate cannot overflow whatever the
+  data.  Constants are Q16 and are folded at compile time - the double
+  arithmetic in OPJ_FP_C never reaches the target.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef OPJ_FIXED_H
+#define OPJ_FIXED_H
+
+/* Included after opj_includes.h, which supplies the OPJ_ types.     */
+
+#define OPJ_FP_SHIFT   11
+#define OPJ_FP_ONE     (1 << OPJ_FP_SHIFT)
+
+/* A constant in Q16, rounded to nearest and evaluated by the
+   compiler.  Written as a double expression so the value in the
+   source stays readable next to the specification's.               */
+#define OPJ_FP_CSHIFT  16
+#define OPJ_FP_C(x) \
+    ((OPJ_INT32)((x) * 65536.0 + ((x) >= 0 ? 0.5 : -0.5)))
+
+/* Q11 value times Q16 constant -> Q11 value.                        */
+static OPJ_INT32 opj_fp_mul(OPJ_INT32 a, OPJ_INT32 c)
+{
+    return (OPJ_INT32)(((OPJ_INT64)a * c) >> OPJ_FP_CSHIFT);
+}
+
+/* Integer coefficient times Q16 stepsize -> Q11 value.              */
+static OPJ_INT32 opj_fp_from_int(OPJ_INT32 v, OPJ_INT32 step_c)
+{
+    return (OPJ_INT32)(((OPJ_INT64)v * step_c) >>
+                       (OPJ_FP_CSHIFT - OPJ_FP_SHIFT));
+}
+
+/* Q11 value -> nearest integer.                                     */
+static OPJ_INT32 opj_fp_round(OPJ_INT32 v)
+{
+    return (v + (1 << (OPJ_FP_SHIFT - 1))) >> OPJ_FP_SHIFT;
+}
+
+#endif
