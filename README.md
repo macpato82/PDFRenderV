@@ -13,6 +13,24 @@ VFP), and the Norcroft build emits no ARMv6+ encodings.
 Copyright (c) RISC OS Technologies 2026.
 SPDX-License-Identifier: CDDL-1.0
 
+## Requirements
+
+**SpriteExtend 1.88 recommended.**  Every JPEG - both standalone
+`&C85` files and `DCTDecode` images inside a PDF - is plotted by
+SpriteExtend rather than decoded here, so its version sets the JPEG
+behaviour you get.  1.88 is what PDFRenderV is developed and tested
+against: libjpeg-turbo 3.1.3 in place of IJG 8d, one binary from
+ARMv5TE to ARMv8, and CMYK/YCCK JPEGs carried through the migration
+with the RGB approximation upstream does not provide.
+
+It is not a hard floor - 1.86 and earlier decode CMYK/YCCK as well,
+and PDFRenderV asks `JPEG_Info` before plotting, falling back to its
+own `c/pdfjpg` decoder if the OS refuses a file, so an older or
+stricter SpriteExtend still draws the page.  That fallback is slower
+and is not the tested path.
+
+RISC OS 5.28 or later otherwise; no other modules are needed.
+
 ## Design
 
 ```
@@ -138,18 +156,21 @@ JPEG 2000 (`JPXDecode`) via the vendored OpenJPEG in
 `thirdparty/openjpeg` - needed by scanned PDFs, which are otherwise
 blank pages - decoded at a resolution matched to the display size,
 since JPX is resolution-scalable and a full-size decode of a scan is
-many times more work than the screen can show.  CMYK/YCCK JPEGs go
-through our own `c/pdfjpg`, which SpriteExtend cannot decode.
+many times more work than the screen can show.
 
 Decoded images are cached (LRU, 4MB by default, keyed by stream
 offset and decode size), so revisiting a page costs nothing.
 
-A note on JPEG: ordinary JPEGs are left to SpriteExtend even though
+A note on JPEG: every JPEG is left to SpriteExtend even though
 `c/pdfjpg` can decode them at 1/2, 1/4 or 1/8 scale.  Measured on an
 emulated StrongARM with a 2550x3300 scan, SpriteExtend took ~19s and
 our scaled decode 26-33s: skipping the IDCT does not help when the
 Huffman pass dominates, and the OS decoder does that in hand-written
-ARM.  The numbers, not the theory, decided it. Constant alpha and Multiply are composited for real
+ARM.  The numbers, not the theory, decided it.  `c/pdfjpg` stays as
+the fallback described under Requirements - the backend tries
+`JPEG_Info` first and only decodes in-house if the OS refuses the
+file, so an unsupported variant draws something rather than leaving a
+hole in the page. Constant alpha and Multiply are composited for real
 (the backend owns its sprite and reads it back) on axis-aligned
 rectangles.
 
@@ -158,7 +179,7 @@ metric-equivalent RISC OS fonts instead), /Differences encodings,
 Type3 glyph rendering, shadings/patterns (skipped or grey),
 transparency groups and luminosity soft masks - so a highlight
 annotation drawn as an opaque fill inside a form XObject still covers
-what is under it - CCITT/JBIG2 images, CMYK JPEGs.
+what is under it - CCITT/JBIG2 images.
 
 ## Testing
 
