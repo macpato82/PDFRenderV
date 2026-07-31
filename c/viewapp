@@ -454,6 +454,53 @@ selection_text(u32 *lenp)
     return out;
 }
 
+/* Screen size in OS units.                                          */
+static void
+screen_size(int *w, int *h)
+{
+    *w = (readmodevar(11) + 1) << vw.xeig;      /* XWindLimit         */
+    *h = (readmodevar(12) + 1) << vw.yeig;      /* YWindLimit         */
+}
+
+/* Choose the opening zoom: show the whole thing if it fits, and
+   shrink to fit the screen when it does not.  A 4000-pixel scan
+   should open readable, not 4000 pixels wide with scrollbars.       */
+static void
+fit_zoom(void)
+{
+    int wmpt = 0, hmpt = 0, rot = 0, sw, sh, i;
+    s64 pxw, pxh;
+
+    if (_swix(PDFRenderV_PageSize, _INR(0, 1) | _OUTR(0, 2),
+              vw.handle, vw.page + 1, &wmpt, &hmpt, &rot) != NULL) {
+        return;
+    }
+    if (rot == 90 || rot == 270) {
+        int t = wmpt;
+        wmpt = hmpt;
+        hmpt = t;
+    }
+    screen_size(&sw, &sh);
+    /* leave room for window furniture and the icon bar               */
+    sw -= 80;
+    sh -= 200 + TOOLH;
+    if (sw < 200 || sh < 200 || wmpt <= 0 || hmpt <= 0) {
+        return;
+    }
+    for (i = NZOOM - 1; i > 0; i--) {
+        pxw = ((s64) wmpt * zoomsteps[i]) / 80000;
+        pxh = ((s64) hmpt * zoomsteps[i]) / 80000;
+        if ((pxw << vw.xeig) <= sw && (pxh << vw.yeig) <= sh) {
+            break;
+        }
+    }
+    /* never open above 100%: a small image should not be blown up    */
+    while (i > 0 && zoomsteps[i] > 100) {
+        i--;
+    }
+    vw.zoom = zoomsteps[i];
+}
+
 /* --- window management ---------------------------------------------- */
 
 static void
@@ -478,14 +525,13 @@ set_extent(void)
 {
     int ext[4];
 
-    /* the top TOOLH of the work area sits under the toolbar pane     */
     ext[0] = 0;
     ext[1] = -(vw.sprh << vw.yeig);
     ext[2] = vw.sprw << vw.xeig;
-    ext[3] = TOOLH;
+    ext[3] = 0;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
-          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, TOOLH);
+          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
 }
 
 /* icon block helper: bbox + flags + 12 bytes of data                 */
@@ -516,10 +562,33 @@ create_windows(void)
 
     /* --- main document window --- */
     memset(blk, 0, sizeof blk);
-    blk[0] = 200;                       /* visible area               */
-    blk[1] = 200;
-    blk[2] = 200 + 800;
-    blk[3] = 200 + 700;
+    {
+        /* open the window at the size of the content (plus the
+           toolbar), clamped to what the screen can show             */
+        int sw, sh, ww, wh, x0, y1;
+
+        screen_size(&sw, &sh);
+        ww = vw.sprw << vw.xeig;
+        wh = (vw.sprh << vw.yeig) + TOOLH;
+        if (ww > sw - 80) {
+            ww = sw - 80;
+        }
+        if (wh > sh - 160) {
+            wh = sh - 160;
+        }
+        if (ww < 320) {
+            ww = 320;
+        }
+        if (wh < 200) {
+            wh = 200;
+        }
+        x0 = (sw - ww) / 2;
+        y1 = sh - 100;
+        blk[0] = x0;                    /* visible area               */
+        blk[1] = y1 - wh;
+        blk[2] = x0 + ww;
+        blk[3] = y1;
+    }
     blk[6] = -1;                        /* open at top                */
     /* moveable; new-style control icons: back/close/title/toggle/
        vscroll/adjust/hscroll                                         */
@@ -532,11 +601,11 @@ create_windows(void)
     ((u8 *) &blk[9])[1] = 1;            /* scroll inner               */
     ((u8 *) &blk[9])[2] = 12;           /* highlight                  */
     blk[4] = 0;                         /* scroll x                   */
-    blk[5] = TOOLH;                     /* scroll y: extent top up    */
+    blk[5] = 0;                         /* scroll y                   */
     blk[10] = 0;                        /* work area extent           */
     blk[11] = -(vw.sprh << vw.yeig);
     blk[12] = vw.sprw << vw.xeig;
-    blk[13] = TOOLH;                    /* top strip under the pane   */
+    blk[13] = 0;
     blk[14] = 0x00000109;               /* title: text+indirected+ctr */
     /* work-area button type 10 (click/drag): without this the Wimp
        never reports clicks in the page and text cannot be selected  */
@@ -612,9 +681,9 @@ open_with_pane(int *open)
 {
     int pblk[8];
 
-    /* The pane overlays the top TOOLH strip of the main window's
-       visible area (the work-area extent reserves that strip), so
-       the title bar stays above and unobscured.                      */
+    /* Standard pane technique: the toolbar takes the top TOOLH of
+       the window's outline and the document's visible area starts
+       below it, so no strip of empty work area is ever exposed.     */
     pblk[0] = vw.pane;
     pblk[1] = open[1];
     pblk[2] = open[4] - TOOLH;
@@ -624,7 +693,8 @@ open_with_pane(int *open)
     pblk[6] = 0;
     pblk[7] = open[7];                  /* behind                     */
     _swix(XWimp_OpenWindow, _IN(1), pblk);
-    open[7] = vw.pane;                  /* main directly below pane   */
+    open[4] -= TOOLH;                   /* document sits below it     */
+    open[7] = vw.pane;
     _swix(XWimp_OpenWindow, _IN(1), open);
 }
 
@@ -682,7 +752,7 @@ static void
 redraw_doc(void)
 {
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
-          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, TOOLH);
+          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
 }
 
 static void
@@ -1234,6 +1304,7 @@ main(int argc, char **argv)
     vw.xeig = readmodevar(4);
     vw.yeig = readmodevar(5);
     sprintf(vw.titletxt, "%.290s", vw.filename);
+    fit_zoom();
 
     if (render_page() != 0) {
         report("Could not render the first page");
