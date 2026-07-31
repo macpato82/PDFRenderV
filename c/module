@@ -422,8 +422,12 @@ plot_sprite(DocSlot *ds, int dx, int dy, int dw, int dh)
     scale[1] = (u32) dh;
     scale[2] = (u32) ds->w;
     scale[3] = (u32) ds->h;
+    /* Plot action 8: overwrite, *using the mask* (PRM, Sprites: bit 3
+       of the plot action).  Without it a masked sprite is drawn
+       including whatever lies under its mask, which is usually black,
+       so a transparent logo arrived on a black rectangle.          */
     e = _swix(XOS_SpriteOp, _INR(0, 7),
-              52 + 512, area, area + first, dx, dy, 0, scale, 0);
+              52 + 512, area, area + first, dx, dy, 8, scale, 0);
     free(area);
     return e;
 }

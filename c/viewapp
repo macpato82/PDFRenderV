@@ -880,12 +880,52 @@ redraw_doc(void)
           0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
 }
 
+/* Resize the window to the page just rendered, keeping its top-left
+   corner where the user put it.  Pages within one PDF are not all the
+   same size - a landscape plate in a portrait document is common - and
+   zooming changes the size too, so the window follows the page rather
+   than leaving it adrift in a window of the wrong shape.  The screen
+   is the limit; past that the scroll bars do their job.             */
+static void
+size_to_page(void)
+{
+    int st[16], sw, sh, ww, wh;
+
+    st[0] = vw.win;
+    if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
+        return;
+    }
+    if ((st[8] & (1 << 16)) == 0) {
+        return;                         /* not open: nothing to size  */
+    }
+    screen_size(&sw, &sh);
+    ww = vw.sprw << vw.xeig;
+    wh = vw.sprh << vw.yeig;
+    if (ww > sw - 80) {
+        ww = sw - 80;
+    }
+    if (wh > sh - 260) {
+        wh = sh - 260;
+    }
+    if (ww < TOOLW + 200) {
+        ww = TOOLW + 200;               /* room for the toolbar       */
+    }
+    if (wh < 200) {
+        wh = 200;
+    }
+    st[3] = st[1] + ww;                 /* x1: grow/shrink rightwards */
+    st[2] = st[4] - wh;                 /* y0: and downwards          */
+    st[7] = -1;                         /* keep it in front           */
+    open_with_pane(st);
+}
+
 static void
 rerender(void)
 {
     render_page();
     update_toolbar_texts();
     set_extent();
+    size_to_page();
 }
 
 /* --- printing ------------------------------------------------------- */

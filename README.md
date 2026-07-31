@@ -96,7 +96,11 @@ between "the module is loaded" and "PDFs just open".
 
 Double-clicking any supported file opens it: window + toolbar
 `[<] [n/N] [>]  [-] [zoom%] [+]  [Print]`, scrollable page, zoom
-25-400%, vector printing through PDriver.  On a PDF the Menu button
+25-400%, vector printing through PDriver.  The window resizes to the
+page on every page turn and zoom step, keeping its top-left corner
+where you put it - pages within one PDF are not all the same size, and
+a landscape plate in a portrait document should not be left adrift in a
+window of the wrong shape.  On a PDF the Menu button
 over the page also offers Copy / Select all / Save text, with
 click-drag text selection.
 
