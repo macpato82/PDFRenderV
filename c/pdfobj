@@ -1,0 +1,779 @@
+/*
+  PDFRender - object model, arena pool and lexer.
+
+  The lexer is deliberately tolerant: real-world PDFs contain 19-byte
+  xref lines, CR-only line ends, junk between objects and numbers
+  like "4." or "-.5".  Anything we cannot make sense of is a clean
+  error, never a crash - the module will meet hostile files.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+
+/* --- pool ----------------------------------------------------------- */
+
+#define POOL_BLOCK 65536
+
+typedef struct PoolBlk {
+    struct PoolBlk *next;
+    u32 used, size;
+    /* data follows */
+} PoolBlk;
+
+struct PdfPool {
+    PoolBlk *head;
+};
+
+PdfPool *
+pdfpool_new(void)
+{
+    PdfPool *p = calloc(1, sizeof *p);
+    return p;
+}
+
+void *
+pdfpool_alloc(PdfPool *p, u32 size)
+{
+    PoolBlk *b = p->head;
+    void *r;
+
+    size = (size + 7u) & ~7u;   /* 8-aligned: hosts hold 64-bit ptrs */
+    if (size > 0x4000000u) {
+        return NULL;                    /* 64MB single-object cap */
+    }
+    if (b == NULL || b->used + size > b->size) {
+        u32 bsz = size > POOL_BLOCK - sizeof(PoolBlk)
+                  ? size + sizeof(PoolBlk) : POOL_BLOCK;
+        b = malloc(bsz);
+        if (b == NULL) {
+            return NULL;
+        }
+        b->next = p->head;
+        b->used = sizeof(PoolBlk);
+        b->size = bsz;
+        p->head = b;
+    }
+    r = (u8 *) b + b->used;
+    b->used += size;
+    return r;
+}
+
+void
+pdfpool_free(PdfPool *p)
+{
+    PoolBlk *b, *n;
+
+    if (p == NULL) {
+        return;
+    }
+    for (b = p->head; b; b = n) {
+        n = b->next;
+        free(b);
+    }
+    free(p);
+}
+
+/* --- object helpers ------------------------------------------------- */
+
+PdfObj *
+pdfobj_new(PdfPool *p, int type)
+{
+    PdfObj *o = pdfpool_alloc(p, sizeof *o);
+    if (o) {
+        memset(o, 0, sizeof *o);
+        o->type = (u8) type;
+    }
+    return o;
+}
+
+PdfObj *
+pdfobj_int(PdfPool *p, s32 v)
+{
+    PdfObj *o = pdfobj_new(p, PDF_INT);
+    if (o) {
+        o->u.i = v;
+    }
+    return o;
+}
+
+PdfObj *
+pdfobj_name(PdfPool *p, const char *name)
+{
+    PdfObj *o = pdfobj_new(p, PDF_NAME);
+    u32 n = (u32) strlen(name);
+    if (o) {
+        o->u.str.p = pdfpool_alloc(p, n + 1);
+        if (o->u.str.p == NULL) {
+            return NULL;
+        }
+        memcpy(o->u.str.p, name, n + 1);
+        o->u.str.len = n;
+    }
+    return o;
+}
+
+fix
+pdfobj_fix(PdfObj *o)
+{
+    if (o == NULL) {
+        return 0;
+    }
+    if (o->type == PDF_REAL) {
+        return o->u.f;
+    }
+    if (o->type == PDF_INT) {
+        s32 v = o->u.i;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        return FX_FROMINT(v);
+    }
+    return 0;
+}
+
+s32
+pdfobj_int_of(PdfObj *o)
+{
+    if (o == NULL) {
+        return 0;
+    }
+    if (o->type == PDF_INT) {
+        return o->u.i;
+    }
+    if (o->type == PDF_REAL) {
+        return FX_TOINT(o->u.f);
+    }
+    return 0;
+}
+
+PdfObj *
+pdf_dictget(PdfObj *d, const char *key)
+{
+    u32 i;
+
+    if (d == NULL) {
+        return NULL;
+    }
+    if (d->type == PDF_STREAM) {
+        d = d->u.stm.dict;
+        if (d == NULL) {
+            return NULL;
+        }
+    }
+    if (d->type != PDF_DICT) {
+        return NULL;
+    }
+    for (i = 0; i < d->u.dict.n; i++) {
+        if (strcmp(d->u.dict.e[i].key, key) == 0) {
+            return d->u.dict.e[i].val;
+        }
+    }
+    return NULL;
+}
+
+int
+pdf_dictput(PdfPool *p, PdfObj *d, const char *key, PdfObj *val)
+{
+    u32 i, n;
+
+    if (d->type == PDF_STREAM) {
+        d = d->u.stm.dict;
+    }
+    if (d == NULL || d->type != PDF_DICT) {
+        return PDF_E_SYNTAX;
+    }
+    for (i = 0; i < d->u.dict.n; i++) {
+        if (strcmp(d->u.dict.e[i].key, key) == 0) {
+            d->u.dict.e[i].val = val;
+            return PDF_OK;
+        }
+    }
+    if (d->u.dict.n >= d->u.dict.cap) {
+        u32 ncap = d->u.dict.cap ? (u32) d->u.dict.cap * 2 : 8;
+        PdfDictEnt *ne;
+        if (ncap > 0xffff) {
+            return PDF_E_LIMIT;
+        }
+        ne = pdfpool_alloc(p, ncap * sizeof *ne);
+        if (ne == NULL) {
+            return PDF_E_NOMEM;
+        }
+        memcpy(ne, d->u.dict.e, d->u.dict.n * sizeof *ne);
+        d->u.dict.e = ne;
+        d->u.dict.cap = (u16) ncap;
+    }
+    n = (u32) strlen(key);
+    d->u.dict.e[d->u.dict.n].key = pdfpool_alloc(p, n + 1);
+    if (d->u.dict.e[d->u.dict.n].key == NULL) {
+        return PDF_E_NOMEM;
+    }
+    memcpy(d->u.dict.e[d->u.dict.n].key, key, n + 1);
+    d->u.dict.e[d->u.dict.n].val = val;
+    d->u.dict.n++;
+    return PDF_OK;
+}
+
+PdfObj *
+pdf_arrget(PdfObj *a, u32 i)
+{
+    if (a == NULL || a->type != PDF_ARRAY || i >= a->u.arr.n) {
+        return NULL;
+    }
+    return a->u.arr.v[i];
+}
+
+u32
+pdf_arrlen(PdfObj *a)
+{
+    return (a && a->type == PDF_ARRAY) ? a->u.arr.n : 0;
+}
+
+int
+pdf_arrpush(PdfPool *p, PdfObj *a, PdfObj *val)
+{
+    if (a->u.arr.n >= a->u.arr.cap) {
+        u32 ncap = a->u.arr.cap ? (u32) a->u.arr.cap * 2 : 8;
+        PdfObj **nv;
+        if (ncap > 0xffff) {
+            return PDF_E_LIMIT;
+        }
+        nv = pdfpool_alloc(p, ncap * sizeof *nv);
+        if (nv == NULL) {
+            return PDF_E_NOMEM;
+        }
+        memcpy(nv, a->u.arr.v, a->u.arr.n * sizeof *nv);
+        a->u.arr.v = nv;
+        a->u.arr.cap = (u16) ncap;
+    }
+    a->u.arr.v[a->u.arr.n++] = val;
+    return PDF_OK;
+}
+
+int
+pdf_isname(PdfObj *o, const char *name)
+{
+    return o && o->type == PDF_NAME &&
+           strcmp((const char *) o->u.str.p, name) == 0;
+}
+
+/* --- lexer ---------------------------------------------------------- */
+
+void
+pdflex_init(PdfLex *lx, const u8 *buf, u32 len, PdfPool *pool)
+{
+    lx->buf = buf;
+    lx->len = len;
+    lx->pos = 0;
+    lx->pool = pool;
+}
+
+static int
+is_ws(u8 c)
+{
+    return c == 0 || c == 9 || c == 10 || c == 12 || c == 13 || c == 32;
+}
+
+static int
+is_delim(u8 c)
+{
+    return c == '(' || c == ')' || c == '<' || c == '>' ||
+           c == '[' || c == ']' || c == '{' || c == '}' ||
+           c == '/' || c == '%';
+}
+
+void
+pdflex_skipws(PdfLex *lx)
+{
+    while (lx->pos < lx->len) {
+        u8 c = lx->buf[lx->pos];
+        if (is_ws(c)) {
+            lx->pos++;
+        } else if (c == '%') {
+            while (lx->pos < lx->len && lx->buf[lx->pos] != 10 &&
+                   lx->buf[lx->pos] != 13) {
+                lx->pos++;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+int
+pdflex_uint(PdfLex *lx, u32 *out)
+{
+    u32 save = lx->pos;
+    u64 v = 0;
+    int any = 0;
+
+    pdflex_skipws(lx);
+    while (lx->pos < lx->len) {
+        u8 c = lx->buf[lx->pos];
+        if (c < '0' || c > '9') {
+            break;
+        }
+        v = v * 10 + (c - '0');
+        if (v > 0xffffffffu) {
+            v = 0xffffffffu;
+        }
+        any = 1;
+        lx->pos++;
+    }
+    if (!any || (lx->pos < lx->len && !is_ws(lx->buf[lx->pos]) &&
+                 !is_delim(lx->buf[lx->pos]))) {
+        lx->pos = save;
+        return -1;
+    }
+    *out = (u32) v;
+    return 0;
+}
+
+int
+pdflex_kw(PdfLex *lx, char kw[PDF_KWMAX])
+{
+    u32 save = lx->pos;
+    int n = 0;
+
+    pdflex_skipws(lx);
+    while (lx->pos < lx->len) {
+        u8 c = lx->buf[lx->pos];
+        if (is_ws(c) || is_delim(c) || (c >= '0' && c <= '9' && n == 0)) {
+            break;
+        }
+        if (c >= '0' && c <= '9') {
+            break;                      /* keywords are alpha + few marks */
+        }
+        if (n >= PDF_KWMAX - 1) {
+            lx->pos = save;
+            return -1;
+        }
+        kw[n++] = (char) c;
+        lx->pos++;
+    }
+    if (n == 0) {
+        lx->pos = save;
+        return -1;
+    }
+    kw[n] = 0;
+    return 0;
+}
+
+/* number: [+-] digits [. digits]  |  [+-] . digits                   */
+static int
+lex_number(PdfLex *lx, PdfObj **out)
+{
+    int neg = 0, isreal = 0;
+    s64 ip = 0;
+    u32 fp = 0, fdiv = 1;
+    PdfObj *o;
+
+    if (lx->pos < lx->len &&
+        (lx->buf[lx->pos] == '+' || lx->buf[lx->pos] == '-')) {
+        neg = lx->buf[lx->pos] == '-';
+        lx->pos++;
+    }
+    while (lx->pos < lx->len && lx->buf[lx->pos] >= '0' &&
+           lx->buf[lx->pos] <= '9') {
+        ip = ip * 10 + (lx->buf[lx->pos] - '0');
+        if (ip > 0x7fffffffLL) {
+            ip = 0x7fffffffLL;
+        }
+        lx->pos++;
+    }
+    if (lx->pos < lx->len && lx->buf[lx->pos] == '.') {
+        isreal = 1;
+        lx->pos++;
+        while (lx->pos < lx->len && lx->buf[lx->pos] >= '0' &&
+               lx->buf[lx->pos] <= '9') {
+            if (fdiv < 100000000u) {    /* 8 fractional digits kept */
+                fp = fp * 10 + (lx->buf[lx->pos] - '0');
+                fdiv *= 10;
+            }
+            lx->pos++;
+        }
+    }
+    o = pdfobj_new(lx->pool, isreal ? PDF_REAL : PDF_INT);
+    if (o == NULL) {
+        return PDF_E_NOMEM;
+    }
+    if (isreal) {
+        s64 v;
+        if (ip > 32767) {
+            ip = 32767;                 /* clamp to fix range */
+        }
+        v = (ip << 16) + ((s64) fp << 16) / fdiv;
+        o->u.f = neg ? (fix) -v : (fix) v;
+    } else {
+        o->u.i = neg ? (s32) -ip : (s32) ip;
+    }
+    *out = o;
+    return PDF_OK;
+}
+
+static int
+lex_name(PdfLex *lx, PdfObj **out)
+{
+    u8 tmp[128];
+    u32 n = 0;
+    PdfObj *o;
+
+    lx->pos++;                          /* skip '/' */
+    while (lx->pos < lx->len) {
+        u8 c = lx->buf[lx->pos];
+        if (is_ws(c) || is_delim(c)) {
+            break;
+        }
+        if (c == '#' && lx->pos + 2 < lx->len) {
+            int hi, lo;
+            u8 a = lx->buf[lx->pos + 1] | 0x20;
+            u8 b = lx->buf[lx->pos + 2] | 0x20;
+            hi = (a >= '0' && a <= '9') ? a - '0'
+               : (a >= 'a' && a <= 'f') ? a - 'a' + 10 : -1;
+            lo = (b >= '0' && b <= '9') ? b - '0'
+               : (b >= 'a' && b <= 'f') ? b - 'a' + 10 : -1;
+            if (hi >= 0 && lo >= 0) {
+                c = (u8) ((hi << 4) | lo);
+                lx->pos += 2;
+            }
+        }
+        if (n < sizeof tmp - 1) {
+            tmp[n++] = c;
+        }
+        lx->pos++;
+    }
+    o = pdfobj_new(lx->pool, PDF_NAME);
+    if (o == NULL) {
+        return PDF_E_NOMEM;
+    }
+    o->u.str.p = pdfpool_alloc(lx->pool, n + 1);
+    if (o->u.str.p == NULL) {
+        return PDF_E_NOMEM;
+    }
+    memcpy(o->u.str.p, tmp, n);
+    o->u.str.p[n] = 0;
+    o->u.str.len = n;
+    *out = o;
+    return PDF_OK;
+}
+
+static int
+lex_string(PdfLex *lx, PdfObj **out)
+{
+    /* ( ... ) with balanced parens and backslash escapes.  Two-pass:
+       measure, then copy into the pool.                              */
+    u32 start, n = 0, depth = 1;
+    int pass;
+    u8 *dst = NULL;
+    PdfObj *o;
+
+    lx->pos++;                          /* skip '(' */
+    start = lx->pos;
+    for (pass = 0; pass < 2; pass++) {
+        u32 p = start;
+        depth = 1;
+        n = 0;
+        while (p < lx->len && depth > 0) {
+            u8 c = lx->buf[p++];
+            if (c == '\\' && p < lx->len) {
+                u8 e = lx->buf[p++];
+                switch (e) {
+                case 'n': c = 10; break;
+                case 'r': c = 13; break;
+                case 't': c = 9;  break;
+                case 'b': c = 8;  break;
+                case 'f': c = 12; break;
+                case 10:            continue;   /* line continuation */
+                case 13:
+                    if (p < lx->len && lx->buf[p] == 10) {
+                        p++;
+                    }
+                    continue;
+                default:
+                    if (e >= '0' && e <= '7') {
+                        u32 v = e - '0';
+                        int k;
+                        for (k = 0; k < 2 && p < lx->len &&
+                             lx->buf[p] >= '0' && lx->buf[p] <= '7'; k++) {
+                            v = (v << 3) | (lx->buf[p++] - '0');
+                        }
+                        c = (u8) v;
+                    } else {
+                        c = e;          /* \( \) \\ and unknown */
+                    }
+                    break;
+                }
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                if (--depth == 0) {
+                    break;
+                }
+            }
+            if (pass) {
+                dst[n] = c;
+            }
+            n++;
+        }
+        if (pass == 0) {
+            dst = pdfpool_alloc(lx->pool, n + 1);
+            if (dst == NULL) {
+                return PDF_E_NOMEM;
+            }
+        } else {
+            lx->pos = p;
+        }
+    }
+    dst[n] = 0;
+    o = pdfobj_new(lx->pool, PDF_STRING);
+    if (o == NULL) {
+        return PDF_E_NOMEM;
+    }
+    o->u.str.p = dst;
+    o->u.str.len = n;
+    *out = o;
+    return PDF_OK;
+}
+
+static int
+lex_hexstring(PdfLex *lx, PdfObj **out)
+{
+    u32 start = lx->pos, n = 0;
+    int hi = -1;
+    u8 *dst;
+    PdfObj *o;
+
+    while (lx->pos < lx->len && lx->buf[lx->pos] != '>') {
+        lx->pos++;
+    }
+    dst = pdfpool_alloc(lx->pool, (lx->pos - start) / 2 + 2);
+    if (dst == NULL) {
+        return PDF_E_NOMEM;
+    }
+    {
+        u32 p;
+        for (p = start; p < lx->pos; p++) {
+            u8 c = lx->buf[p];
+            int v;
+            if (is_ws(c)) {
+                continue;
+            }
+            if (c >= '0' && c <= '9') {
+                v = c - '0';
+            } else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') {
+                v = (c | 0x20) - 'a' + 10;
+            } else {
+                continue;               /* be tolerant */
+            }
+            if (hi < 0) {
+                hi = v;
+            } else {
+                dst[n++] = (u8) ((hi << 4) | v);
+                hi = -1;
+            }
+        }
+    }
+    if (hi >= 0) {
+        dst[n++] = (u8) (hi << 4);
+    }
+    if (lx->pos < lx->len) {
+        lx->pos++;                      /* skip '>' */
+    }
+    o = pdfobj_new(lx->pool, PDF_STRING);
+    if (o == NULL) {
+        return PDF_E_NOMEM;
+    }
+    o->u.str.p = dst;
+    o->u.str.len = n;
+    *out = o;
+    return PDF_OK;
+}
+
+int
+pdf_parseany(PdfLex *lx, PdfObj **out, char kw[PDF_KWMAX], int depth)
+{
+    u8 c;
+    PdfObj *o;
+    int err;
+
+    *out = NULL;
+    kw[0] = 0;
+    if (depth > PDF_MAXDEPTH) {
+        return PDF_E_LIMIT;
+    }
+    pdflex_skipws(lx);
+    if (lx->pos >= lx->len) {
+        return PDF_TOK_EOF;
+    }
+    c = lx->buf[lx->pos];
+
+    if ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
+        err = lex_number(lx, &o);
+        if (err) {
+            return err;
+        }
+        /* "<uint> <uint> R" is an indirect reference */
+        if (o->type == PDF_INT && o->u.i >= 0) {
+            u32 save = lx->pos, gen;
+            if (pdflex_uint(lx, &gen) == 0) {
+                char kw2[PDF_KWMAX];
+                u32 save2 = lx->pos;
+                if (pdflex_kw(lx, kw2) == 0 && strcmp(kw2, "R") == 0) {
+                    PdfObj *r = pdfobj_new(lx->pool, PDF_REF);
+                    if (r == NULL) {
+                        return PDF_E_NOMEM;
+                    }
+                    r->u.ref.num = (u32) o->u.i;
+                    r->u.ref.gen = (u16) gen;
+                    *out = r;
+                    return PDF_TOK_OBJ;
+                }
+                lx->pos = save2;
+                lx->pos = save;
+            }
+        }
+        *out = o;
+        return PDF_TOK_OBJ;
+    }
+    if (c == '/') {
+        err = lex_name(lx, &o);
+        if (err) {
+            return err;
+        }
+        *out = o;
+        return PDF_TOK_OBJ;
+    }
+    if (c == '(') {
+        err = lex_string(lx, &o);
+        if (err) {
+            return err;
+        }
+        *out = o;
+        return PDF_TOK_OBJ;
+    }
+    if (c == '<') {
+        if (lx->pos + 1 < lx->len && lx->buf[lx->pos + 1] == '<') {
+            /* dictionary */
+            PdfObj *d = pdfobj_new(lx->pool, PDF_DICT);
+            if (d == NULL) {
+                return PDF_E_NOMEM;
+            }
+            lx->pos += 2;
+            for (;;) {
+                PdfObj *key, *val;
+                pdflex_skipws(lx);
+                if (lx->pos + 1 < lx->len && lx->buf[lx->pos] == '>' &&
+                    lx->buf[lx->pos + 1] == '>') {
+                    lx->pos += 2;
+                    break;
+                }
+                if (lx->pos >= lx->len) {
+                    return PDF_E_SYNTAX;
+                }
+                if (lx->buf[lx->pos] != '/') {
+                    return PDF_E_SYNTAX;
+                }
+                err = lex_name(lx, &key);
+                if (err) {
+                    return err;
+                }
+                err = pdf_parseobj(lx, &val, depth + 1);
+                if (err) {
+                    return err;
+                }
+                err = pdf_dictput(lx->pool, d, (const char *) key->u.str.p,
+                                  val);
+                if (err) {
+                    return err;
+                }
+            }
+            *out = d;
+            return PDF_TOK_OBJ;
+        }
+        lx->pos++;
+        err = lex_hexstring(lx, &o);
+        if (err) {
+            return err;
+        }
+        *out = o;
+        return PDF_TOK_OBJ;
+    }
+    if (c == '[') {
+        PdfObj *a = pdfobj_new(lx->pool, PDF_ARRAY);
+        if (a == NULL) {
+            return PDF_E_NOMEM;
+        }
+        lx->pos++;
+        for (;;) {
+            PdfObj *el;
+            pdflex_skipws(lx);
+            if (lx->pos < lx->len && lx->buf[lx->pos] == ']') {
+                lx->pos++;
+                break;
+            }
+            if (lx->pos >= lx->len) {
+                return PDF_E_SYNTAX;
+            }
+            err = pdf_parseobj(lx, &el, depth + 1);
+            if (err) {
+                return err;
+            }
+            err = pdf_arrpush(lx->pool, a, el);
+            if (err) {
+                return err;
+            }
+        }
+        *out = a;
+        return PDF_TOK_OBJ;
+    }
+    if (c == ']' || c == '>' || c == ')' || c == '{' || c == '}') {
+        lx->pos++;                      /* stray delimiter: skip it */
+        return PDF_E_SYNTAX;
+    }
+
+    /* keyword */
+    if (pdflex_kw(lx, kw) != 0) {
+        lx->pos++;                      /* unlexable byte: step over */
+        return PDF_E_SYNTAX;
+    }
+    if (strcmp(kw, "true") == 0 || strcmp(kw, "false") == 0) {
+        o = pdfobj_new(lx->pool, PDF_BOOL);
+        if (o == NULL) {
+            return PDF_E_NOMEM;
+        }
+        o->u.i = kw[0] == 't';
+        *out = o;
+        kw[0] = 0;
+        return PDF_TOK_OBJ;
+    }
+    if (strcmp(kw, "null") == 0) {
+        o = pdfobj_new(lx->pool, PDF_NULL);
+        if (o == NULL) {
+            return PDF_E_NOMEM;
+        }
+        *out = o;
+        kw[0] = 0;
+        return PDF_TOK_OBJ;
+    }
+    return PDF_TOK_KW;
+}
+
+int
+pdf_parseobj(PdfLex *lx, PdfObj **out, int depth)
+{
+    char kw[PDF_KWMAX];
+    int t = pdf_parseany(lx, out, kw, depth);
+
+    if (t == PDF_TOK_OBJ) {
+        return PDF_OK;
+    }
+    if (t < 0) {
+        return t;
+    }
+    return PDF_E_SYNTAX;                /* EOF or stray keyword */
+}

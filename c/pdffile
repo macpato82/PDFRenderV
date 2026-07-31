@@ -1,0 +1,848 @@
+/*
+  PDFRender - document layer implementation.
+
+  Robustness rules: offsets are never trusted (every span is bounds-
+  checked), /Length is verified against the actual endstream keyword
+  with a rescue scan when wrong, xref chains are depth-limited, and
+  object loading carries a re-entrancy mark so reference cycles
+  cannot recurse to death on the SVC stack.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdfflt.h"
+#include "pdffile.h"
+
+#define MAX_OBJS     (1u << 20)
+#define MAX_PAGES    50000u
+#define MAX_XSECTS   64
+#define MAX_PAGEDEPTH 64
+
+/* find needle in hay (memmem is not in C90) */
+static const u8 *
+find_bytes(const u8 *hay, u32 haylen, const char *needle)
+{
+    u32 nlen = (u32) strlen(needle), i;
+
+    if (haylen < nlen) {
+        return NULL;
+    }
+    for (i = 0; i + nlen <= haylen; i++) {
+        if (hay[i] == (u8) needle[0] &&
+            memcmp(hay + i, needle, nlen) == 0) {
+            return hay + i;
+        }
+    }
+    return NULL;
+}
+
+static int
+ensure_objs(PdfDoc *d, u32 n)
+{
+    u32 ncap, i;
+    PdfXEnt *nx;
+    PdfObj **nc;
+    u8 *ns;
+
+    if (n <= d->nobjs) {
+        return PDF_OK;
+    }
+    if (n > MAX_OBJS) {
+        return PDF_E_LIMIT;
+    }
+    ncap = n + 64;
+    nx = realloc(d->xref, ncap * sizeof *nx);
+    if (nx == NULL) {
+        return PDF_E_NOMEM;
+    }
+    d->xref = nx;
+    nc = realloc(d->cache, ncap * sizeof *nc);
+    if (nc == NULL) {
+        return PDF_E_NOMEM;
+    }
+    d->cache = nc;
+    ns = realloc(d->state, ncap);
+    if (ns == NULL) {
+        return PDF_E_NOMEM;
+    }
+    d->state = ns;
+    for (i = d->nobjs; i < ncap; i++) {
+        d->xref[i].type = 0;
+        d->xref[i].a = d->xref[i].b = 0;
+        d->cache[i] = NULL;
+        d->state[i] = 0;
+    }
+    d->nobjs = ncap;
+    return PDF_OK;
+}
+
+static void
+xset(PdfDoc *d, u32 num, u8 type, u32 a, u32 b)
+{
+    if (num >= d->nobjs || d->xref[num].type != 0) {
+        return;                         /* first seen wins */
+    }
+    d->xref[num].type = type;
+    d->xref[num].a = a;
+    d->xref[num].b = b;
+}
+
+/* --- stream span / decode ------------------------------------------- */
+
+/* Fix up u.stm.len so [off, off+len) is inside the file and really is
+   followed by "endstream" (allowing an EOL).  Rescue-scans if not.   */
+static void
+stream_fixlen(PdfDoc *d, PdfObj *stm)
+{
+    u32 off = stm->u.stm.off, len = stm->u.stm.len;
+    int plausible = 0;
+
+    if (off <= d->len && len <= d->len - off) {
+        const u8 *tail = d->buf + off + len;
+        u32 room = d->len - off - len;
+        u32 sk = 0;
+        while (sk < room && sk < 4 &&
+               (tail[sk] == 13 || tail[sk] == 10 || tail[sk] == ' ')) {
+            sk++;
+        }
+        if (room - sk >= 9 && memcmp(tail + sk, "endstream", 9) == 0) {
+            plausible = 1;
+        }
+    }
+    if (!plausible) {
+        const u8 *e = off < d->len
+            ? find_bytes(d->buf + off, d->len - off, "endstream") : NULL;
+        if (e) {
+            u32 nlen = (u32) (e - (d->buf + off));
+            while (nlen > 0 && (d->buf[off + nlen - 1] == 10 ||
+                                d->buf[off + nlen - 1] == 13)) {
+                nlen--;
+            }
+            stm->u.stm.len = nlen;
+        } else {
+            stm->u.stm.len = 0;
+        }
+    }
+}
+
+static int
+filter_is(const char *n, const char *full, const char *abbr)
+{
+    return strcmp(n, full) == 0 || (abbr && strcmp(n, abbr) == 0);
+}
+
+int
+pdf_streamdata(PdfDoc *d, PdfObj *stm, PdfBuf *out, char stopflt[16])
+{
+    PdfObj *filter, *parms;
+    PdfBuf tmp[2];
+    const u8 *src;
+    u32 srclen;
+    int cur = -1;               /* which tmp[] holds src; -1 = raw     */
+    u32 nf, i;
+    int err = PDF_OK;
+
+    if (stopflt) {
+        stopflt[0] = 0;
+    }
+    if (stm == NULL || stm->type != PDF_STREAM) {
+        return PDF_E_SYNTAX;
+    }
+    if (stm->u.stm.off > d->len ||
+        stm->u.stm.len > d->len - stm->u.stm.off) {
+        return PDF_E_DATA;
+    }
+    src = d->buf + stm->u.stm.off;
+    srclen = stm->u.stm.len;
+    memset(tmp, 0, sizeof tmp);
+
+    filter = pdf_resolve(d, pdf_dictget(stm, "Filter"));
+    parms = pdf_resolve(d, pdf_dictget(stm, "DecodeParms"));
+    if (parms == NULL) {
+        parms = pdf_resolve(d, pdf_dictget(stm, "DP"));
+    }
+    nf = filter == NULL ? 0
+       : filter->type == PDF_ARRAY ? pdf_arrlen(filter) : 1;
+
+    for (i = 0; i < nf; i++) {
+        PdfObj *f = filter->type == PDF_ARRAY
+                    ? pdf_resolve(d, pdf_arrget(filter, i)) : filter;
+        PdfObj *pm = parms == NULL ? NULL
+                   : parms->type == PDF_ARRAY
+                     ? pdf_resolve(d, pdf_arrget(parms, i)) : parms;
+        const char *name;
+        PdfBuf *dst = &tmp[cur == 0 ? 1 : 0];
+
+        if (f == NULL || f->type != PDF_NAME) {
+            err = PDF_E_SYNTAX;
+            goto out;
+        }
+        name = (const char *) f->u.str.p;
+        dst->len = 0;
+
+        if (filter_is(name, "FlateDecode", "Fl")) {
+            err = pdf_inflate(src, srclen, dst);
+        } else if (filter_is(name, "LZWDecode", "LZW")) {
+            int early = 1;
+            PdfObj *ec = pdf_resolve(d, pdf_dictget(pm, "EarlyChange"));
+            if (ec) {
+                early = pdfobj_int_of(ec);
+            }
+            err = pdf_lzw(src, srclen, early, dst);
+        } else if (filter_is(name, "ASCII85Decode", "A85")) {
+            err = pdf_ascii85(src, srclen, dst);
+        } else if (filter_is(name, "ASCIIHexDecode", "AHx")) {
+            err = pdf_asciihex(src, srclen, dst);
+        } else if (filter_is(name, "RunLengthDecode", "RL")) {
+            err = pdf_rle(src, srclen, dst);
+        } else if (filter_is(name, "DCTDecode", "DCT") ||
+                   filter_is(name, "JPXDecode", NULL) ||
+                   filter_is(name, "CCITTFaxDecode", "CCF") ||
+                   filter_is(name, "JBIG2Decode", NULL)) {
+            if (stopflt) {
+                strncpy(stopflt, name, 15);
+                stopflt[15] = 0;
+                break;          /* hand the caller what we have        */
+            }
+            err = PDF_E_UNSUP;
+        } else if (filter_is(name, "Crypt", NULL)) {
+            err = PDF_E_ENCRYPTED;
+        } else {
+            err = PDF_E_UNSUP;
+        }
+        if (err) {
+            goto out;
+        }
+
+        /* predictor applies to Flate and LZW output */
+        if (pm && (filter_is(name, "FlateDecode", "Fl") ||
+                   filter_is(name, "LZWDecode", "LZW"))) {
+            int pred = pdfobj_int_of(pdf_resolve(d, pdf_dictget(pm, "Predictor")));
+            if (pred > 1) {
+                int colors = 1, bpc = 8, cols = 1;
+                PdfObj *o;
+                if ((o = pdf_resolve(d, pdf_dictget(pm, "Colors"))) != NULL) {
+                    colors = pdfobj_int_of(o);
+                }
+                if ((o = pdf_resolve(d, pdf_dictget(pm, "BitsPerComponent"))) != NULL) {
+                    bpc = pdfobj_int_of(o);
+                }
+                if ((o = pdf_resolve(d, pdf_dictget(pm, "Columns"))) != NULL) {
+                    cols = pdfobj_int_of(o);
+                }
+                err = pdf_predict(dst->p, &dst->len, pred, colors, bpc, cols);
+                if (err) {
+                    goto out;
+                }
+            }
+        }
+        cur = cur == 0 ? 1 : 0;
+        src = dst->p;
+        srclen = dst->len;
+    }
+
+    err = pdfbuf_need(out, srclen);
+    if (err == PDF_OK && srclen) {
+        memcpy(out->p + out->len, src, srclen);
+        out->len += srclen;
+    }
+out:
+    pdfbuf_free(&tmp[0]);
+    pdfbuf_free(&tmp[1]);
+    return err;
+}
+
+/* --- object loading ------------------------------------------------- */
+
+static PdfObj *load_from_objstm(PdfDoc *d, u32 num, u32 stmnum, u32 idx);
+
+static PdfObj *
+load_at_offset(PdfDoc *d, u32 num, u32 off)
+{
+    PdfLex lx;
+    u32 n2, g2;
+    char kw[PDF_KWMAX];
+    PdfObj *o;
+
+    if (off >= d->len) {
+        return NULL;
+    }
+    pdflex_init(&lx, d->buf, d->len, d->pool);
+    lx.pos = off;
+    if (pdflex_uint(&lx, &n2) != 0 || pdflex_uint(&lx, &g2) != 0 ||
+        pdflex_kw(&lx, kw) != 0 || strcmp(kw, "obj") != 0) {
+        return NULL;
+    }
+    if (pdf_parseobj(&lx, &o, 0) != PDF_OK) {
+        return NULL;
+    }
+    /* stream? */
+    {
+        u32 save = lx.pos;
+        if (pdflex_kw(&lx, kw) == 0 && strcmp(kw, "stream") == 0) {
+            PdfObj *s;
+            PdfObj *lenobj;
+            if (o->type != PDF_DICT) {
+                return NULL;
+            }
+            if (lx.pos < d->len && d->buf[lx.pos] == 13) {
+                lx.pos++;
+            }
+            if (lx.pos < d->len && d->buf[lx.pos] == 10) {
+                lx.pos++;
+            }
+            s = pdfobj_new(d->pool, PDF_STREAM);
+            if (s == NULL) {
+                return NULL;
+            }
+            s->u.stm.dict = o;
+            s->u.stm.off = lx.pos;
+            lenobj = pdf_resolve(d, pdf_dictget(o, "Length"));
+            s->u.stm.len = lenobj ? (u32) pdfobj_int_of(lenobj) : 0;
+            stream_fixlen(d, s);
+            return s;
+        }
+        lx.pos = save;
+    }
+    (void) num;
+    return o;
+}
+
+PdfObj *
+pdf_getobj(PdfDoc *d, u32 num)
+{
+    PdfObj *o = NULL;
+
+    if (d == NULL || num == 0 || num >= d->nobjs) {
+        return NULL;
+    }
+    if (d->cache[num]) {
+        return d->cache[num];
+    }
+    if (d->state[num]) {
+        return NULL;                    /* reference cycle */
+    }
+    d->state[num] = 1;
+    if (d->xref[num].type == 1) {
+        o = load_at_offset(d, num, d->xref[num].a);
+    } else if (d->xref[num].type == 2) {
+        o = load_from_objstm(d, num, d->xref[num].a, d->xref[num].b);
+    }
+    d->state[num] = 0;
+    d->cache[num] = o;
+    return o;
+}
+
+PdfObj *
+pdf_resolve(PdfDoc *d, PdfObj *o)
+{
+    int guard = 0;
+
+    while (o && o->type == PDF_REF) {
+        if (++guard > 32) {
+            return NULL;
+        }
+        o = pdf_getobj(d, o->u.ref.num);
+    }
+    return o;
+}
+
+static PdfObj *
+load_from_objstm(PdfDoc *d, u32 num, u32 stmnum, u32 idx)
+{
+    PdfOStm *slot = NULL;
+    u32 i;
+
+    for (i = 0; i < PDF_NOSTM; i++) {
+        if (d->ostm[i].num == stmnum) {
+            slot = &d->ostm[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        PdfObj *stm = pdf_resolve(d, pdf_getobj(d, stmnum));
+        PdfObj *no, *fo;
+        u32 n, first;
+        PdfLex lx;
+
+        if (stm == NULL || stm->type != PDF_STREAM) {
+            return NULL;
+        }
+        no = pdf_resolve(d, pdf_dictget(stm, "N"));
+        fo = pdf_resolve(d, pdf_dictget(stm, "First"));
+        n = no ? (u32) pdfobj_int_of(no) : 0;
+        first = fo ? (u32) pdfobj_int_of(fo) : 0;
+        if (n == 0 || n > 100000) {
+            return NULL;
+        }
+        /* evict LRU slot */
+        slot = &d->ostm[0];
+        for (i = 1; i < PDF_NOSTM; i++) {
+            if (d->ostm[i].num == 0) {
+                slot = &d->ostm[i];
+                break;
+            }
+            if (d->ostm[i].tick < slot->tick) {
+                slot = &d->ostm[i];
+            }
+        }
+        pdfbuf_free(&slot->data);
+        free(slot->pairs);
+        slot->pairs = NULL;
+        slot->num = 0;
+        if (pdf_streamdata(d, stm, &slot->data, NULL) != PDF_OK) {
+            return NULL;
+        }
+        slot->pairs = malloc((size_t) n * 2 * sizeof(u32));
+        if (slot->pairs == NULL) {
+            return NULL;
+        }
+        pdflex_init(&lx, slot->data.p, slot->data.len, d->pool);
+        for (i = 0; i < n; i++) {
+            if (pdflex_uint(&lx, &slot->pairs[i * 2]) != 0 ||
+                pdflex_uint(&lx, &slot->pairs[i * 2 + 1]) != 0) {
+                free(slot->pairs);
+                slot->pairs = NULL;
+                return NULL;
+            }
+        }
+        slot->num = stmnum;
+        slot->n = n;
+        slot->first = first;
+    }
+    slot->tick = ++d->tick;
+
+    if (idx >= slot->n) {
+        return NULL;
+    }
+    /* xref says idx; trust the pair table's object number if they
+       disagree, searching for num as a fallback                      */
+    if (slot->pairs[idx * 2] != num) {
+        u32 j;
+        for (j = 0; j < slot->n; j++) {
+            if (slot->pairs[j * 2] == num) {
+                idx = j;
+                break;
+            }
+        }
+        if (j == slot->n) {
+            return NULL;
+        }
+    }
+    {
+        PdfLex lx;
+        PdfObj *o;
+        u32 off = slot->first + slot->pairs[idx * 2 + 1];
+        if (off >= slot->data.len) {
+            return NULL;
+        }
+        pdflex_init(&lx, slot->data.p, slot->data.len, d->pool);
+        lx.pos = off;
+        if (pdf_parseobj(&lx, &o, 0) != PDF_OK) {
+            return NULL;
+        }
+        return o;
+    }
+}
+
+/* --- xref loading --------------------------------------------------- */
+
+static int
+load_xref_stream_at(PdfDoc *d, u32 off, PdfObj **trailer_out)
+{
+    PdfObj *o;
+    PdfObj *wobj, *idxobj, *szobj;
+    PdfBuf data = { 0 };
+    u32 w[4] = { 0, 0, 0, 0 };
+    u32 nw, i;
+    int err;
+
+    o = load_at_offset(d, 0, off);
+    if (o == NULL || o->type != PDF_STREAM) {
+        return PDF_E_BADXREF;
+    }
+    szobj = pdf_dictget(o, "Size");
+    if (szobj && szobj->type == PDF_INT) {
+        err = ensure_objs(d, (u32) szobj->u.i);
+        if (err) {
+            return err;
+        }
+    }
+    wobj = pdf_dictget(o, "W");
+    nw = pdf_arrlen(wobj);
+    if (nw < 2 || nw > 4) {
+        return PDF_E_BADXREF;
+    }
+    for (i = 0; i < nw; i++) {
+        s32 v = pdfobj_int_of(pdf_arrget(wobj, i));
+        if (v < 0 || v > 4) {
+            return PDF_E_BADXREF;
+        }
+        w[i] = (u32) v;
+    }
+    err = pdf_streamdata(d, o, &data, NULL);
+    if (err) {
+        pdfbuf_free(&data);
+        return err;
+    }
+    idxobj = pdf_dictget(o, "Index");
+    {
+        u32 rowlen = w[0] + w[1] + w[2];
+        u32 pos = 0;
+        u32 nidx = idxobj ? pdf_arrlen(idxobj) : 0;
+        u32 pair;
+        u32 npairs = nidx >= 2 ? nidx / 2 : 1;
+
+        if (rowlen == 0) {
+            pdfbuf_free(&data);
+            return PDF_E_BADXREF;
+        }
+        for (pair = 0; pair < npairs; pair++) {
+            u32 start, count, e;
+            if (nidx >= 2) {
+                start = (u32) pdfobj_int_of(pdf_arrget(idxobj, pair * 2));
+                count = (u32) pdfobj_int_of(pdf_arrget(idxobj, pair * 2 + 1));
+            } else {
+                start = 0;
+                count = szobj ? (u32) szobj->u.i : 0;
+            }
+            err = ensure_objs(d, start + count);
+            if (err) {
+                break;
+            }
+            for (e = 0; e < count; e++) {
+                u32 f[3] = { 1, 0, 0 };  /* absent type field = 1 */
+                u32 k;
+                if (pos + rowlen > data.len) {
+                    break;              /* short data: stop cleanly */
+                }
+                for (k = 0; k < 3; k++) {
+                    u32 v = 0, b;
+                    for (b = 0; b < w[k]; b++) {
+                        v = (v << 8) | data.p[pos++];
+                    }
+                    if (w[k]) {
+                        f[k] = v;
+                    }
+                }
+                if (f[0] == 1) {
+                    xset(d, start + e, 1, f[1], f[2]);
+                } else if (f[0] == 2) {
+                    xset(d, start + e, 2, f[1], f[2]);
+                }
+                /* type 0 (free) and unknown types: ignore */
+            }
+        }
+    }
+    pdfbuf_free(&data);
+    *trailer_out = o->u.stm.dict;
+    return PDF_OK;
+}
+
+static int
+load_xref_at(PdfDoc *d, u32 off, PdfObj **trailer_out)
+{
+    PdfLex lx;
+    char kw[PDF_KWMAX];
+
+    *trailer_out = NULL;
+    if (off >= d->len) {
+        return PDF_E_BADXREF;
+    }
+    pdflex_init(&lx, d->buf, d->len, d->pool);
+    lx.pos = off;
+    if (pdflex_kw(&lx, kw) == 0 && strcmp(kw, "xref") == 0) {
+        /* classic table */
+        for (;;) {
+            u32 start, count, e;
+            if (pdflex_uint(&lx, &start) != 0) {
+                if (pdflex_kw(&lx, kw) == 0 && strcmp(kw, "trailer") == 0) {
+                    PdfObj *t;
+                    if (pdf_parseobj(&lx, &t, 0) != PDF_OK ||
+                        t->type != PDF_DICT) {
+                        return PDF_E_BADXREF;
+                    }
+                    *trailer_out = t;
+                    return PDF_OK;
+                }
+                return PDF_E_BADXREF;
+            }
+            if (pdflex_uint(&lx, &count) != 0) {
+                return PDF_E_BADXREF;
+            }
+            {
+                int err = ensure_objs(d, start + count);
+                if (err) {
+                    return err;
+                }
+            }
+            for (e = 0; e < count; e++) {
+                u32 a, b;
+                if (pdflex_uint(&lx, &a) != 0 ||
+                    pdflex_uint(&lx, &b) != 0 ||
+                    pdflex_kw(&lx, kw) != 0) {
+                    return PDF_E_BADXREF;
+                }
+                if (kw[0] == 'n') {
+                    xset(d, start + e, 1, a, b);
+                }
+            }
+        }
+    }
+    /* not a classic table: try an xref stream */
+    return load_xref_stream_at(d, off, trailer_out);
+}
+
+/* --- page tree ------------------------------------------------------ */
+
+static const char *const inherit_keys[4] = {
+    "Resources", "MediaBox", "CropBox", "Rotate"
+};
+
+static int
+walk_pages(PdfDoc *d, PdfObj *node, PdfObj *inh[4], int depth)
+{
+    PdfObj *kids, *type;
+    PdfObj *own[4];
+    u32 i;
+
+    node = pdf_resolve(d, node);
+    if (node == NULL || node->type != PDF_DICT || depth > MAX_PAGEDEPTH) {
+        return PDF_OK;                  /* skip damage, keep going */
+    }
+    for (i = 0; i < 4; i++) {
+        PdfObj *v = pdf_dictget(node, inherit_keys[i]);
+        own[i] = v ? v : inh[i];
+    }
+    type = pdf_resolve(d, pdf_dictget(node, "Type"));
+    kids = pdf_resolve(d, pdf_dictget(node, "Kids"));
+    if (pdf_isname(type, "Page") ||
+        (type == NULL && kids == NULL)) {
+        if (d->npages >= MAX_PAGES) {
+            return PDF_E_LIMIT;
+        }
+        for (i = 0; i < 4; i++) {
+            if (own[i] && pdf_dictget(node, inherit_keys[i]) == NULL) {
+                int err = pdf_dictput(d->pool, node, inherit_keys[i], own[i]);
+                if (err) {
+                    return err;
+                }
+            }
+        }
+        {
+            PdfObj **np = realloc(d->pages,
+                                  (d->npages + 1) * sizeof *np);
+            if (np == NULL) {
+                return PDF_E_NOMEM;
+            }
+            d->pages = np;
+            d->pages[d->npages++] = node;
+        }
+        return PDF_OK;
+    }
+    if (kids && kids->type == PDF_ARRAY) {
+        for (i = 0; i < pdf_arrlen(kids); i++) {
+            int err = walk_pages(d, pdf_arrget(kids, i), own, depth + 1);
+            if (err) {
+                return err;
+            }
+        }
+    }
+    return PDF_OK;
+}
+
+/* --- open / close --------------------------------------------------- */
+
+int
+pdf_open(PdfDoc **docp, const u8 *buf, u32 len)
+{
+    PdfDoc *d;
+    const u8 *hdr;
+    u32 sxoff = 0;
+    int err = PDF_OK;
+
+    *docp = NULL;
+    if (buf == NULL || len < 32) {
+        return PDF_E_SYNTAX;
+    }
+    /* %PDF may be preceded by junk; offsets are relative to it */
+    hdr = find_bytes(buf, len > 1024 ? 1024 : len, "%PDF-");
+    if (hdr == NULL) {
+        return PDF_E_SYNTAX;
+    }
+    len -= (u32) (hdr - buf);
+    buf = hdr;
+
+    d = calloc(1, sizeof *d);
+    if (d == NULL) {
+        return PDF_E_NOMEM;
+    }
+    d->buf = buf;
+    d->len = len;
+    d->pool = pdfpool_new();
+    if (d->pool == NULL) {
+        free(d);
+        return PDF_E_NOMEM;
+    }
+    d->vermajor = hdr[5] >= '0' && hdr[5] <= '9' ? hdr[5] - '0' : 1;
+    d->verminor = len > 7 && hdr[7] >= '0' && hdr[7] <= '9' ? hdr[7] - '0' : 0;
+
+    /* startxref: search the last 2KB */
+    {
+        u32 tail = len > 2048 ? len - 2048 : 0;
+        const u8 *sx = NULL, *p = d->buf + tail;
+        u32 rem = len - tail;
+        for (;;) {
+            const u8 *q = find_bytes(p, rem, "startxref");
+            if (q == NULL) {
+                break;
+            }
+            sx = q;                     /* keep the last one */
+            rem -= (u32) (q - p) + 9;
+            p = q + 9;
+        }
+        if (sx == NULL) {
+            err = PDF_E_BADXREF;
+            goto fail;
+        }
+        {
+            PdfLex lx;
+            pdflex_init(&lx, d->buf, d->len, d->pool);
+            lx.pos = (u32) (sx - d->buf) + 9;
+            if (pdflex_uint(&lx, &sxoff) != 0) {
+                err = PDF_E_BADXREF;
+                goto fail;
+            }
+        }
+    }
+
+    /* follow the xref chain: newest first, first-seen entries win */
+    {
+        u32 seen[MAX_XSECTS];
+        u32 nseen = 0;
+        u32 off = sxoff;
+        while (off != 0 && nseen < MAX_XSECTS) {
+            PdfObj *tr = NULL;
+            u32 i;
+            int dup = 0;
+            for (i = 0; i < nseen; i++) {
+                if (seen[i] == off) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) {
+                break;
+            }
+            seen[nseen++] = off;
+            err = load_xref_at(d, off, &tr);
+            if (err) {
+                goto fail;
+            }
+            if (d->trailer == NULL) {
+                d->trailer = tr;
+            }
+            /* hybrid: classic table pointing at an extra xref stream */
+            {
+                PdfObj *xs = pdf_dictget(tr, "XRefStm");
+                if (xs && xs->type == PDF_INT && xs->u.i > 0) {
+                    PdfObj *tr2 = NULL;
+                    (void) load_xref_stream_at(d, (u32) xs->u.i, &tr2);
+                }
+            }
+            {
+                PdfObj *prev = pdf_dictget(tr, "Prev");
+                off = (prev && prev->type == PDF_INT && prev->u.i > 0)
+                      ? (u32) prev->u.i : 0;
+            }
+        }
+    }
+
+    if (pdf_dictget(d->trailer, "Encrypt")) {
+        err = PDF_E_ENCRYPTED;
+        goto fail;
+    }
+    d->root = pdf_resolve(d, pdf_dictget(d->trailer, "Root"));
+    if (d->root == NULL || d->root->type != PDF_DICT) {
+        err = PDF_E_BADXREF;
+        goto fail;
+    }
+    {
+        PdfObj *inh[4] = { NULL, NULL, NULL, NULL };
+        err = walk_pages(d, pdf_dictget(d->root, "Pages"), inh, 0);
+        if (err) {
+            goto fail;
+        }
+    }
+    if (d->npages == 0) {
+        err = PDF_E_SYNTAX;
+        goto fail;
+    }
+    *docp = d;
+    return PDF_OK;
+
+fail:
+    pdf_close(d);
+    return err;
+}
+
+void
+pdf_close(PdfDoc *d)
+{
+    u32 i;
+
+    if (d == NULL) {
+        return;
+    }
+    for (i = 0; i < PDF_NOSTM; i++) {
+        pdfbuf_free(&d->ostm[i].data);
+        free(d->ostm[i].pairs);
+    }
+    free(d->xref);
+    free(d->cache);
+    free(d->state);
+    free(d->pages);
+    pdfpool_free(d->pool);
+    free(d);
+}
+
+/* --- page content --------------------------------------------------- */
+
+int
+pdf_pagecontent(PdfDoc *d, PdfObj *page, PdfBuf *out)
+{
+    PdfObj *c = pdf_resolve(d, pdf_dictget(page, "Contents"));
+
+    if (c == NULL) {
+        return PDF_OK;                  /* empty page */
+    }
+    if (c->type == PDF_STREAM) {
+        return pdf_streamdata(d, c, out, NULL);
+    }
+    if (c->type == PDF_ARRAY) {
+        u32 i;
+        for (i = 0; i < pdf_arrlen(c); i++) {
+            PdfObj *s = pdf_resolve(d, pdf_arrget(c, i));
+            if (s && s->type == PDF_STREAM) {
+                int err = pdf_streamdata(d, s, out, NULL);
+                if (err) {
+                    return err;
+                }
+                err = pdfbuf_need(out, 1);
+                if (err) {
+                    return err;
+                }
+                out->p[out->len++] = '\n';
+            }
+        }
+        return PDF_OK;
+    }
+    return PDF_E_SYNTAX;
+}

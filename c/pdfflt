@@ -1,0 +1,754 @@
+/*
+  PDFRender - stream filters: Flate (in-house RFC1950/1951 inflate),
+  LZW, PNG/TIFF predictors, ASCII85, ASCIIHex, RunLength.
+
+  The inflate is written from the DEFLATE specification (RFC 1951) and
+  verified on the host against Python's zlib as an oracle (see
+  test/host).  It uses a 9-bit primary lookup table per Huffman tree
+  with a canonical bit-by-bit fallback for longer codes.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfflt.h"
+
+/* --- growable buffer ------------------------------------------------ */
+
+int
+pdfbuf_need(PdfBuf *b, u32 extra)
+{
+	u32 want = b->len + extra;
+	u8 *np;
+	u32 ncap;
+
+	if (want < b->len) {
+		return PDF_E_LIMIT;             /* u32 overflow */
+	}
+	if (want <= b->cap) {
+		return PDF_OK;
+	}
+	ncap = b->cap ? b->cap : 4096;
+	while (ncap < want) {
+		ncap <<= 1;
+		if (ncap == 0) {
+			return PDF_E_LIMIT;
+		}
+	}
+	np = realloc(b->p, ncap);
+	if (np == NULL) {
+		return PDF_E_NOMEM;
+	}
+	b->p = np;
+	b->cap = ncap;
+	return PDF_OK;
+}
+
+void
+pdfbuf_free(PdfBuf *b)
+{
+	free(b->p);
+	b->p = NULL;
+	b->len = b->cap = 0;
+}
+
+/* --- inflate -------------------------------------------------------- */
+
+#define FASTBITS 9
+
+typedef struct {
+	u16 fast[1 << FASTBITS];        /* (sym<<4)|len; 0 = miss       */
+	u16 cnt[16];                    /* number of codes per length   */
+	u16 sym[288];                   /* symbols ordered canonically  */
+} Huf;
+
+typedef struct {
+	const u8 *src;
+	u32 slen, spos;
+	u32 bb;                         /* bit buffer, LSB first        */
+	int bn;                         /* valid bits in bb             */
+	PdfBuf *out;
+	int err;
+	Huf lit, dist, cl;              /* here, not on the SVC stack   */
+} Inf;
+
+static u32
+inf_bits(Inf *z, int n)
+{
+	u32 v;
+
+	while (z->bn < n) {
+		if (z->spos >= z->slen) {
+			z->err = PDF_E_DATA;    /* truncated stream */
+			return 0;
+		}
+		z->bb |= (u32) z->src[z->spos++] << z->bn;
+		z->bn += 8;
+	}
+	v = z->bb & ((1u << n) - 1u);
+	z->bb >>= n;
+	z->bn -= n;
+	return v;
+}
+
+/* Build decode tables from a code-length list (canonical Huffman,
+   RFC 1951 3.2.2).  Rejects over-subscribed sets; incomplete sets are
+   tolerated (single-symbol distance trees are legal and common).     */
+static int
+huf_build(Huf *h, const u8 *len, int n)
+{
+	u16 offs[16];
+	u32 code;
+	int i, l, k, left;
+
+	for (l = 0; l < 16; l++) {
+		h->cnt[l] = 0;
+	}
+	for (i = 0; i < n; i++) {
+		h->cnt[len[i]]++;
+	}
+	h->cnt[0] = 0;
+	left = 1;
+	for (l = 1; l < 16; l++) {
+		left <<= 1;
+		left -= h->cnt[l];
+		if (left < 0) {
+			return PDF_E_DATA;      /* over-subscribed */
+		}
+	}
+	{
+		u16 sum = 0;
+		for (l = 1; l < 16; l++) {
+			offs[l] = sum;
+			sum += h->cnt[l];
+		}
+	}
+	for (i = 0; i < n; i++) {
+		if (len[i]) {
+			h->sym[offs[len[i]]++] = (u16) i;
+		}
+	}
+	/* Primary table: short codes replicated across all suffixes.
+	   Codes are MSB-first on the wire but the buffer is LSB-first,
+	   so the index is the bit-reversed code.                       */
+	memset(h->fast, 0, sizeof h->fast);
+	code = 0;
+	k = 0;
+	for (l = 1; l < 16; l++) {
+		int c;
+		for (c = 0; c < h->cnt[l]; c++, k++) {
+			if (l <= FASTBITS) {
+				u32 r = 0, t = code;
+				int b;
+				for (b = 0; b < l; b++) {
+					r = (r << 1) | (t & 1);
+					t >>= 1;
+				}
+				for (; r < (1u << FASTBITS); r += 1u << l) {
+					h->fast[r] = (u16) (((u32) h->sym[k] << 4) | l);
+				}
+			}
+			code++;
+		}
+		code <<= 1;
+	}
+	return PDF_OK;
+}
+
+static int
+huf_dec(Inf *z, Huf *h)
+{
+	u16 e;
+
+	while (z->bn < FASTBITS && z->spos < z->slen) {
+		z->bb |= (u32) z->src[z->spos++] << z->bn;
+		z->bn += 8;
+	}
+	e = h->fast[z->bb & ((1u << FASTBITS) - 1u)];
+	if (e != 0 && (int) (e & 15u) <= z->bn) {
+		z->bb >>= e & 15u;
+		z->bn -= e & 15u;
+		return e >> 4;
+	}
+	/* long code (>FASTBITS) or starved buffer: canonical walk */
+	{
+		u32 code = 0;
+		int first = 0, idx = 0, l;
+		for (l = 1; l < 16; l++) {
+			int c;
+			code |= inf_bits(z, 1);
+			if (z->err) {
+				return -1;
+			}
+			c = h->cnt[l];
+			if ((int) code - first < c) {
+				return h->sym[idx + (int) code - first];
+			}
+			idx += c;
+			first = (first + c) << 1;
+			code <<= 1;
+		}
+	}
+	z->err = PDF_E_DATA;
+	return -1;
+}
+
+static int
+inf_put(Inf *z, u8 c)
+{
+	int e = pdfbuf_need(z->out, 1);
+	if (e) {
+		z->err = e;
+		return e;
+	}
+	z->out->p[z->out->len++] = c;
+	return PDF_OK;
+}
+
+static const u16 lenbase[29] = {
+	3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+	35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+};
+static const u8 lenextra[29] = {
+	0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+	3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+};
+static const u16 distbase[30] = {
+	1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+	257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+	8193, 12289, 16385, 24577
+};
+static const u8 distextra[30] = {
+	0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+	7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+};
+static const u8 clorder[19] = {
+	16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+};
+
+static int
+inf_block_huf(Inf *z)
+{
+	for (;;) {
+		int s = huf_dec(z, &z->lit);
+		if (s < 0) {
+			return z->err;
+		}
+		if (s < 256) {
+			if (inf_put(z, (u8) s)) {
+				return z->err;
+			}
+		} else if (s == 256) {
+			return PDF_OK;          /* end of block */
+		} else {
+			u32 length, distance;
+			int d;
+			if (s > 285) {
+				return z->err = PDF_E_DATA;
+			}
+			length = lenbase[s - 257] + inf_bits(z, lenextra[s - 257]);
+			d = huf_dec(z, &z->dist);
+			if (d < 0) {
+				return z->err;
+			}
+			if (d > 29) {
+				return z->err = PDF_E_DATA;
+			}
+			distance = distbase[d] + inf_bits(z, distextra[d]);
+			if (z->err) {
+				return z->err;
+			}
+			if (distance > z->out->len) {
+				return z->err = PDF_E_DATA;
+			}
+			if (pdfbuf_need(z->out, length)) {
+				return z->err = PDF_E_NOMEM;
+			}
+			{
+				u8 *dst = z->out->p + z->out->len;
+				const u8 *from = dst - distance;
+				u32 i;
+				for (i = 0; i < length; i++) {
+					dst[i] = from[i];   /* overlap = repeat, by design */
+				}
+				z->out->len += length;
+			}
+		}
+	}
+}
+
+static int
+inf_dynamic(Inf *z)
+{
+	u8 lens[320];
+	int hlit, hdist, hclen, i, n;
+
+	hlit = (int) inf_bits(z, 5) + 257;
+	hdist = (int) inf_bits(z, 5) + 1;
+	hclen = (int) inf_bits(z, 4) + 4;
+	if (z->err) {
+		return z->err;
+	}
+	memset(lens, 0, 19);
+	for (i = 0; i < hclen; i++) {
+		lens[clorder[i]] = (u8) inf_bits(z, 3);
+	}
+	if (z->err || huf_build(&z->cl, lens, 19)) {
+		return z->err ? z->err : (z->err = PDF_E_DATA);
+	}
+	n = 0;
+	while (n < hlit + hdist) {
+		int s = huf_dec(z, &z->cl);
+		if (s < 0) {
+			return z->err;
+		}
+		if (s < 16) {
+			lens[n++] = (u8) s;
+		} else {
+			int rep, val = 0;
+			if (s == 16) {
+				if (n == 0) {
+					return z->err = PDF_E_DATA;
+				}
+				val = lens[n - 1];
+				rep = 3 + (int) inf_bits(z, 2);
+			} else if (s == 17) {
+				rep = 3 + (int) inf_bits(z, 3);
+			} else {
+				rep = 11 + (int) inf_bits(z, 7);
+			}
+			if (z->err || n + rep > hlit + hdist) {
+				return z->err ? z->err : (z->err = PDF_E_DATA);
+			}
+			while (rep--) {
+				lens[n++] = (u8) val;
+			}
+		}
+	}
+	if (lens[256] == 0) {
+		return z->err = PDF_E_DATA;     /* no end-of-block code */
+	}
+	if (huf_build(&z->lit, lens, hlit) ||
+	    huf_build(&z->dist, lens + hlit, hdist)) {
+		return z->err = PDF_E_DATA;
+	}
+	return inf_block_huf(z);
+}
+
+static int
+inf_fixed(Inf *z)
+{
+	u8 lens[288];
+	int i;
+
+	for (i = 0; i < 144; i++) lens[i] = 8;
+	for (; i < 256; i++) lens[i] = 9;
+	for (; i < 280; i++) lens[i] = 7;
+	for (; i < 288; i++) lens[i] = 8;
+	huf_build(&z->lit, lens, 288);
+	for (i = 0; i < 30; i++) lens[i] = 5;
+	huf_build(&z->dist, lens, 30);
+	return inf_block_huf(z);
+}
+
+static int
+inf_stored(Inf *z)
+{
+	u32 length, nlen, i;
+
+	z->bb >>= z->bn & 7;                /* byte-align */
+	z->bn -= z->bn & 7;
+	length = inf_bits(z, 16);
+	nlen = inf_bits(z, 16);
+	if (z->err) {
+		return z->err;
+	}
+	if ((length ^ nlen) != 0xffffu) {
+		return z->err = PDF_E_DATA;
+	}
+	if (pdfbuf_need(z->out, length)) {
+		return z->err = PDF_E_NOMEM;
+	}
+	for (i = 0; i < length; i++) {
+		z->out->p[z->out->len++] = (u8) inf_bits(z, 8);
+		if (z->err) {
+			return z->err;
+		}
+	}
+	return PDF_OK;
+}
+
+int
+pdf_inflate(const u8 *src, u32 srclen, PdfBuf *out)
+{
+	Inf *z;
+	int err = PDF_OK;
+
+	/* Skip a zlib (RFC1950) wrapper if present; PDF FlateDecode is
+	   normally zlib-wrapped but broken generators emit raw deflate.
+	   FDICT is never meaningful in PDF - reject it.                */
+	if (srclen >= 2 && (src[0] & 0x0f) == 8 && (src[0] >> 4) <= 7 &&
+	    ((((u32) src[0] << 8) | src[1]) % 31) == 0) {
+		if (src[1] & 0x20) {
+			return PDF_E_UNSUP;
+		}
+		src += 2;
+		srclen -= 2;                /* trailing adler32 falls off the
+		                               end of the final block harmlessly */
+	}
+	z = calloc(1, sizeof *z);
+	if (z == NULL) {
+		return PDF_E_NOMEM;
+	}
+	z->src = src;
+	z->slen = srclen;
+	z->out = out;
+	for (;;) {
+		u32 final = inf_bits(z, 1);
+		u32 type = inf_bits(z, 2);
+		if (z->err) {
+			err = z->err;
+			break;
+		}
+		if (type == 0) {
+			err = inf_stored(z);
+		} else if (type == 1) {
+			err = inf_fixed(z);
+		} else if (type == 2) {
+			err = inf_dynamic(z);
+		} else {
+			err = PDF_E_DATA;
+		}
+		if (err || final) {
+			break;
+		}
+	}
+	free(z);
+	return err;
+}
+
+/* --- LZWDecode ------------------------------------------------------ */
+
+/* PDF LZW: MSB-first codes, 9->12 bits, Clear=256, EOD=257, first new
+   code 258.  With EarlyChange (the default) the code width bumps one
+   entry early.  Table entries chain through prefix links; a small
+   stack unwinds each chain.                                          */
+int
+pdf_lzw(const u8 *src, u32 srclen, int earlychange, PdfBuf *out)
+{
+	u16 *prefix;
+	u8 *suffix, *stack;
+	u32 bb = 0, spos = 0;
+	int bn = 0, width = 9, next = 258, prev = -1;
+	int err = PDF_OK;
+
+	prefix = malloc(4096 * sizeof(u16) + 4096 + 4096);
+	if (prefix == NULL) {
+		return PDF_E_NOMEM;
+	}
+	suffix = (u8 *) (prefix + 4096);
+	stack = suffix + 4096;
+
+	for (;;) {
+		int code, sp = 0, c;
+		while (bn < width) {
+			if (spos >= srclen) {
+				goto done;          /* ran off the end: accept */
+			}
+			bb = (bb << 8) | src[spos++];
+			bn += 8;
+		}
+		code = (int) ((bb >> (bn - width)) & ((1u << width) - 1u));
+		bn -= width;
+
+		if (code == 256) {
+			width = 9;
+			next = 258;
+			prev = -1;
+			continue;
+		}
+		if (code == 257) {
+			break;                  /* EOD */
+		}
+		if (code > next || (code == next && prev < 0)) {
+			err = PDF_E_DATA;
+			break;
+		}
+		if (code == next) {
+			/* KwKwK case: chain = prev + first char of prev */
+			c = prev;
+			while (c >= 258) {
+				stack[sp++] = suffix[c];
+				c = prefix[c];
+			}
+			stack[sp++] = (u8) c;   /* first char, will emit last */
+			/* emit prev's chain then that first char again */
+			{
+				int first = c;
+				if (pdfbuf_need(out, (u32) sp + 1)) {
+					err = PDF_E_NOMEM;
+					break;
+				}
+				while (sp > 0) {
+					out->p[out->len++] = stack[--sp];
+				}
+				out->p[out->len++] = (u8) first;
+				suffix[next] = (u8) first;
+			}
+		} else {
+			c = code;
+			while (c >= 258) {
+				stack[sp++] = suffix[c];
+				c = prefix[c];
+			}
+			stack[sp++] = (u8) c;
+			if (pdfbuf_need(out, (u32) sp)) {
+				err = PDF_E_NOMEM;
+				break;
+			}
+			{
+				int first = (u8) c;
+				while (sp > 0) {
+					out->p[out->len++] = stack[--sp];
+				}
+				if (prev >= 0) {
+					suffix[next] = (u8) first;
+				}
+			}
+		}
+		if (prev >= 0 && next < 4096) {
+			prefix[next] = (u16) prev;
+			next++;
+		}
+		prev = code;
+		if (next + (earlychange ? 1 : 0) >= (1 << width) && width < 12) {
+			width++;
+		}
+	}
+done:
+	free(prefix);
+	return err;
+}
+
+/* --- predictors ----------------------------------------------------- */
+
+static int
+paeth(int a, int b, int c)
+{
+	int p = a + b - c;
+	int pa = p > a ? p - a : a - p;
+	int pb = p > b ? p - b : b - p;
+	int pc = p > c ? p - c : c - p;
+	if (pa <= pb && pa <= pc) {
+		return a;
+	}
+	return pb <= pc ? b : c;
+}
+
+int
+pdf_predict(u8 *data, u32 *plen, int predictor, int colors,
+            int bpc, int columns)
+{
+	u32 rowb, r, nrows;
+	int bpp;
+
+	if (predictor < 2) {
+		return PDF_OK;
+	}
+	if (colors < 1 || colors > 60 || columns < 1) {
+		return PDF_E_DATA;
+	}
+	bpp = (colors * bpc + 7) / 8;
+	if (bpp < 1) {
+		bpp = 1;
+	}
+	rowb = ((u32) colors * (u32) bpc * (u32) columns + 7) / 8;
+	if (rowb == 0) {
+		return PDF_E_DATA;
+	}
+
+	if (predictor == 2) {
+		/* TIFF horizontal differencing; 8-bit components only */
+		if (bpc != 8) {
+			return PDF_E_UNSUP;
+		}
+		nrows = *plen / rowb;
+		for (r = 0; r < nrows; r++) {
+			u8 *row = data + r * rowb;
+			u32 i;
+			for (i = (u32) bpp; i < rowb; i++) {
+				row[i] = (u8) (row[i] + row[i - bpp]);
+			}
+		}
+		return PDF_OK;
+	}
+
+	/* PNG predictors: every row is filter-byte + rowb data bytes.
+	   Unfilter and compact in place (dst trails src, safe).        */
+	nrows = *plen / (rowb + 1);
+	for (r = 0; r < nrows; r++) {
+		const u8 *srcrow = data + r * (rowb + 1);
+		u8 *dst = data + r * rowb;
+		const u8 *up = r ? dst - rowb : NULL;
+		u8 ft = srcrow[0];
+		u32 i;
+		for (i = 0; i < rowb; i++) {
+			int x = srcrow[1 + i];
+			int a = i >= (u32) bpp ? dst[i - bpp] : 0;
+			int b = up ? up[i] : 0;
+			int c = (up && i >= (u32) bpp) ? up[i - bpp] : 0;
+			switch (ft) {
+			case 0:                             break;
+			case 1: x += a;                     break;
+			case 2: x += b;                     break;
+			case 3: x += (a + b) >> 1;          break;
+			case 4: x += paeth(a, b, c);        break;
+			default:
+				return PDF_E_DATA;
+			}
+			dst[i] = (u8) x;
+		}
+	}
+	*plen = nrows * rowb;
+	return PDF_OK;
+}
+
+/* --- ASCII85 / ASCIIHex / RunLength --------------------------------- */
+
+int
+pdf_ascii85(const u8 *src, u32 srclen, PdfBuf *out)
+{
+	u32 acc = 0, i;
+	int cnt = 0;
+
+	for (i = 0; i < srclen; i++) {
+		u8 c = src[i];
+		if (c <= ' ') {
+			continue;
+		}
+		if (c == '~') {
+			break;                  /* ~> end marker */
+		}
+		if (c == 'z' && cnt == 0) {
+			if (pdfbuf_need(out, 4)) {
+				return PDF_E_NOMEM;
+			}
+			memset(out->p + out->len, 0, 4);
+			out->len += 4;
+			continue;
+		}
+		if (c < '!' || c > 'u') {
+			return PDF_E_DATA;
+		}
+		acc = acc * 85 + (u32) (c - '!');
+		if (++cnt == 5) {
+			if (pdfbuf_need(out, 4)) {
+				return PDF_E_NOMEM;
+			}
+			out->p[out->len++] = (u8) (acc >> 24);
+			out->p[out->len++] = (u8) (acc >> 16);
+			out->p[out->len++] = (u8) (acc >> 8);
+			out->p[out->len++] = (u8) acc;
+			acc = 0;
+			cnt = 0;
+		}
+	}
+	if (cnt == 1) {
+		return PDF_E_DATA;          /* a lone final digit is illegal */
+	}
+	if (cnt > 1) {
+		int n = cnt - 1, j;
+		for (j = cnt; j < 5; j++) {
+			acc = acc * 85 + 84;    /* pad with 'u' */
+		}
+		if (pdfbuf_need(out, (u32) n)) {
+			return PDF_E_NOMEM;
+		}
+		for (j = 0; j < n; j++) {
+			out->p[out->len++] = (u8) (acc >> (24 - 8 * j));
+		}
+	}
+	return PDF_OK;
+}
+
+int
+pdf_asciihex(const u8 *src, u32 srclen, PdfBuf *out)
+{
+	int hi = -1;
+	u32 i;
+
+	for (i = 0; i < srclen; i++) {
+		u8 c = src[i];
+		int v;
+		if (c == '>') {
+			break;
+		}
+		if (c <= ' ') {
+			continue;
+		}
+		if (c >= '0' && c <= '9') {
+			v = c - '0';
+		} else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') {
+			v = (c | 0x20) - 'a' + 10;
+		} else {
+			return PDF_E_DATA;
+		}
+		if (hi < 0) {
+			hi = v;
+		} else {
+			if (pdfbuf_need(out, 1)) {
+				return PDF_E_NOMEM;
+			}
+			out->p[out->len++] = (u8) ((hi << 4) | v);
+			hi = -1;
+		}
+	}
+	if (hi >= 0) {                  /* odd digit count: pad with 0 */
+		if (pdfbuf_need(out, 1)) {
+			return PDF_E_NOMEM;
+		}
+		out->p[out->len++] = (u8) (hi << 4);
+	}
+	return PDF_OK;
+}
+
+int
+pdf_rle(const u8 *src, u32 srclen, PdfBuf *out)
+{
+	u32 i = 0;
+
+	while (i < srclen) {
+		u8 n = src[i++];
+		if (n == 128) {
+			break;                  /* EOD */
+		}
+		if (n < 128) {
+			u32 cnt = (u32) n + 1;
+			if (i + cnt > srclen) {
+				return PDF_E_DATA;
+			}
+			if (pdfbuf_need(out, cnt)) {
+				return PDF_E_NOMEM;
+			}
+			memcpy(out->p + out->len, src + i, cnt);
+			out->len += cnt;
+			i += cnt;
+		} else {
+			u32 cnt = 257 - (u32) n;
+			if (i >= srclen) {
+				return PDF_E_DATA;
+			}
+			if (pdfbuf_need(out, cnt)) {
+				return PDF_E_NOMEM;
+			}
+			memset(out->p + out->len, src[i++], cnt);
+			out->len += cnt;
+		}
+	}
+	return PDF_OK;
+}

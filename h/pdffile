@@ -1,0 +1,76 @@
+/*
+  PDFRender - document layer: xref, object loading, page tree,
+  stream decoding.
+
+  The whole file is held in memory (caller-owned buffer); objects are
+  parsed lazily on first reference and cached.  Handles classic xref
+  tables, xref streams (PDF 1.5+), hybrid files, object streams, and
+  chained /Prev sections.  Encrypted documents are detected and
+  refused cleanly.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFFILE_H
+#define PDFFILE_H
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdfflt.h"
+
+typedef struct {
+    u8 type;                    /* 0 unset/free, 1 offset, 2 in objstm */
+    u32 a, b;                   /* t1: a=offset; t2: a=stm num, b=idx  */
+} PdfXEnt;
+
+typedef struct {
+    u32 num;                    /* object stream number; 0 = empty     */
+    u32 tick;                   /* LRU stamp                           */
+    PdfBuf data;                /* decoded bytes                       */
+    u32 n, first;
+    u32 *pairs;                 /* n * {objnum, offset}                */
+} PdfOStm;
+
+#define PDF_NOSTM 4             /* decoded object streams kept live    */
+
+typedef struct PdfDoc {
+    const u8 *buf;              /* caller-owned                        */
+    u32 len;
+    PdfPool *pool;
+    int vermajor, verminor;
+
+    u32 nobjs;
+    PdfXEnt *xref;
+    PdfObj **cache;
+    u8 *state;                  /* 1 while an object is being loaded   */
+
+    PdfObj *trailer;
+    PdfObj *root;
+
+    u32 npages;
+    PdfObj **pages;             /* flattened page dicts, inheritance
+                                   already applied                     */
+    PdfOStm ostm[PDF_NOSTM];
+    u32 tick;
+} PdfDoc;
+
+/* Open/close.  buf must stay valid until pdf_close.                  */
+int  pdf_open(PdfDoc **docp, const u8 *buf, u32 len);
+void pdf_close(PdfDoc *doc);
+
+PdfObj *pdf_getobj(PdfDoc *doc, u32 num);
+PdfObj *pdf_resolve(PdfDoc *doc, PdfObj *o);    /* chase PDF_REFs      */
+
+/* Decode a stream through its filter chain into out (appends).
+   If an image-only filter (DCT/JPX/CCITT/JBIG2) is met, decoding of
+   the preceding filters succeeds and its name is left in stopflt
+   (empty otherwise); pass NULL to treat that as an error.            */
+int pdf_streamdata(PdfDoc *doc, PdfObj *stm, PdfBuf *out,
+                   char stopflt[16]);
+
+/* Concatenated, decoded page content streams.                        */
+int pdf_pagecontent(PdfDoc *doc, PdfObj *page, PdfBuf *out);
+
+#endif

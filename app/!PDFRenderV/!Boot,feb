@@ -1,0 +1,21 @@
+| !Boot for PDFRenderV - run by the Filer when it first sees this
+| application directory, and by the boot sequence if the app is in a
+| scanned Apps directory.  Loading the module here (rather than in
+| !Run) is what makes double-clicking a PDF work without having
+| started the viewer first.
+|
+| Copyright (c) RISC OS Technologies 2026.
+| SPDX-License-Identifier: CDDL-1.0
+| Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+
+Set PDFRenderV$Dir <Obey$Dir>
+IconSprites <Obey$Dir>.!Sprites
+
+| The module claims Alias$@RunType_ADF at initialisation, but only if
+| it knows where the viewer lives - so set that first.
+Set PDFRenderV$Viewer <PDFRenderV$Dir>.Viewer
+RMEnsure PDFRenderV 1.00 RMLoad <PDFRenderV$Dir>.PDFRenderV
+RMEnsure PDFRenderV 1.00 Error PDFRenderV 1.00 or later is required
+
+| Give the filetype a name in the Filer.
+Set File$Type_ADF PDF

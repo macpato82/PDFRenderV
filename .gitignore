@@ -1,0 +1,25 @@
+# Build outputs - regenerate with ./build.sh
+o/
+rm/
+aif/
+s/
+scrap/
+linked/
+Messages
+thirdparty/openjpeg/o/
+
+# The application directory ships as source; build.sh fills in the
+# two binaries, so they are not tracked.
+app/!PDFRenderV/PDFRenderV,ffa
+app/!PDFRenderV/Viewer,ff8
+
+# Host test artefacts
+test/host/obj/
+test/host/hostinc/
+test/host/ojinc/
+test/host/vectors/
+test/host/testflt
+test/host/testpdf
+test/host/testtext
+
+.DS_Store

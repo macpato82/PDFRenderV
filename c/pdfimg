@@ -1,0 +1,736 @@
+/*
+  PDFRender - image XObject / inline image decoding.
+
+  pdfimg_load (image XObjects) and pdfimg_inline (BI/ID/EI inline
+  images) both reduce their dict - full key names for XObjects,
+  either spelling for inline images - down to plain values (w, h,
+  bpc, colourspace, mask flag/fill) plus a fully filter-decoded byte
+  buffer, then hand that to expand_pixels(), the one shared pixel-
+  expansion core.  A DCTDecode-terminated stream is passed through
+  untouched for SpriteExtend's JPEG plotter; a JPXDecode-terminated
+  one goes to c/pdfjpx (OpenJPEG) and comes back as pixels; the
+  remaining image-only filters (CCITTFax/JBIG2) are refused.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdfflt.h"
+#include "pdffile.h"
+#include "pdfimg.h"
+#include "pdfjpx.h"
+
+enum { CS_GRAY = 0, CS_RGB, CS_CMYK, CS_INDEXED, CS_UNKNOWN };
+
+/* --- small helpers ---------------------------------------------------- */
+
+static int
+num_nonzero(PdfObj *o)
+{
+    if (o == NULL) {
+        return 0;
+    }
+    if (o->type == PDF_INT || o->type == PDF_BOOL) {
+        return o->u.i != 0;
+    }
+    if (o->type == PDF_REAL) {
+        return o->u.f != 0;
+    }
+    return 0;
+}
+
+/* Inline image dicts accept either spelling of every key. */
+static PdfObj *
+inline_get(PdfDoc *doc, PdfObj *dict, const char *full, const char *abbr)
+{
+    PdfObj *o = pdf_resolve(doc, pdf_dictget(dict, full));
+
+    if (o == NULL) {
+        o = pdf_resolve(doc, pdf_dictget(dict, abbr));
+    }
+    return o;
+}
+
+/* Extract sample idx (0-based, component-interleaved) from a tightly
+   packed row: MSB-first bit order, first sample in the high bits.
+   16-bit samples yield only the high byte, per the module's 8-bit
+   pixel pipeline.                                                     */
+static u32
+img_sample(const u8 *row, u32 idx, int bpc)
+{
+    u32 bitpos, byteoff, bitoff, shift, mask;
+
+    if (bpc == 8) {
+        return row[idx];
+    }
+    if (bpc == 16) {
+        return row[idx * 2];
+    }
+    bitpos = idx * (u32) bpc;
+    byteoff = bitpos >> 3;
+    bitoff = bitpos & 7u;
+    shift = 8u - bitoff - (u32) bpc;
+    mask = (1u << bpc) - 1u;
+    return (row[byteoff] >> shift) & mask;
+}
+
+/* Scale a bpc-wide sample to 0..255 (identity for bpc 8, and for the
+   16-bit high byte already extracted by img_sample).                  */
+static u32
+img_scale255(u32 v, int bpc)
+{
+    int eff = bpc == 16 ? 8 : bpc;
+    u32 maxv = (1u << eff) - 1u;
+
+    return maxv ? v * 255u / maxv : 0u;
+}
+
+/* --- colourspace classification ---------------------------------------- */
+
+/* Classify a non-Indexed colourspace: DeviceGray/RGB/CMYK and their
+   Cal-family/ICCBased/abbreviated-name equivalents.  A recognised-
+   but-unsupported family (Lab, Separation, DeviceN, Pattern) is
+   refused; an unrecognised bare name comes back as CS_UNKNOWN so the
+   caller can guess RGB-vs-gray from how much data actually turned up. */
+static int
+plain_cs_kind(PdfDoc *doc, PdfObj *cs, int *kind, int *ncomp)
+{
+    const char *name;
+
+    cs = pdf_resolve(doc, cs);
+    if (cs == NULL) {
+        return PDF_E_SYNTAX;
+    }
+    if (cs->type == PDF_NAME) {
+        name = (const char *) cs->u.str.p;
+        if (strcmp(name, "DeviceGray") == 0 || strcmp(name, "CalGray") == 0 ||
+            strcmp(name, "G") == 0) {
+            *kind = CS_GRAY;
+            *ncomp = 1;
+            return PDF_OK;
+        }
+        if (strcmp(name, "DeviceRGB") == 0 || strcmp(name, "CalRGB") == 0 ||
+            strcmp(name, "RGB") == 0) {
+            *kind = CS_RGB;
+            *ncomp = 3;
+            return PDF_OK;
+        }
+        if (strcmp(name, "DeviceCMYK") == 0 || strcmp(name, "CMYK") == 0) {
+            *kind = CS_CMYK;
+            *ncomp = 4;
+            return PDF_OK;
+        }
+        *kind = CS_UNKNOWN;
+        *ncomp = 0;
+        return PDF_OK;
+    }
+    if (cs->type == PDF_ARRAY) {
+        PdfObj *fam = pdf_resolve(doc, pdf_arrget(cs, 0));
+        const char *fname;
+
+        if (fam == NULL || fam->type != PDF_NAME) {
+            return PDF_E_UNSUP;
+        }
+        fname = (const char *) fam->u.str.p;
+        if (strcmp(fname, "ICCBased") == 0) {
+            PdfObj *stm = pdf_resolve(doc, pdf_arrget(cs, 1));
+            PdfObj *n = stm ? pdf_resolve(doc, pdf_dictget(stm, "N")) : NULL;
+            s32 nv = n ? pdfobj_int_of(n) : 0;
+
+            if (nv == 1) {
+                *kind = CS_GRAY;
+                *ncomp = 1;
+                return PDF_OK;
+            }
+            if (nv == 3) {
+                *kind = CS_RGB;
+                *ncomp = 3;
+                return PDF_OK;
+            }
+            if (nv == 4) {
+                *kind = CS_CMYK;
+                *ncomp = 4;
+                return PDF_OK;
+            }
+            return PDF_E_UNSUP;
+        }
+        if (strcmp(fname, "CalGray") == 0) {
+            *kind = CS_GRAY;
+            *ncomp = 1;
+            return PDF_OK;
+        }
+        if (strcmp(fname, "CalRGB") == 0) {
+            *kind = CS_RGB;
+            *ncomp = 3;
+            return PDF_OK;
+        }
+    }
+    return PDF_E_UNSUP;         /* Lab, Separation, DeviceN, Pattern, ... */
+}
+
+/* Classify a colourspace object, resolving /Indexed's base and lookup
+   table.  lutbuf receives ownership of any stream-decoded lookup
+   table; the caller frees it once done with *lut.                     */
+static int
+classify_cs(PdfDoc *doc, PdfObj *csobj, int *kind, int *ncomp,
+            const u8 **lut, u32 *lutlen, s32 *hival, int *basencomp,
+            PdfBuf *lutbuf)
+{
+    PdfObj *cs = pdf_resolve(doc, csobj);
+    PdfObj *fam;
+
+    *lut = NULL;
+    *lutlen = 0;
+    *hival = 0;
+    *basencomp = 1;
+
+    if (cs == NULL) {
+        return PDF_E_SYNTAX;
+    }
+    fam = cs->type == PDF_ARRAY ? pdf_resolve(doc, pdf_arrget(cs, 0)) : NULL;
+    if (fam && fam->type == PDF_NAME &&
+        (strcmp((const char *) fam->u.str.p, "Indexed") == 0 ||
+         strcmp((const char *) fam->u.str.p, "I") == 0)) {
+        PdfObj *base = pdf_arrget(cs, 1);
+        PdfObj *hv = pdf_resolve(doc, pdf_arrget(cs, 2));
+        PdfObj *lookup = pdf_resolve(doc, pdf_arrget(cs, 3));
+        int bkind, bncomp;
+        int err = plain_cs_kind(doc, base, &bkind, &bncomp);
+
+        if (err) {
+            return err;
+        }
+        if (bkind == CS_UNKNOWN) {
+            return PDF_E_UNSUP;
+        }
+        *basencomp = bncomp;
+        *hival = hv ? pdfobj_int_of(hv) : 0;
+        if (*hival < 0) {
+            *hival = 0;
+        }
+        if (lookup && lookup->type == PDF_STRING) {
+            *lut = lookup->u.str.p;
+            *lutlen = lookup->u.str.len;
+        } else if (lookup && lookup->type == PDF_STREAM) {
+            int e2 = pdf_streamdata(doc, lookup, lutbuf, NULL);
+            if (e2) {
+                return e2;
+            }
+            *lut = lutbuf->p;
+            *lutlen = lutbuf->len;
+        }
+        *kind = CS_INDEXED;
+        *ncomp = 1;
+        return PDF_OK;
+    }
+    return plain_cs_kind(doc, cs, kind, ncomp);
+}
+
+/* Combine already-extracted component samples into an 0x00BBGGRR
+   word.  For CS_INDEXED, samp[0] is an unscaled table index (not a
+   0..255 colour value) - see expand_pixels.                           */
+static u32
+combine_pixel(int kind, const u32 *samp, const u8 *lut, u32 lutlen,
+              s32 hival, int basencomp)
+{
+    u32 r, g, b;
+
+    if (kind == CS_GRAY) {
+        r = g = b = samp[0];
+    } else if (kind == CS_RGB) {
+        r = samp[0];
+        g = samp[1];
+        b = samp[2];
+    } else if (kind == CS_CMYK) {
+        u32 rr = samp[0] + samp[3];
+        u32 gg = samp[1] + samp[3];
+        u32 bb = samp[2] + samp[3];
+
+        r = 255u - (rr > 255u ? 255u : rr);
+        g = 255u - (gg > 255u ? 255u : gg);
+        b = 255u - (bb > 255u ? 255u : bb);
+    } else if (kind == CS_INDEXED) {
+        s32 idx = (s32) samp[0];
+        u32 off;
+
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx > hival) {
+            idx = hival;
+        }
+        off = (u32) idx * (u32) basencomp;
+        if (lut == NULL || basencomp <= 0 ||
+            off + (u32) basencomp > lutlen) {
+            r = g = b = 0;               /* missing/short table: black */
+        } else if (basencomp == 1) {
+            r = g = b = lut[off];
+        } else if (basencomp == 3) {
+            r = lut[off];
+            g = lut[off + 1];
+            b = lut[off + 2];
+        } else if (basencomp == 4) {
+            u32 c = lut[off], m = lut[off + 1];
+            u32 yv = lut[off + 2], k = lut[off + 3];
+            u32 rr = c + k, gg = m + k, bb = yv + k;
+
+            r = 255u - (rr > 255u ? 255u : rr);
+            g = 255u - (gg > 255u ? 255u : gg);
+            b = 255u - (bb > 255u ? 255u : bb);
+        } else {
+            r = g = b = 0;
+        }
+    } else {
+        r = g = b = 0;
+    }
+    return (b << 16) | (g << 8) | r;
+}
+
+/* --- shared pixel-expansion core ---------------------------------------- */
+
+/* w, h, bpc, the colourspace object, the ImageMask/Decode-invert
+   flags and fillrgb come from the caller's dict lookup (full names
+   for XObjects, either spelling for inline images); data/datalen is
+   the fully filter-decoded byte buffer.  Builds *outpix (malloc'd,
+   w*h words, caller frees).                                           */
+static int
+expand_pixels(PdfDoc *doc, s32 w, s32 h, s32 bpc, int imagemask,
+              int maskinvert, u32 fillrgb, PdfObj *csobj,
+              const u8 *data, u32 datalen, u32 **outpix)
+{
+    u32 npix, stride, y;
+    u32 *pix = NULL;
+    int kind = CS_GRAY, ncomp = 1, basencomp = 1;
+    const u8 *lut = NULL;
+    u32 lutlen = 0;
+    s32 hival = 0;
+    PdfBuf lutbuf = { 0 };
+    int err = PDF_OK;
+
+    *outpix = NULL;
+    if (w < 1 || w > 8192 || h < 1 || h > 8192) {
+        return PDF_E_LIMIT;
+    }
+    npix = (u32) w * (u32) h;
+    if (npix > 4194304u) {
+        return PDF_E_LIMIT;
+    }
+
+    if (imagemask) {
+        bpc = 1;
+        ncomp = 1;
+    } else {
+        if (bpc != 1 && bpc != 2 && bpc != 4 && bpc != 8 && bpc != 16) {
+            return PDF_E_UNSUP;
+        }
+        err = classify_cs(doc, csobj, &kind, &ncomp, &lut, &lutlen,
+                          &hival, &basencomp, &lutbuf);
+        if (err) {
+            goto fail;
+        }
+        if (kind == CS_UNKNOWN) {
+            /* Bare unrecognised colourspace name: guess RGB if the
+               data is big enough to hold 3 components per pixel,
+               otherwise fall back to gray.                            */
+            u32 stride3 = ((u32) w * 3u * (u32) bpc + 7u) / 8u;
+            u32 need3 = stride3 * (u32) h;
+
+            if (need3 > 0 && datalen >= need3) {
+                kind = CS_RGB;
+                ncomp = 3;
+            } else {
+                kind = CS_GRAY;
+                ncomp = 1;
+            }
+        }
+    }
+
+    /* w*h is capped at 4194304 above, so w*h*4 (the pix buffer size in
+       bytes) cannot overflow u32.                                     */
+    pix = malloc((size_t) npix * sizeof(u32));
+    if (pix == NULL) {
+        err = PDF_E_NOMEM;
+        goto fail;
+    }
+
+    stride = ((u32) w * (u32) ncomp * (u32) bpc + 7u) / 8u;
+    for (y = 0; y < (u32) h; y++) {
+        u32 rowoff = y * stride;
+        const u8 *row;
+        s32 x;
+
+        if (rowoff + stride > datalen) {
+            /* Buffer ran out: fill this row and everything below it
+               white, never reading past the buffer.                  */
+            u32 fy, fx;
+
+            for (fy = y; fy < (u32) h; fy++) {
+                for (fx = 0; fx < (u32) w; fx++) {
+                    pix[fy * (u32) w + fx] = 0x00ffffffu;
+                }
+            }
+            break;
+        }
+        row = data + rowoff;
+        for (x = 0; x < w; x++) {
+            u32 word;
+
+            if (imagemask) {
+                u32 bit = img_sample(row, (u32) x, 1);
+                int paint = (maskinvert ? (bit != 0) : (bit == 0));
+
+                word = paint ? (fillrgb & 0x00ffffffu) : 0x00ffffffu;
+            } else {
+                u32 samp[4];
+                int c;
+
+                for (c = 0; c < ncomp && c < 4; c++) {
+                    u32 raw = img_sample(row, (u32) x * (u32) ncomp +
+                                         (u32) c, bpc);
+                    samp[c] = kind == CS_INDEXED ? raw
+                                                  : img_scale255(raw, bpc);
+                }
+                word = combine_pixel(kind, samp, lut, lutlen, hival,
+                                     basencomp);
+            }
+            pix[y * (u32) w + x] = word;
+        }
+    }
+
+    pdfbuf_free(&lutbuf);
+    *outpix = pix;
+    return PDF_OK;
+
+fail:
+    pdfbuf_free(&lutbuf);
+    free(pix);
+    return err;
+}
+
+/* --- inline image filter chain ------------------------------------------ */
+
+/* Apply an inline image's own /F /DP filter chain to caller-supplied
+   raw bytes (pdf_streamdata cannot be used here - the data does not
+   live inside doc->buf).  Mirrors pdf_streamdata's structure: on an
+   image-only stop filter, *isjpeg is set and out holds whatever bytes
+   had been produced up to that point (the raw bytes themselves if
+   DCT is the first/only filter).                                      */
+static int
+inline_filters(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
+              PdfBuf *out, int *isjpeg, int *isjpx)
+{
+    PdfObj *filter = inline_get(doc, dict, "Filter", "F");
+    PdfObj *parms = inline_get(doc, dict, "DecodeParms", "DP");
+    PdfBuf tmp[2];
+    const u8 *src = data;
+    u32 srclen = dlen;
+    int cur = -1;
+    u32 nf, i;
+    int err = PDF_OK;
+
+    *isjpeg = 0;
+    *isjpx = 0;
+    memset(tmp, 0, sizeof tmp);
+    nf = filter == NULL ? 0
+       : filter->type == PDF_ARRAY ? pdf_arrlen(filter) : 1;
+
+    for (i = 0; i < nf; i++) {
+        PdfObj *f = filter->type == PDF_ARRAY
+                    ? pdf_resolve(doc, pdf_arrget(filter, i)) : filter;
+        PdfObj *pm = parms == NULL ? NULL
+                   : parms->type == PDF_ARRAY
+                     ? pdf_resolve(doc, pdf_arrget(parms, i)) : parms;
+        const char *name;
+        PdfBuf *dst = &tmp[cur == 0 ? 1 : 0];
+
+        if (f == NULL || f->type != PDF_NAME) {
+            err = PDF_E_SYNTAX;
+            goto out;
+        }
+        name = (const char *) f->u.str.p;
+        dst->len = 0;
+
+        if (strcmp(name, "FlateDecode") == 0 || strcmp(name, "Fl") == 0) {
+            err = pdf_inflate(src, srclen, dst);
+        } else if (strcmp(name, "LZWDecode") == 0 ||
+                   strcmp(name, "LZW") == 0) {
+            int early = 1;
+            PdfObj *ec = pdf_resolve(doc, pdf_dictget(pm, "EarlyChange"));
+
+            if (ec) {
+                early = pdfobj_int_of(ec);
+            }
+            err = pdf_lzw(src, srclen, early, dst);
+        } else if (strcmp(name, "ASCII85Decode") == 0 ||
+                   strcmp(name, "A85") == 0) {
+            err = pdf_ascii85(src, srclen, dst);
+        } else if (strcmp(name, "ASCIIHexDecode") == 0 ||
+                   strcmp(name, "AHx") == 0) {
+            err = pdf_asciihex(src, srclen, dst);
+        } else if (strcmp(name, "RunLengthDecode") == 0 ||
+                   strcmp(name, "RL") == 0) {
+            err = pdf_rle(src, srclen, dst);
+        } else if (strcmp(name, "DCTDecode") == 0 ||
+                   strcmp(name, "DCT") == 0) {
+            *isjpeg = 1;
+            break;                       /* hand the caller what we have */
+        } else if (strcmp(name, "JPXDecode") == 0) {
+            *isjpx = 1;
+            break;                       /* hand the caller what we have */
+        } else if (strcmp(name, "CCITTFaxDecode") == 0 ||
+                   strcmp(name, "CCF") == 0 ||
+                   strcmp(name, "JBIG2Decode") == 0) {
+            err = PDF_E_UNSUP;
+            goto out;
+        } else {
+            err = PDF_E_UNSUP;
+            goto out;
+        }
+        if (err) {
+            goto out;
+        }
+
+        /* predictor applies to Flate and LZW output */
+        if (pm && (strcmp(name, "FlateDecode") == 0 ||
+                   strcmp(name, "Fl") == 0 ||
+                   strcmp(name, "LZWDecode") == 0 ||
+                   strcmp(name, "LZW") == 0)) {
+            PdfObj *predobj = pdf_resolve(doc, pdf_dictget(pm, "Predictor"));
+            int pred = pdfobj_int_of(predobj);
+
+            if (pred > 1) {
+                int colors = 1, bpc = 8, cols = 1;
+                PdfObj *o;
+
+                o = pdf_resolve(doc, pdf_dictget(pm, "Colors"));
+                if (o) {
+                    colors = pdfobj_int_of(o);
+                }
+                o = pdf_resolve(doc, pdf_dictget(pm, "BitsPerComponent"));
+                if (o) {
+                    bpc = pdfobj_int_of(o);
+                }
+                o = pdf_resolve(doc, pdf_dictget(pm, "Columns"));
+                if (o) {
+                    cols = pdfobj_int_of(o);
+                }
+                err = pdf_predict(dst->p, &dst->len, pred, colors, bpc,
+                                  cols);
+                if (err) {
+                    goto out;
+                }
+            }
+        }
+        cur = cur == 0 ? 1 : 0;
+        src = dst->p;
+        srclen = dst->len;
+    }
+
+    err = pdfbuf_need(out, srclen);
+    if (err == PDF_OK && srclen) {
+        memcpy(out->p + out->len, src, srclen);
+        out->len += srclen;
+    }
+out:
+    pdfbuf_free(&tmp[0]);
+    pdfbuf_free(&tmp[1]);
+    return err;
+}
+
+/* --- public interface ---------------------------------------------------- */
+
+int
+pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img)
+{
+    PdfObj *wobj, *hobj, *bpcobj, *csobj, *imobj, *decobj;
+    s32 w, h, bpc;
+    int imagemask, maskinvert;
+    char stopflt[16];
+    PdfBuf buf = { 0 };
+    int err;
+
+    memset(img, 0, sizeof *img);
+    if (doc == NULL || xobj == NULL || xobj->type != PDF_STREAM) {
+        return PDF_E_SYNTAX;
+    }
+
+    wobj   = pdf_resolve(doc, pdf_dictget(xobj, "Width"));
+    hobj   = pdf_resolve(doc, pdf_dictget(xobj, "Height"));
+    bpcobj = pdf_resolve(doc, pdf_dictget(xobj, "BitsPerComponent"));
+    csobj  = pdf_resolve(doc, pdf_dictget(xobj, "ColorSpace"));
+    imobj  = pdf_resolve(doc, pdf_dictget(xobj, "ImageMask"));
+    decobj = pdf_resolve(doc, pdf_dictget(xobj, "Decode"));
+
+    w = pdfobj_int_of(wobj);
+    h = pdfobj_int_of(hobj);
+    if (w < 1 || h < 1) {
+        return PDF_E_SYNTAX;
+    }
+    imagemask = num_nonzero(imobj);
+    bpc = imagemask ? 1 : pdfobj_int_of(bpcobj);
+    if (!imagemask && bpc != 1 && bpc != 2 && bpc != 4 && bpc != 8 &&
+        bpc != 16) {
+        return PDF_E_UNSUP;
+    }
+    maskinvert = 0;
+    if (imagemask && decobj && decobj->type == PDF_ARRAY &&
+        pdf_arrlen(decobj) >= 1) {
+        maskinvert = num_nonzero(pdf_arrget(decobj, 0));
+    }
+
+    err = pdf_streamdata(doc, xobj, &buf, stopflt);
+    if (err) {
+        pdfbuf_free(&buf);
+        return err;
+    }
+
+    if (stopflt[0] != 0) {
+        if (strcmp(stopflt, "DCTDecode") == 0) {
+            img->kind = PDFIMG_JPEG;
+            img->w = w;
+            img->h = h;
+            img->jpegbuf = buf;          /* ownership moves to img */
+            img->jpeg = img->jpegbuf.p;
+            img->jpeglen = img->jpegbuf.len;
+            return PDF_OK;
+        }
+        if (strcmp(stopflt, "JPXDecode") == 0) {
+            /* JPEG 2000 carries its own geometry and colour space;
+               the dict's /Width /Height /ColorSpace are advisory and
+               may even be absent, so trust the codestream.          */
+            int jw = 0, jh = 0;
+            u32 *pix = NULL;
+
+            err = pdfjpx_decode(buf.p, buf.len, &jw, &jh, &pix);
+            pdfbuf_free(&buf);
+            if (err) {
+                return err;
+            }
+            img->kind = PDFIMG_XRGB32;
+            img->w = jw;
+            img->h = jh;
+            img->pix = pix;
+            return PDF_OK;
+        }
+        pdfbuf_free(&buf);
+        return PDF_E_UNSUP;
+    }
+
+    {
+        u32 *pix = NULL;
+
+        err = expand_pixels(doc, w, h, bpc, imagemask, maskinvert, fillrgb,
+                            csobj, buf.p, buf.len, &pix);
+        pdfbuf_free(&buf);
+        if (err) {
+            return err;
+        }
+        img->kind = PDFIMG_XRGB32;
+        img->w = w;
+        img->h = h;
+        img->pix = pix;
+        return PDF_OK;
+    }
+}
+
+int
+pdfimg_inline(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
+             u32 fillrgb, PdfImg *img)
+{
+    PdfObj *csobj, *decobj;
+    s32 w, h, bpc;
+    int imagemask, maskinvert, isjpeg, isjpx;
+    PdfBuf buf = { 0 };
+    int err;
+
+    memset(img, 0, sizeof *img);
+    if (doc == NULL || dict == NULL) {
+        return PDF_E_SYNTAX;
+    }
+
+    w = pdfobj_int_of(inline_get(doc, dict, "Width", "W"));
+    h = pdfobj_int_of(inline_get(doc, dict, "Height", "H"));
+    if (w < 1 || h < 1) {
+        return PDF_E_SYNTAX;
+    }
+    imagemask = num_nonzero(inline_get(doc, dict, "ImageMask", "IM"));
+    bpc = imagemask
+        ? 1
+        : pdfobj_int_of(inline_get(doc, dict, "BitsPerComponent", "BPC"));
+    if (!imagemask && bpc != 1 && bpc != 2 && bpc != 4 && bpc != 8 &&
+        bpc != 16) {
+        return PDF_E_UNSUP;
+    }
+    csobj = inline_get(doc, dict, "ColorSpace", "CS");
+    decobj = inline_get(doc, dict, "Decode", "D");
+
+    maskinvert = 0;
+    if (imagemask && decobj && decobj->type == PDF_ARRAY &&
+        pdf_arrlen(decobj) >= 1) {
+        maskinvert = num_nonzero(pdf_arrget(decobj, 0));
+    }
+
+    err = inline_filters(doc, dict, data, dlen, &buf, &isjpeg, &isjpx);
+    if (err) {
+        pdfbuf_free(&buf);
+        return err;
+    }
+
+    if (isjpeg) {
+        img->kind = PDFIMG_JPEG;
+        img->w = w;
+        img->h = h;
+        img->jpegbuf = buf;              /* ownership moves to img */
+        img->jpeg = img->jpegbuf.p;
+        img->jpeglen = img->jpegbuf.len;
+        return PDF_OK;
+    }
+    if (isjpx) {
+        int jw = 0, jh = 0;
+        u32 *pix = NULL;
+
+        err = pdfjpx_decode(buf.p, buf.len, &jw, &jh, &pix);
+        pdfbuf_free(&buf);
+        if (err) {
+            return err;
+        }
+        img->kind = PDFIMG_XRGB32;
+        img->w = jw;
+        img->h = jh;
+        img->pix = pix;
+        return PDF_OK;
+    }
+
+    {
+        u32 *pix = NULL;
+
+        err = expand_pixels(doc, w, h, bpc, imagemask, maskinvert, fillrgb,
+                            csobj, buf.p, buf.len, &pix);
+        pdfbuf_free(&buf);
+        if (err) {
+            return err;
+        }
+        img->kind = PDFIMG_XRGB32;
+        img->w = w;
+        img->h = h;
+        img->pix = pix;
+        return PDF_OK;
+    }
+}
+
+void
+pdfimg_free(PdfImg *img)
+{
+    if (img == NULL) {
+        return;
+    }
+    free(img->pix);
+    pdfbuf_free(&img->jpegbuf);
+    memset(img, 0, sizeof *img);
+}

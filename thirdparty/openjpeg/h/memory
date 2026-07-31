@@ -1,0 +1,2 @@
+/* shim: memory.h is an SVR4-ism; string.h has the mem* functions */
+#include <string.h>

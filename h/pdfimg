@@ -1,0 +1,51 @@
+/*
+  PDFRender - image XObject / inline image decoding interface.
+
+  Images decode to one of two forms for the backend:
+    PDFIMG_XRGB32 - w*h words, red in bits 0-7, green 8-15, blue
+                    16-23, bits 24-31 zero (RISC OS 32bpp sprite
+                    pixel order), rows bottom-up NOT applied - row 0
+                    is the TOP row as in PDF; the backend flips.
+    PDFIMG_JPEG   - untouched DCTDecode bytes for SpriteExtend's
+                    JPEG_PlotScaled.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFIMG_H
+#define PDFIMG_H
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdffile.h"
+
+enum {
+    PDFIMG_XRGB32 = 0,
+    PDFIMG_JPEG
+};
+
+typedef struct {
+    int kind;
+    int w, h;
+    u32 *pix;                   /* XRGB32: malloc'd w*h words         */
+    const u8 *jpeg;             /* JPEG: pointer into jpegbuf         */
+    u32 jpeglen;
+    PdfBuf jpegbuf;             /* owns DCT bytes when filters preceded */
+} PdfImg;
+
+/* Decode an image XObject (stream) to img.  fillrgb paints /ImageMask
+   images (1 = paint fill colour, 0 = white in this version - no
+   transparency yet).  Caller must pdfimg_free().                     */
+int pdfimg_load(PdfDoc *doc, PdfObj *xobj, u32 fillrgb, PdfImg *img);
+
+/* Decode an inline image (BI/ID/EI): dict is the parsed BI dict with
+   abbreviated keys expanded by the caller or not (both key spellings
+   are accepted here); data/dlen is the raw byte span after ID.       */
+int pdfimg_inline(PdfDoc *doc, PdfObj *dict, const u8 *data, u32 dlen,
+                  u32 fillrgb, PdfImg *img);
+
+void pdfimg_free(PdfImg *img);
+
+#endif

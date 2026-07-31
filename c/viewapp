@@ -1,0 +1,1259 @@
+/*
+  PDFRenderV - the desktop viewer (absolute application).
+
+  Double-clicking a PDF makes the Filer run Alias$@RunType_ADF, which
+  the module points at this small AIF binary (*Run <viewer> file).
+  All document work happens in the PDFRenderV module through its
+  SWIs; this application is only the window, the toolbar and the
+  PDriver print loop.  (An earlier in-module viewer using CMunge's
+  module-is-runnable entry died inside Wimp_Initialise on the Kinetic
+  Box RO5.31 softload - entering an RMA module as an application is
+  broken there, so the viewer became a plain application, which is
+  solid everywhere.)
+
+  The viewer opens a scrollable document window with a toolbar pane:
+    [<] [page n/N] [>]   [-] [zoom%] [+]   [Print]
+  The page is rendered by the same engine the SWIs use, into a 32bpp
+  180dpi sprite kept in a dynamic area (so big zooms do not fight the
+  CLib heap), and plotted 1:1 pixels on redraw.  Print re-runs the
+  renderer inside a PDriver job, so paths and fonts reach the printer
+  as vectors, not as a screen dump.
+
+  Wimp/PDriver interfaces per the PRMs: Wimp_CreateWindow block
+  (88-byte header + 32-byte icons), pane technique on open events,
+  PDriver_SelectJob/GiveRectangle/DrawPage/GetRectangle job loop with
+  rectangles in OS units and positions in millipoints.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef signed int s32;
+typedef signed long long s64;
+typedef s32 fix;
+#define FX_ONE 0x10000
+#define FX_FROMINT(i) ((fix)((u32)(s32)(i) << 16))
+#define FX_TOINT(f)   ((s32)(f) >> 16)
+#define fx_mul(a, b)  ((fix)(((s64)(a) * (s64)(b)) >> 16))
+#define fx_div(a, b)  ((fix)(((s64)(a) << 16) / (s64)(b)))
+
+/* PDFRenderV SWIs (chunk base &5B740 - placeholder allocation)      */
+#define PDFRenderV_Open      0x5B740
+#define PDFRenderV_Close     0x5B741
+#define PDFRenderV_Info      0x5B742
+#define PDFRenderV_PageSize  0x5B743
+#define PDFRenderV_Render    0x5B744
+#define PDFRenderV_ExtractText 0x5B745
+
+#define XOS_File                (0x08)
+#define XOS_Find                (0x0D)
+#define XOS_SpriteOp            (0x2E)
+#define XOS_DynamicArea         (0x66)
+#define XOS_ReadModeVariable    (0x35)
+#define XWimp_Initialise        (0x400C0)
+#define XWimp_CreateWindow      (0x400C1)
+#define XWimp_OpenWindow        (0x400C5)
+#define XWimp_CloseWindow       (0x400C6)
+#define XWimp_Poll              (0x400C7)
+#define XWimp_RedrawWindow      (0x400C8)
+#define XWimp_GetRectangle      (0x400CA)
+#define XWimp_GetWindowState    (0x400CB)
+#define XWimp_SetIconState      (0x400CD)
+#define XWimp_SetCaretPosition  (0x400D2)
+#define XWimp_CreateMenu        (0x400D4)
+#define XWimp_DecodeMenu        (0x400D5)
+#define XWimp_ForceRedraw       (0x400D1)
+#define XWimp_SetExtent         (0x400D7)
+#define XWimp_CloseDown         (0x400DD)
+#define XWimp_ReportError       (0x400DF)
+#define XPDriver_PageSize       (0x80143)
+#define XPDriver_SelectJob      (0x80145)
+#define XPDriver_EndJob         (0x80148)
+#define XPDriver_AbortJob       (0x80149)
+#define XPDriver_GiveRectangle  (0x8014B)
+#define XPDriver_DrawPage       (0x8014C)
+#define XPDriver_GetRectangle   (0x8014D)
+#define XWimp_SendMessage       (0x400E7)
+#define XWimp_GetPointerInfo    (0x400CF)
+#define XWimp_UpdateWindow      (0x400C9)
+#define XOS_GBPB                (0x0C)
+#define XHourglass_On           (0x406C0)
+#define XHourglass_Off          (0x406C1)
+
+#define SPRITE_MODE_32BPP_180 \
+    ((6u << 27) | (180u << 14) | (180u << 1) | 1u)
+
+#define TOOLH 52                        /* toolbar height, OS units   */
+
+/* Wimp message numbers (PRM / ROOL wiki: Message Codes)              */
+#define Msg_DataSave        0x1
+#define Msg_DataSaveAck     0x2
+#define Msg_DataLoad        0x3
+#define Msg_ClaimEntity     0xF
+#define Msg_DataRequest     0x10
+#define ENTITY_CLIPBOARD    4           /* bit 2                      */
+
+/* One glyph as PDFRenderV_ExtractText returns it: device units,
+   16.16, origin bottom left of the page.                            */
+typedef struct {
+    s32 x0, y0, x1, y1;
+    u32 ch;
+} Glyph;
+
+/* toolbar icon numbers (creation order below) */
+#define IC_PREV  0
+#define IC_PAGE  1
+#define IC_NEXT  2
+#define IC_ZOUT  3
+#define IC_ZOOM  4
+#define IC_ZIN   5
+#define IC_PRINT 6
+
+static const int zoomsteps[] = { 25, 50, 75, 100, 125, 150, 200, 300, 400 };
+#define NZOOM ((int) (sizeof zoomsteps / sizeof zoomsteps[0]))
+
+typedef struct {
+    int handle;                 /* module document handle             */
+    u32 npages;
+    char filename[256];
+    u32 page;                   /* 0-based                            */
+    int zoom;                   /* percent                            */
+    /* sprite in a dynamic area */
+    int danum;
+    u8 *area;
+    int sprw, sprh;             /* pixels                             */
+    /* wimp */
+    int task;
+    int win, pane;
+    int xeig, yeig;
+    char pagetxt[16], zoomtxt[12];
+    char titletxt[300];
+    /* text selection */
+    Glyph *glyphs;
+    u32 nglyphs;
+    int selfrom, selto;         /* glyph indices, -1 = no selection   */
+    int dragging;
+    int anchor;
+    /* clipboard */
+    char *clip;                 /* our selection, if we own it        */
+    u32 cliplen;
+    int ownclip;
+    int savemyref;              /* my_ref of the DataSave we sent     */
+    int quit;
+} Viewer;
+
+static Viewer vw;
+
+/* --- small helpers -------------------------------------------------- */
+
+/* Startup-stage breadcrumbs: tiny files on HostFS, readable from the
+   host while debugging the entry path.  Compiled out for release.    */
+#define VIEWER_DEBUG 0
+
+static void
+dbg(int n)
+{
+#if VIEWER_DEBUG
+    char name[64];
+    sprintf(name, "HostFS::HostFS.$.PDFTest.dbg%d", n);
+    _swix(0x08, _INR(0, 2) | _INR(4, 5), 10, name, 0xFFD, name, name + 4);
+#else
+    (void) n;
+#endif
+}
+
+static void
+report(const char *msg)
+{
+    struct {
+        int num;
+        char text[200];
+    } eb;
+
+    eb.num = 0;
+    strncpy(eb.text, msg, sizeof eb.text - 1);
+    eb.text[sizeof eb.text - 1] = 0;
+    _swix(XWimp_ReportError, _INR(0, 2), &eb, 1, "PDFRenderV");
+}
+
+static void
+report_oserr(_kernel_oserror *e)
+{
+    if (e != NULL) {
+        _swix(XWimp_ReportError, _INR(0, 2), e, 1, "PDFRenderV");
+    }
+}
+
+static int
+readmodevar(int var)
+{
+    int v = 0;
+
+    _swix(XOS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, var, &v);
+    return v;
+}
+
+/* --- rendering ------------------------------------------------------ */
+
+/* Make sure our document handle is still good.  It will not be if the
+   module has been reloaded under us (*RMKill/*RMLoad during
+   development, or a user updating the module) - the handles live in
+   the module and die with it.  Reopen the file rather than making the
+   window useless.  Returns 0 if we have a usable handle.            */
+static int
+ensure_doc(void)
+{
+    int pages = 0, ver = 0, handle = 0, npages = 0;
+
+    if (_swix(PDFRenderV_Info, _IN(0) | _OUT(0) | _OUT(1),
+              vw.handle, &pages, &ver) == NULL) {
+        return 0;                       /* still valid               */
+    }
+    if (_swix(PDFRenderV_Open, _INR(0, 1) | _OUT(0) | _OUT(1),
+              0, vw.filename, &handle, &npages) != NULL) {
+        return -1;
+    }
+    vw.handle = handle;
+    vw.npages = (u32) npages;
+    if (vw.page >= vw.npages) {
+        vw.page = vw.npages ? vw.npages - 1 : 0;
+    }
+    return 0;
+}
+
+static void load_glyphs(fix zoomfix);
+static void free_glyphs(void);
+static void clipboard_copy(void);
+static void save_selection(void);
+
+static void
+free_sprite(void)
+{
+    if (vw.danum) {
+        _swix(XOS_DynamicArea, _INR(0, 1), 1, vw.danum);
+        vw.danum = 0;
+        vw.area = NULL;
+    }
+}
+
+/* Render current page at current zoom into a fresh dynamic-area
+   sprite, using the module's renderer.  Returns 0 on success.        */
+static int
+render_page(void)
+{
+    int wmpt = 0, hmpt = 0, rot = 0, w, h;
+    u32 areasize;
+    _kernel_oserror *e;
+
+    if (ensure_doc() != 0) {
+        report("The document could not be reopened");
+        return -1;
+    }
+    e = _swix(PDFRenderV_PageSize, _INR(0, 1) | _OUTR(0, 2),
+              vw.handle, vw.page + 1, &wmpt, &hmpt, &rot);
+    if (e != NULL) {
+        report_oserr(e);
+        return -1;
+    }
+    if (rot == 90 || rot == 270) {
+        int t = wmpt;
+        wmpt = hmpt;
+        hmpt = t;
+    }
+    /* 100% = actual size on a 90dpi screen: 1pt = 1.25px; sizes are
+       millipoints so px = mpt * zoom / 80000                         */
+    w = (int) (((s64) wmpt * vw.zoom) / 80000);
+    h = (int) (((s64) hmpt * vw.zoom) / 80000);
+    if (w < 16) w = 16;
+    if (h < 16) h = 16;
+    if (w > 4096) w = 4096;
+    if (h > 4096) h = 4096;
+
+    free_sprite();
+    areasize = 16 + 44 + (u32) w * (u32) h * 4 + 256;
+    {
+        int danum = 0;
+        u8 *base = NULL;
+        e = _swix(XOS_DynamicArea,
+                  _INR(0, 8) | _OUT(1) | _OUT(3),
+                  0, -1, areasize, -1, 0, areasize, 0, 0,
+                  "PDFRenderV page", &danum, &base);
+        if (e != NULL) {
+            report_oserr(e);
+            return -1;
+        }
+        vw.danum = danum;
+        vw.area = base;
+    }
+    ((u32 *) vw.area)[0] = areasize;
+    ((u32 *) vw.area)[1] = 0;
+    ((u32 *) vw.area)[2] = 16;
+    ((u32 *) vw.area)[3] = 16;
+    e = _swix(XOS_SpriteOp, _INR(0, 6),
+              15 + 256, vw.area, "page", 0, w, h, SPRITE_MODE_32BPP_180);
+    if (e == NULL) {
+        /* flags bit 0: white background.  The render is synchronous
+           and can take a moment - show the hourglass.                */
+        _swix(XHourglass_On, 0);
+        e = _swix(PDFRenderV_Render, _INR(0, 4),
+                  1, vw.handle, vw.page + 1, vw.area, vw.area + 16);
+        _swix(XHourglass_Off, 0);
+    }
+    if (e != NULL) {
+        report_oserr(e);
+        free_sprite();
+        return -1;
+    }
+    vw.sprw = w;
+    vw.sprh = h;
+    /* selection follows the page, at the same zoom as the pixels    */
+    load_glyphs((fix) (((s64) vw.zoom << 16) / 80));
+    return 0;
+}
+
+/* --- text selection -------------------------------------------------- */
+
+static void
+free_glyphs(void)
+{
+    free(vw.glyphs);
+    vw.glyphs = NULL;
+    vw.nglyphs = 0;
+    vw.selfrom = vw.selto = -1;
+}
+
+/* Pull the page's glyphs at the zoom the sprite was rendered with, so
+   the boxes line up with what is on screen.                          */
+static void
+load_glyphs(fix zoomfix)
+{
+    int need = 0, count = 0;
+    _kernel_oserror *e;
+
+    free_glyphs();
+    e = _swix(PDFRenderV_ExtractText, _INR(0, 5) | _OUT(0) | _OUT(1),
+              0, vw.handle, vw.page + 1, zoomfix, 0, 0, &need, &count);
+    if (e != NULL || need <= 0 || count <= 0) {
+        return;                         /* a page may hold no text    */
+    }
+    vw.glyphs = malloc((u32) need);
+    if (vw.glyphs == NULL) {
+        return;
+    }
+    e = _swix(PDFRenderV_ExtractText, _INR(0, 5) | _OUT(0) | _OUT(1),
+              0, vw.handle, vw.page + 1, zoomfix, vw.glyphs, need,
+              &need, &count);
+    if (e != NULL) {
+        free_glyphs();
+        return;
+    }
+    vw.nglyphs = (u32) count;
+}
+
+/* Work-area coordinates of a glyph box, in OS units.  The sprite is
+   plotted 1:1 in screen pixels from the work-area origin, so a device
+   unit is one pixel, i.e. 1<<eig OS units.                           */
+static void
+glyph_box(const Glyph *g, int *x0, int *y0, int *x1, int *y1)
+{
+    int top = -(vw.sprh << vw.yeig);
+
+    *x0 = (FX_TOINT(g->x0)) << vw.xeig;
+    *x1 = (FX_TOINT(g->x1)) << vw.xeig;
+    /* device y counts up from the sprite's bottom, which sits at the
+       bottom of the work area                                        */
+    *y0 = top + ((FX_TOINT(g->y0)) << vw.yeig);
+    *y1 = top + ((FX_TOINT(g->y1)) << vw.yeig);
+}
+
+/* Index of the glyph nearest a work-area point, or -1.  Prefers a
+   direct hit; otherwise takes the nearest on the closest line, so a
+   drag through the gaps between words still selects sensibly.       */
+static int
+glyph_at(int wx, int wy)
+{
+    u32 i;
+    int best = -1;
+    long bestd = 0;
+
+    for (i = 0; i < vw.nglyphs; i++) {
+        int x0, y0, x1, y1;
+        long dx, dy, d;
+
+        glyph_box(&vw.glyphs[i], &x0, &y0, &x1, &y1);
+        if (wx >= x0 && wx < x1 && wy >= y0 && wy < y1) {
+            return (int) i;
+        }
+        dy = wy < y0 ? y0 - wy : wy > y1 ? wy - y1 : 0;
+        dx = wx < x0 ? x0 - wx : wx > x1 ? wx - x1 : 0;
+        d = dy * 8 + dx;                /* lines matter more than columns */
+        if (best < 0 || d < bestd) {
+            best = (int) i;
+            bestd = d;
+        }
+    }
+    return best;
+}
+
+/* Build the selected text, inserting spaces and newlines from the
+   geometry (a PDF has neither).                                     */
+static char *
+selection_text(u32 *lenp)
+{
+    int from = vw.selfrom, to = vw.selto, t;
+    u32 i, n = 0, cap;
+    char *out;
+
+    *lenp = 0;
+    if (from < 0 || to < 0 || vw.glyphs == NULL) {
+        return NULL;
+    }
+    if (from > to) {
+        t = from;
+        from = to;
+        to = t;
+    }
+    cap = (u32) (to - from + 2) * 2 + 8;
+    out = malloc(cap);
+    if (out == NULL) {
+        return NULL;
+    }
+    for (i = (u32) from; i <= (u32) to && i < vw.nglyphs; i++) {
+        const Glyph *g = &vw.glyphs[i];
+
+        if (i > (u32) from) {
+            const Glyph *p = &vw.glyphs[i - 1];
+            int newline = g->y0 < p->y0 - (p->y1 - p->y0) / 2 ||
+                          g->y0 > p->y0 + (p->y1 - p->y0) / 2;
+            if (newline) {
+                out[n++] = 10;
+            } else if (g->x0 > p->x1 + (p->x1 - p->x0) / 3) {
+                out[n++] = ' ';         /* visible gap = word break   */
+            }
+        }
+        if (g->ch >= 32) {
+            out[n++] = (char) g->ch;
+        }
+        if (n + 4 >= cap) {
+            break;
+        }
+    }
+    out[n] = 0;
+    *lenp = n;
+    return out;
+}
+
+/* --- window management ---------------------------------------------- */
+
+static void
+update_toolbar_texts(void)
+{
+    int blk[4];
+
+    sprintf(vw.pagetxt, "%u/%u", vw.page + 1, vw.npages);
+    sprintf(vw.zoomtxt, "%d%%", vw.zoom);
+    /* Wimp_SetIconState takes a 4-word block in R1                   */
+    blk[0] = vw.pane;
+    blk[1] = IC_PAGE;
+    blk[2] = 0;
+    blk[3] = 0;
+    _swix(XWimp_SetIconState, _IN(1), blk);
+    blk[1] = IC_ZOOM;
+    _swix(XWimp_SetIconState, _IN(1), blk);
+}
+
+static void
+set_extent(void)
+{
+    int ext[4];
+
+    /* the top TOOLH of the work area sits under the toolbar pane     */
+    ext[0] = 0;
+    ext[1] = -(vw.sprh << vw.yeig);
+    ext[2] = vw.sprw << vw.xeig;
+    ext[3] = TOOLH;
+    _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
+    _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
+          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, TOOLH);
+}
+
+/* icon block helper: bbox + flags + 12 bytes of data                 */
+static void
+mkicon(int *p, int x0, int y0, int x1, int y1, unsigned flags,
+       const char *text, char *indbuf, int indlen)
+{
+    p[0] = x0;
+    p[1] = y0;
+    p[2] = x1;
+    p[3] = y1;
+    p[4] = (int) flags;
+    memset(p + 5, 0, 12);
+    if (indbuf != NULL) {
+        p[5] = (int) indbuf;
+        p[6] = -1;
+        p[7] = indlen;
+    } else {
+        strncpy((char *) (p + 5), text, 11);
+    }
+}
+
+static int
+create_windows(void)
+{
+    int blk[120];
+    _kernel_oserror *e;
+
+    /* --- main document window --- */
+    memset(blk, 0, sizeof blk);
+    blk[0] = 200;                       /* visible area               */
+    blk[1] = 200;
+    blk[2] = 200 + 800;
+    blk[3] = 200 + 700;
+    blk[6] = -1;                        /* open at top                */
+    /* moveable; new-style control icons: back/close/title/toggle/
+       vscroll/adjust/hscroll                                         */
+    blk[7] = (int) 0xFF000002u;
+    ((u8 *) &blk[8])[0] = 7;            /* title fg                   */
+    ((u8 *) &blk[8])[1] = 2;            /* title bg                   */
+    ((u8 *) &blk[8])[2] = 7;            /* work fg                    */
+    ((u8 *) &blk[8])[3] = 1;            /* work bg                    */
+    ((u8 *) &blk[9])[0] = 3;            /* scroll outer               */
+    ((u8 *) &blk[9])[1] = 1;            /* scroll inner               */
+    ((u8 *) &blk[9])[2] = 12;           /* highlight                  */
+    blk[4] = 0;                         /* scroll x                   */
+    blk[5] = TOOLH;                     /* scroll y: extent top up    */
+    blk[10] = 0;                        /* work area extent           */
+    blk[11] = -(vw.sprh << vw.yeig);
+    blk[12] = vw.sprw << vw.xeig;
+    blk[13] = TOOLH;                    /* top strip under the pane   */
+    blk[14] = 0x00000109;               /* title: text+indirected+ctr */
+    /* work-area button type 10 (click/drag): without this the Wimp
+       never reports clicks in the page and text cannot be selected  */
+    blk[15] = 10 << 12;
+    blk[16] = 1;                        /* wimp sprite area           */
+    blk[17] = 0;                        /* min w/h                    */
+    blk[18] = (int) vw.titletxt;        /* indirected title           */
+    blk[19] = -1;
+    blk[20] = (int) sizeof vw.titletxt;
+    blk[21] = 0;                        /* no icons                   */
+    e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.win);
+    if (e != NULL) {
+        report_oserr(e);
+        return -1;
+    }
+
+    /* --- toolbar pane --- */
+    memset(blk, 0, sizeof blk);
+    blk[0] = 200;
+    blk[1] = 900;
+    blk[2] = 200 + 560;
+    blk[3] = 900 + TOOLH;
+    blk[6] = -1;
+    /* pane + auto-redraw + no control icons (new-style, none set)    */
+    blk[7] = (int) 0x80000030u;
+    ((u8 *) &blk[8])[0] = 0xFF;         /* no frame/title             */
+    ((u8 *) &blk[8])[1] = 2;
+    ((u8 *) &blk[8])[2] = 7;
+    ((u8 *) &blk[8])[3] = 1;
+    ((u8 *) &blk[9])[0] = 3;
+    ((u8 *) &blk[9])[1] = 1;
+    ((u8 *) &blk[9])[2] = 12;
+    blk[10] = 0;
+    blk[11] = -TOOLH;
+    blk[12] = 1600;
+    blk[13] = 0;
+    blk[14] = 0;                        /* no title text              */
+    blk[15] = 0;
+    blk[16] = 1;
+    blk[17] = 0;
+    blk[18] = 0;
+    blk[19] = 0;
+    blk[20] = 0;
+    blk[21] = 7;                        /* icons follow               */
+    {
+        /* icon flags: text|border|hcentre|vcentre|filled, click
+           button type, black on grey                                 */
+        unsigned bf = 0x1700303Du;
+        unsigned df = 0x1700013Du;      /* display only: no button    */
+        int *ic = blk + 22;
+        mkicon(ic + 0, 8, -48, 56, -4, bf, "<", NULL, 0);
+        mkicon(ic + 8, 64, -48, 176, -4, df | 0x100, NULL,
+               vw.pagetxt, sizeof vw.pagetxt);
+        mkicon(ic + 16, 184, -48, 232, -4, bf, ">", NULL, 0);
+        mkicon(ic + 24, 256, -48, 304, -4, bf, "-", NULL, 0);
+        mkicon(ic + 32, 312, -48, 400, -4, df | 0x100, NULL,
+               vw.zoomtxt, sizeof vw.zoomtxt);
+        mkicon(ic + 40, 408, -48, 456, -4, bf, "+", NULL, 0);
+        mkicon(ic + 48, 480, -48, 592, -4, bf, "Print", NULL, 0);
+    }
+    e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.pane);
+    if (e != NULL) {
+        report_oserr(e);
+        return -1;
+    }
+    return 0;
+}
+
+/* Open the main window (from an open request block) and glue the
+   toolbar pane above its visible area.                               */
+static void
+open_with_pane(int *open)
+{
+    int pblk[8];
+
+    /* The pane overlays the top TOOLH strip of the main window's
+       visible area (the work-area extent reserves that strip), so
+       the title bar stays above and unobscured.                      */
+    pblk[0] = vw.pane;
+    pblk[1] = open[1];
+    pblk[2] = open[4] - TOOLH;
+    pblk[3] = open[3];
+    pblk[4] = open[4];
+    pblk[5] = 0;
+    pblk[6] = 0;
+    pblk[7] = open[7];                  /* behind                     */
+    _swix(XWimp_OpenWindow, _IN(1), pblk);
+    open[7] = vw.pane;                  /* main directly below pane   */
+    _swix(XWimp_OpenWindow, _IN(1), open);
+}
+
+/* Paint the selection as EOR'd rectangles over the plotted page, so
+   it inverts whatever is underneath and needs no repaint to remove.
+   ox/oy are the work-area origin in screen coordinates.             */
+static void
+draw_selection(int ox, int oy)
+{
+    int from = vw.selfrom, to = vw.selto, t;
+    u32 i;
+
+    if (from < 0 || to < 0 || vw.glyphs == NULL) {
+        return;
+    }
+    if (from > to) {
+        t = from;
+        from = to;
+        to = t;
+    }
+    /* GCOL action 3 = exclusive OR, colour white: inverts            */
+    _swix(0x40743, _IN(0) | _INR(3, 4), 0xFFFFFF00u, 0, 3);
+    for (i = (u32) from; i <= (u32) to && i < vw.nglyphs; i++) {
+        int x0, y0, x1, y1;
+
+        glyph_box(&vw.glyphs[i], &x0, &y0, &x1, &y1);
+        /* PLOT 4 = move absolute, PLOT &65 = rectangle fill to point */
+        _swix(0x45, _INR(0, 2), 4, ox + x0, oy + y0);
+        _swix(0x45, _INR(0, 2), 0x65, ox + x1 - 1, oy + y1 - 1);
+    }
+}
+
+static void
+redraw_main(int *blk)
+{
+    int more = 0;
+
+    _swix(XWimp_RedrawWindow, _IN(1) | _OUT(0), blk, &more);
+    while (more) {
+        /* work-area origin in screen coords                          */
+        int ox = blk[1] - blk[5];
+        int oy = blk[4] - blk[6];
+        int sx = ox;
+        int sy = oy - (vw.sprh << vw.yeig);
+        if (vw.area != NULL) {
+            _swix(XOS_SpriteOp, _INR(0, 7),
+                  52 + 512, vw.area, vw.area + 16, sx, sy, 0, 0, 0);
+        }
+        draw_selection(ox, oy);
+        _swix(XWimp_GetRectangle, _IN(1) | _OUT(0), blk, &more);
+    }
+}
+
+static void
+redraw_doc(void)
+{
+    _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
+          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, TOOLH);
+}
+
+static void
+rerender(void)
+{
+    render_page();
+    update_toolbar_texts();
+    set_extent();
+}
+
+/* --- printing ------------------------------------------------------- */
+
+static void
+print_page(void)
+{
+    _kernel_oserror *e;
+    int job = 0, oldjob = 0;
+    int psize[6];
+    int wmpt = 0, hmpt = 0, rot = 0;
+    fix zoomfix, zx, zy;
+    int devw, devh;
+
+    if (ensure_doc() != 0) {
+        report("The document could not be reopened");
+        return;
+    }
+    e = _swix(XOS_Find, _INR(0, 1) | _OUT(0), 0x8F, "printer:", &job);
+    if (e != NULL || job == 0) {
+        report("No printer driver is active (load Printers first)");
+        return;
+    }
+    e = _swix(XPDriver_SelectJob, _INR(0, 1) | _OUT(0),
+              job, "PDFRenderV", &oldjob);
+    if (e != NULL) {
+        _swix(XOS_Find, _INR(0, 1), 0, job);
+        report_oserr(e);
+        return;
+    }
+    e = _swix(XPDriver_PageSize, _OUTR(1, 6),
+              &psize[0], &psize[1], &psize[2], &psize[3],
+              &psize[4], &psize[5]);
+    if (e == NULL) {
+        e = _swix(PDFRenderV_PageSize, _INR(0, 1) | _OUTR(0, 2),
+                  vw.handle, vw.page + 1, &wmpt, &hmpt, &rot);
+    }
+    if (e == NULL) {
+        int prw_os = (psize[4] - psize[2]) / 400;   /* printable, OS  */
+        int prh_os = (psize[5] - psize[3]) / 400;
+        fix pw = (fix) (((s64) wmpt << 16) / 1000); /* points, 16.16  */
+        fix ph = (fix) (((s64) hmpt << 16) / 1000);
+        if (rot == 90 || rot == 270) {
+            fix t = pw;
+            pw = ph;
+            ph = t;
+        }
+        /* actual size (1pt = 2.5 OS units), shrunk to fit            */
+        zoomfix = 5 << 15;
+        zx = fx_div(FX_FROMINT(prw_os), pw);
+        zy = fx_div(FX_FROMINT(prh_os), ph);
+        if (zx < zoomfix) zoomfix = zx;
+        if (zy < zoomfix) zoomfix = zy;
+        devw = FX_TOINT(fx_mul(pw, zoomfix));
+        devh = FX_TOINT(fx_mul(ph, zoomfix));
+
+        {
+            int rect[4], pos[2], xform[4], outrect[4];
+            int more = 0, id = 0;
+
+            rect[0] = 0;
+            rect[1] = 0;
+            rect[2] = devw + 4;
+            rect[3] = devh + 4;
+            xform[0] = 1 << 16;
+            xform[1] = 0;
+            xform[2] = 0;
+            xform[3] = 1 << 16;
+            pos[0] = psize[2];
+            pos[1] = psize[3];
+            e = _swix(XPDriver_GiveRectangle, _INR(0, 4),
+                      1, rect, xform, pos, 0xFFFFFF00u);
+            if (e == NULL) {
+                e = _swix(XPDriver_DrawPage,
+                          _INR(0, 3) | _OUT(0) | _OUT(2),
+                          1, outrect, vw.page + 1, 0, &more, &id);
+            }
+            while (e == NULL && more != 0) {
+                /* flags bit 1: render direct to current output (the
+                   printer job intercepts the Draw/Font/sprite calls);
+                   R3 = zoom, device units per point, 16.16           */
+                e = _swix(PDFRenderV_Render, _INR(0, 3),
+                          2, vw.handle, vw.page + 1, zoomfix);
+                if (e != NULL) {
+                    break;
+                }
+                e = _swix(XPDriver_GetRectangle,
+                          _IN(1) | _OUT(0) | _OUT(2),
+                          outrect, &more, &id);
+            }
+        }
+    }
+    if (e != NULL) {
+        _swix(XPDriver_AbortJob, _IN(0), job);
+        _swix(XOS_Find, _INR(0, 1), 0, job);
+        report_oserr(e);
+        return;
+    }
+    e = _swix(XPDriver_EndJob, _IN(0), job);
+    _swix(XOS_Find, _INR(0, 1), 0, job);
+    report_oserr(e);
+}
+
+/* Write the selection to a text file alongside the document, which
+   is the useful thing to do without a full drag-and-drop save box. */
+static void
+save_selection(void)
+{
+    u32 len = 0;
+    char *text = selection_text(&len);
+    char path[300];
+    _kernel_oserror *e;
+
+    if (text == NULL || len == 0) {
+        free(text);
+        return;
+    }
+    sprintf(path, "%.280s/txt", vw.filename);
+    e = _swix(XOS_File, _INR(0, 5), 10, path, 0xFFF, 0,
+              text, text + len);
+    free(text);
+    if (e != NULL) {
+        report_oserr(e);
+    } else {
+        char msg[340];
+        sprintf(msg, "Saved %u characters to %.290s", len, path);
+        report(msg);
+    }
+}
+
+/* --- menu ------------------------------------------------------------- */
+
+/* A plain Wimp menu: 28-byte header then 24-byte items.  Built by
+   hand rather than via the Toolbox so the viewer stays a single
+   self-contained binary.                                            */
+#define MENU_COPY   0
+#define MENU_ALL    1
+#define MENU_SAVE   2
+#define MENU_ITEMS  3
+
+static struct {
+    char title[12];
+    char tfcol, tbcol, wfcol, wbcol;
+    int width, height, gap;
+    struct {
+        int flags;
+        int submenu;
+        int iconflags;
+        char text[12];
+    } item[MENU_ITEMS];
+} selmenu;
+
+static void
+build_menu(void)
+{
+    static const char *const names[MENU_ITEMS] = {
+        "Copy", "Select all", "Save text"
+    };
+    int i;
+
+    memset(&selmenu, 0, sizeof selmenu);
+    strcpy(selmenu.title, "Text");
+    selmenu.tfcol = 7;
+    selmenu.tbcol = 2;
+    selmenu.wfcol = 7;
+    selmenu.wbcol = 0;
+    selmenu.width = 200;
+    selmenu.height = 44;
+    selmenu.gap = 0;
+    for (i = 0; i < MENU_ITEMS; i++) {
+        selmenu.item[i].flags = 0;
+        selmenu.item[i].submenu = -1;
+        selmenu.item[i].iconflags = 0x07000021;     /* text, filled  */
+        strcpy(selmenu.item[i].text, names[i]);
+    }
+    selmenu.item[MENU_ITEMS - 1].flags |= 0x80;     /* last item     */
+}
+
+/* Grey Copy and Save when there is nothing selected.                */
+static void
+update_menu(void)
+{
+    int shade = (vw.selfrom < 0 || vw.selto < 0) ? 0x400000 : 0;
+
+    selmenu.item[MENU_COPY].iconflags =
+        0x07000021 | (u32) shade;
+    selmenu.item[MENU_SAVE].iconflags =
+        0x07000021 | (u32) shade;
+    selmenu.item[MENU_ALL].iconflags =
+        0x07000021 | (vw.nglyphs ? 0 : 0x400000);
+}
+
+/* --- clipboard -------------------------------------------------------- */
+
+/* Claim the global clipboard for our selection (Message_ClaimEntity,
+   broadcast; the owner then answers Message_DataRequest).           */
+static void
+clipboard_copy(void)
+{
+    int blk[16];
+    u32 len = 0;
+    char *text = selection_text(&len);
+
+    if (text == NULL || len == 0) {
+        free(text);
+        return;
+    }
+    free(vw.clip);
+    vw.clip = text;
+    vw.cliplen = len;
+    vw.ownclip = 1;
+
+    memset(blk, 0, sizeof blk);
+    blk[0] = 24;                        /* size                       */
+    blk[3] = 0;                         /* your_ref                   */
+    blk[4] = Msg_ClaimEntity;
+    blk[5] = ENTITY_CLIPBOARD;
+    _swix(XWimp_SendMessage, _INR(0, 2), 17, blk, 0);   /* broadcast  */
+}
+
+/* Someone wants the clipboard: offer it as plain text.              */
+static void
+clipboard_send(int *msg)
+{
+    int blk[16];
+    int theirtask = msg[1];
+
+    if (!vw.ownclip || vw.clip == NULL) {
+        return;
+    }
+    if ((msg[9] & ENTITY_CLIPBOARD) == 0) {
+        return;                         /* +36 flags: not clipboard   */
+    }
+    memset(blk, 0, sizeof blk);
+    blk[0] = 60;
+    blk[3] = msg[2];                    /* your_ref = their my_ref    */
+    blk[4] = Msg_DataSave;
+    blk[5] = msg[5];                    /* window                     */
+    blk[6] = msg[6];                    /* icon                       */
+    blk[7] = msg[7];                    /* x                          */
+    blk[8] = msg[8];                    /* y                          */
+    blk[9] = (int) vw.cliplen;          /* estimated size             */
+    blk[10] = 0xFFF;                    /* filetype: Text             */
+    strcpy((char *) &blk[11], "Selection");
+    _swix(XWimp_SendMessage, _INR(0, 2), 17, blk, theirtask);
+    vw.savemyref = blk[2];              /* filled in by the Wimp      */
+}
+
+/* They answered with somewhere to put it: write the file and tell
+   them where it is.                                                 */
+static void
+clipboard_saveack(int *msg)
+{
+    const char *path = (const char *) &msg[11];
+    int blk[16];
+    _kernel_oserror *e;
+
+    if (!vw.ownclip || vw.clip == NULL) {
+        return;
+    }
+    e = _swix(XOS_File, _INR(0, 5), 10, path, 0xFFF, 0,
+              vw.clip, vw.clip + vw.cliplen);
+    if (e != NULL) {
+        report_oserr(e);
+        return;
+    }
+    memcpy(blk, msg, 60);
+    blk[0] = 60;
+    blk[3] = msg[2];                    /* your_ref = their my_ref    */
+    blk[4] = Msg_DataLoad;
+    blk[9] = (int) vw.cliplen;
+    blk[10] = 0xFFF;
+    _swix(XWimp_SendMessage, _INR(0, 2), 17, blk, msg[1]);
+}
+
+/* --- event handling ------------------------------------------------- */
+
+static void
+toolbar_click(int icon)
+{
+    switch (icon) {
+    case IC_PREV:
+        if (vw.page > 0) {
+            vw.page--;
+            rerender();
+        }
+        break;
+    case IC_NEXT:
+        if (vw.page + 1 < vw.npages) {
+            vw.page++;
+            rerender();
+        }
+        break;
+    case IC_ZOUT:
+    case IC_ZIN:
+        {
+            int i, cur = 0;
+            for (i = 0; i < NZOOM; i++) {
+                if (zoomsteps[i] == vw.zoom) {
+                    cur = i;
+                }
+            }
+            if (icon == IC_ZOUT && cur > 0) {
+                vw.zoom = zoomsteps[cur - 1];
+                rerender();
+            } else if (icon == IC_ZIN && cur < NZOOM - 1) {
+                vw.zoom = zoomsteps[cur + 1];
+                rerender();
+            }
+        }
+        break;
+    case IC_PRINT:
+        print_page();
+        break;
+    }
+}
+
+static void
+poll_loop(void)
+{
+    int blk[64];
+    int event;
+
+    while (!vw.quit) {
+        if (_swix(XWimp_Poll, _INR(0, 1) | _OUT(0),
+                  vw.dragging ? 0x30 : 0x31, blk, &event) != NULL) {
+            return;
+        }
+        switch (event) {
+        case 0:                         /* null: tracking a drag      */
+            if (vw.dragging) {
+                int pi[8], st[16], wx, wy, idx;
+
+                _swix(XWimp_GetPointerInfo, _IN(1), pi);
+                if ((pi[2] & 0x54) == 0) {
+                    vw.dragging = 0;    /* button released            */
+                    break;
+                }
+                st[0] = vw.win;
+                _swix(XWimp_GetWindowState, _IN(1), st);
+                wx = pi[0] - (st[1] - st[5]);
+                wy = pi[1] - (st[4] - st[6]);
+                idx = glyph_at(wx, wy);
+                if (idx >= 0 && idx != vw.selto) {
+                    vw.selto = idx;
+                    vw.selfrom = vw.anchor;
+                    redraw_doc();
+                }
+            }
+            break;
+        case 1:                         /* redraw                     */
+            if (blk[0] == vw.win) {
+                redraw_main(blk);
+            }
+            break;
+        case 2:                         /* open                      */
+            if (blk[0] == vw.win) {
+                open_with_pane(blk);
+            } else {
+                _swix(XWimp_OpenWindow, _IN(1), blk);
+            }
+            break;
+        case 3:                         /* close                     */
+            if (blk[0] == vw.win) {
+                vw.quit = 1;
+            }
+            break;
+        case 6:                         /* mouse click               */
+            if (blk[3] == vw.pane) {
+                toolbar_click(blk[4]);
+            } else if (blk[3] == vw.win && (blk[2] & 2) != 0) {
+                /* Menu button over the page: the text menu          */
+                update_menu();
+                _swix(XWimp_CreateMenu, _INR(1, 3),
+                      &selmenu, blk[0] - 64, blk[1]);
+            } else if (blk[3] == vw.win && (blk[2] & 0x54) != 0) {
+                /* Select (4) or Select-drag (64) in the page: start
+                   or extend a text selection                        */
+                int st[16], wx, wy, idx;
+
+                st[0] = vw.win;
+                _swix(XWimp_GetWindowState, _IN(1), st);
+                wx = blk[0] - (st[1] - st[5]);
+                wy = blk[1] - (st[4] - st[6]);
+                /* claim the input focus (invisible caret) so the
+                   keyboard shortcuts reach us                      */
+                _swix(XWimp_SetCaretPosition, _INR(0, 5),
+                      vw.win, -1, 0, 0, (1 << 25) | 40, 0);
+                idx = glyph_at(wx, wy);
+                if (idx >= 0) {
+                    vw.anchor = idx;
+                    vw.selfrom = vw.selto = idx;
+                    vw.dragging = 1;
+                    redraw_doc();
+                } else if (vw.selfrom >= 0) {
+                    vw.selfrom = vw.selto = -1;
+                    redraw_doc();
+                }
+            }
+            break;
+        case 9:                         /* menu selection            */
+            switch (blk[0]) {
+            case MENU_COPY:
+                clipboard_copy();
+                break;
+            case MENU_ALL:
+                if (vw.nglyphs) {
+                    vw.selfrom = 0;
+                    vw.selto = (int) vw.nglyphs - 1;
+                    redraw_doc();
+                }
+                break;
+            case MENU_SAVE:
+                save_selection();
+                break;
+            default:
+                break;
+            }
+            break;
+        case 8:                         /* key pressed               */
+            if (blk[6] == 3) {          /* Ctrl-C                    */
+                clipboard_copy();
+            } else if (blk[6] == 1) {   /* Ctrl-A: select all        */
+                if (vw.nglyphs) {
+                    vw.selfrom = 0;
+                    vw.selto = (int) vw.nglyphs - 1;
+                    redraw_doc();
+                }
+            } else if (blk[6] == 0x18E) {   /* Page Down             */
+                toolbar_click(IC_NEXT);
+            } else if (blk[6] == 0x19E) {   /* Page Up               */
+                toolbar_click(IC_PREV);
+            } else {
+                _swix(0x400E6, _INR(0, 1), 0, blk);     /* pass on   */
+            }
+            break;
+        case 17:
+        case 18:
+            switch (blk[4]) {
+            case 0:                     /* Message_Quit              */
+                vw.quit = 1;
+                break;
+            case Msg_DataRequest:
+                clipboard_send(blk);
+                break;
+            case Msg_DataSaveAck:
+                clipboard_saveack(blk);
+                break;
+            case Msg_ClaimEntity:
+                /* someone else took the clipboard                   */
+                if (blk[1] != vw.task && (blk[5] & ENTITY_CLIPBOARD)) {
+                    vw.ownclip = 0;
+                    free(vw.clip);
+                    vw.clip = NULL;
+                    vw.cliplen = 0;
+                }
+                break;
+            default:
+                break;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/* --- entry ---------------------------------------------------------- */
+
+int
+main(int argc, char **argv)
+{
+    _kernel_oserror *e;
+
+    dbg(1);
+    /* Register with the Wimp first.
+       R3 must be a pointer to a message list, NOT zero: with Wimp
+       310 a null POINTER means "no messages wanted" while a null
+       LIST means "all messages" - the reverse of what one expects
+       (PRM, Wimp_Initialise).  Passing 0 here silently cost us every
+       Message_DataRequest, i.e. the whole clipboard.               */
+    {
+        static const int wanted[] = {
+            Msg_DataSave, Msg_DataSaveAck, Msg_DataLoad,
+            Msg_ClaimEntity, Msg_DataRequest, 0
+        };
+        e = _swix(XWimp_Initialise, _INR(0, 3) | _OUT(1),
+                  310, 0x4B534154, "PDFRenderV", wanted, &vw.task);
+    }
+    if (e != NULL) {
+        fprintf(stderr, "PDFRenderV: %s\n", e->errmess);
+        return 1;
+    }
+    dbg(2);
+    if (argc < 2) {
+        report("Usage: *Run <viewer> <pdffile>");
+        _swix(XWimp_CloseDown, _INR(0, 1), vw.task, 0x4B534154);
+        return 1;
+    }
+    /* CLib splits the tail on spaces; rejoin so paths containing
+       spaces survive                                                 */
+    {
+        int i;
+        vw.filename[0] = 0;
+        for (i = 1; i < argc; i++) {
+            if (i > 1) {
+                strncat(vw.filename, " ",
+                        sizeof vw.filename - strlen(vw.filename) - 1);
+            }
+            strncat(vw.filename, argv[i],
+                    sizeof vw.filename - strlen(vw.filename) - 1);
+        }
+    }
+    vw.zoom = 100;
+    vw.selfrom = vw.selto = -1;
+
+    /* the module does everything document-shaped                     */
+    {
+        int handle = 0, npages = 0;
+        e = _swix(PDFRenderV_Open, _INR(0, 1) | _OUT(0) | _OUT(1),
+                  0, vw.filename, &handle, &npages);
+        if (e != NULL) {
+            report_oserr(e);
+            _swix(XWimp_CloseDown, _INR(0, 1), vw.task, 0x4B534154);
+            return 1;
+        }
+        vw.handle = handle;
+        vw.npages = (u32) npages;
+    }
+    dbg(3);
+
+    vw.xeig = readmodevar(4);
+    vw.yeig = readmodevar(5);
+    sprintf(vw.titletxt, "%.290s", vw.filename);
+
+    if (render_page() != 0) {
+        report("Could not render the first page");
+    }
+    dbg(4);
+    if (create_windows() != 0) {
+        _swix(PDFRenderV_Close, _IN(0), vw.handle);
+        _swix(XWimp_CloseDown, _INR(0, 1), vw.task, 0x4B534154);
+        return 1;
+    }
+    dbg(5);
+    update_toolbar_texts();
+    build_menu();
+
+    /* open centred-ish via a GetWindowState + open                    */
+    {
+        int st[16];
+        st[0] = vw.win;
+        _swix(XWimp_GetWindowState, _IN(1), st);
+        st[7] = -1;
+        open_with_pane(st);
+    }
+    dbg(6);
+
+    poll_loop();
+
+    free_sprite();
+    free_glyphs();
+    free(vw.clip);
+    _swix(PDFRenderV_Close, _IN(0), vw.handle);
+    _swix(XWimp_CloseDown, _INR(0, 1), vw.task, 0x4B534154);
+    return 0;
+}

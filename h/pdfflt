@@ -1,0 +1,47 @@
+/*
+  PDFRender - stream filter layer interface.
+
+  Everything here is portable C over plain memory buffers; the same
+  code runs on the host (unit tests against a zlib oracle) and in the
+  module.  Transient decode buffers use malloc/realloc - on RISC OS,
+  in a module, that is RMA via the SharedCLibrary stubs.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFFLT_H
+#define PDFFLT_H
+
+#include "pdftypes.h"
+
+/* A growable byte buffer.  Zero-initialise, then pdfbuf_need() before
+   writing; pdfbuf_free() releases.  p is realloc-managed.            */
+typedef struct {
+    u8 *p;
+    u32 len;
+    u32 cap;
+} PdfBuf;
+
+int  pdfbuf_need(PdfBuf *b, u32 extra);      /* ensure cap>=len+extra */
+void pdfbuf_free(PdfBuf *b);
+
+/* FlateDecode: zlib-wrapped (RFC1950) or raw (RFC1951) DEFLATE.
+   Appends decompressed bytes to out.                                 */
+int pdf_inflate(const u8 *src, u32 srclen, PdfBuf *out);
+
+/* LZWDecode (TIFF/PDF variant, MSB-first, 12-bit max, EarlyChange).  */
+int pdf_lzw(const u8 *src, u32 srclen, int earlychange, PdfBuf *out);
+
+/* PNG (10..15) and TIFF (2) predictors, applied in place after
+   Flate/LZW.  *plen is updated (PNG rows lose their filter byte).    */
+int pdf_predict(u8 *data, u32 *plen, int predictor, int colors,
+                int bpc, int columns);
+
+/* ASCII85Decode / ASCIIHexDecode / RunLengthDecode.                  */
+int pdf_ascii85(const u8 *src, u32 srclen, PdfBuf *out);
+int pdf_asciihex(const u8 *src, u32 srclen, PdfBuf *out);
+int pdf_rle(const u8 *src, u32 srclen, PdfBuf *out);
+
+#endif

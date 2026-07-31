@@ -1,0 +1,135 @@
+/*
+  PDFRender - content-stream interpreter and render backend contract.
+
+  The interpreter walks a page's content stream and drives a backend
+  vtable.  Everything reaching the backend is in DEVICE space:
+  RISC OS OS units with the origin at the sprite's bottom-left corner
+  and y increasing upwards - which is also PDF's convention, so the
+  base CTM is a pure scale (zoom = device units per PDF point) plus
+  the /Rotate correction.  All coordinates are 16.16 fixed point
+  device units.
+
+  Two backends exist: the RISC OS one (c/pdfdraw - Draw module,
+  FontManager, SpriteOp, JPEG SWIs) and the host test one
+  (test/host/testpdf.c - textual op dump).
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFPAGE_H
+#define PDFPAGE_H
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdffile.h"
+#include "pdffont.h"
+#include "pdfimg.h"
+
+/* --- device-space path ---------------------------------------------- */
+
+enum {
+    PDF_EL_MOVE = 0,            /* p[0]                               */
+    PDF_EL_LINE,                /* p[0]                               */
+    PDF_EL_CURVE,               /* p[0] p[1] control, p[2] end        */
+    PDF_EL_CLOSE
+};
+
+typedef struct { fix x, y; } PdfPt;
+
+typedef struct {
+    u8 op;
+    PdfPt p[3];
+} PdfPathEl;
+
+typedef struct {
+    PdfPathEl *el;
+    u32 n, cap;                 /* malloc-managed by the interpreter  */
+} PdfPath;
+
+/* Blend modes we distinguish.  Only Multiply is implemented (it is
+   what highlight annotations use); everything else is Normal.        */
+enum {
+    PDF_BLEND_NORMAL = 0,
+    PDF_BLEND_MULTIPLY
+};
+
+/* --- backend vtable ------------------------------------------------- */
+
+/* Colours are 0x00BBGGRR (red in bits 0-7), matching both the
+   RISC OS 32bpp sprite pixel and ColourTrans palette-entry >> 8.     */
+
+typedef struct PdfBackend {
+    void *ctx;
+
+    /* graphics state bracketing (q/Q): the backend must save and
+       restore whatever device state it caches - notably the clip.   */
+    void (*gsave)(void *ctx);
+    void (*grestore)(void *ctx);
+
+    /* rectangular clip intersect, device units                       */
+    void (*clip)(void *ctx, fix x0, fix y0, fix x1, fix y1);
+
+    /* alpha is 16.16 (FX_ONE = opaque).  A backend that owns its
+       output buffer should composite properly; one that cannot (a
+       printer job) may approximate.                                 */
+    void (*fill)(void *ctx, const PdfPath *p, u32 rgb, int evenodd,
+                 int blend, fix alpha);
+    void (*stroke)(void *ctx, const PdfPath *p, u32 rgb, fix width,
+                   int cap, int join, const fix *dash, int ndash,
+                   fix dashphase);
+
+    /* Paint a text run.  m[] maps a 1pt-em text space to device
+       space (translation in m[4], m[5]); the run is already
+       re-encoded to Latin-1 for the named RISC OS font.  Return the
+       run's advance width in 1/1000 em per 1pt, or -1 to make the
+       interpreter use PDF widths only (it always prefers PDF widths
+       when the font has them).                                       */
+    void (*text)(void *ctx, const char *rofont, const u8 *s, u32 len,
+                 const fix m[6], u32 rgb);
+
+    /* Measure a Latin-1 run in the named font: advance in 1/1000 em
+       units (per 1pt of font).  Used only when the PDF supplies no
+       /Widths.  May return -1 if unknown (0.5em/char is assumed).    */
+    s32 (*textwidth)(void *ctx, const char *rofont, const u8 *s, u32 len);
+
+    /* Paint an image mapped onto the unit square transformed by m[]. */
+    void (*image)(void *ctx, const PdfImg *img, const fix m[6]);
+
+    /* Optional: called once per glyph with its device-space box, in
+       document order, whether or not the glyph is painted.  This is
+       what text selection and searching are built on; leave NULL if
+       the backend only draws.                                       */
+    void (*glyph)(void *ctx, u32 ch, fix x0, fix y0, fix x1, fix y1);
+} PdfBackend;
+
+/* --- interpreter ---------------------------------------------------- */
+
+/* Render page pageidx (0-based) at zoom device-units-per-point.
+   The backend sees the page with /Rotate already applied; the caller
+   is expected to have sized its sprite to
+     ceil(pagew * zoom) x ceil(pageh * zoom)
+   device units, swapped when /Rotate is 90 or 270.                   */
+int pdf_runpage(PdfDoc *doc, u32 pageidx, PdfBackend *be, fix zoom);
+
+/* Page geometry helper: MediaBox width/height in PDF points (16.16)
+   and normalized /Rotate (0/90/180/270).                             */
+int pdf_pagegeom(PdfDoc *doc, u32 pageidx, fix *w, fix *h, int *rotate);
+
+/* --- text extraction ------------------------------------------------ */
+
+/* One glyph, in the same device space a render at this zoom would
+   use, so a viewer can hit-test against what it drew.  ch is the
+   Latin-1 code the glyph was mapped to (0 if unmappable).           */
+typedef struct {
+    s32 x0, y0, x1, y1;
+    u32 ch;
+} PdfGlyph;
+
+/* Collect every glyph on a page.  *outp receives a malloc'd array
+   the caller owns (free with free()); *nout its length.             */
+int pdf_extracttext(PdfDoc *doc, u32 pageidx, fix zoom,
+                    PdfGlyph **outp, u32 *nout);
+
+#endif

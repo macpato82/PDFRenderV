@@ -1,0 +1,778 @@
+/*
+  PDFRender - RISC OS render backend.
+
+  All SWI interfaces below are per the PRMs (RO3 PRM 'Draw',
+  'Sprites', 'Font manager', 'ColourTrans' chapters; RO3.5/3.6
+  Vol 5a for new-format sprites and the JPEG SWIs):
+
+    Draw_Fill    &40702  R0 path, R1 style, R2 matrix, R3 flatness
+    Draw_Stroke  &40704  ... R4 thickness, R5 cap/join, R6 dashes
+      - path coords are 1/256 OS unit (our device fix >> 8)
+      - element types: 2 move, 8 line, 6 bezier, 5 close, 0 end
+      - fill style bits 0-1: 0 nonzero, 2 even-odd (+ &30 plot bits)
+    OS_SpriteOp  &2E     +256 name / +512 sprite pointer forms
+      15 create, 52 put scaled, 60 switch output, 62 save area size
+    Font_FindFont &40081, Font_LoseFont &40082
+    Font_Paint   &40086  bit6 matrix (16.16, translation millipoint),
+                         bit7 R7 length, bit8 R0 handle
+    Font_ScanString &400A1 (millipoints throughout)
+    ColourTrans_SetGCOL &40743, ColourTrans_SetFontColours &4074F
+    JPEG_Info    &49980, JPEG_PlotScaled &49982
+
+  Millipoint rule: 1 OS unit = 400 millipoints; the sprite is built
+  as 180 dpi so 1 pixel = 1 OS unit and Draw/Font output is 1:1.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdffile.h"
+#include "pdffont.h"
+#include "pdfimg.h"
+#include "pdfpage.h"
+#include "pdfdraw.h"
+
+#define XDraw_Fill              (0x40702)
+#define XDraw_Stroke            (0x40704)
+#define XOS_SpriteOp            (0x2E)
+#define XOS_WriteN              (0x46)
+#define XFont_FindFont          (0x40081)
+#define XFont_LoseFont          (0x40082)
+#define XFont_Paint             (0x40086)
+#define XFont_ScanString        (0x400A1)
+#define XColourTrans_SetGCOL    (0x40743)
+#define XColourTrans_SetFontColours (0x4074F)
+#define XFont_ReadFontMax       (0x4009C)
+#define XFont_SetFontMax        (0x4009B)
+#define XJPEG_Info              (0x49980)
+#define XJPEG_PlotScaled        (0x49982)
+
+/* 32bpp new-format sprite mode word: type 6, 180x180 dpi, bit 0 set */
+#define SPRITE_MODE_32BPP_180 \
+    ((6u << 27) | (180u << 14) | (180u << 1) | 1u)
+
+#define OSUNIT_MILLIPOINTS 400
+
+/* --- small SWI helpers ---------------------------------------------- */
+
+static void
+setgcol(u32 rgb, int bg)
+{
+    _swix(XColourTrans_SetGCOL, _INR(0, 0) | _INR(3, 4),
+          rgb << 8, bg ? 0x80 : 0, 0);
+}
+
+static void
+vdu_bytes(const u8 *b, int n)
+{
+    _swix(XOS_WriteN, _INR(0, 1), b, n);
+}
+
+static void
+set_gwindow(int x0, int y0, int x1, int y1)
+{
+    u8 b[9];
+
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    b[0] = 24;                          /* VDU 24,l;b;r;t;            */
+    b[1] = (u8) x0; b[2] = (u8) (x0 >> 8);
+    b[3] = (u8) y0; b[4] = (u8) (y0 >> 8);
+    b[5] = (u8) x1; b[6] = (u8) (x1 >> 8);
+    b[7] = (u8) y1; b[8] = (u8) (y1 >> 8);
+    vdu_bytes(b, 9);
+}
+
+/* --- clip stack ----------------------------------------------------- */
+
+static void
+clip_apply(RoRender *rr)
+{
+    set_gwindow(rr->clip[rr->csp].x0, rr->clip[rr->csp].y0,
+                rr->clip[rr->csp].x1, rr->clip[rr->csp].y1);
+}
+
+static void
+be_gsave(void *ctx)
+{
+    RoRender *rr = ctx;
+
+    if (rr->csp < 39) {
+        rr->clip[rr->csp + 1] = rr->clip[rr->csp];
+        rr->csp++;
+    }
+}
+
+static void
+be_grestore(void *ctx)
+{
+    RoRender *rr = ctx;
+
+    if (rr->csp > 0) {
+        rr->csp--;
+        clip_apply(rr);
+    }
+}
+
+static void
+be_clip(void *ctx, fix x0, fix y0, fix x1, fix y1)
+{
+    RoRender *rr = ctx;
+    int ix0 = FX_TOINT(x0), iy0 = FX_TOINT(y0);
+    int ix1 = FX_TOINT(x1 + 0xffff), iy1 = FX_TOINT(y1 + 0xffff);
+
+    if (ix0 > rr->clip[rr->csp].x0) rr->clip[rr->csp].x0 = ix0;
+    if (iy0 > rr->clip[rr->csp].y0) rr->clip[rr->csp].y0 = iy0;
+    if (ix1 < rr->clip[rr->csp].x1) rr->clip[rr->csp].x1 = ix1;
+    if (iy1 < rr->clip[rr->csp].y1) rr->clip[rr->csp].y1 = iy1;
+    clip_apply(rr);
+}
+
+/* --- Draw path conversion ------------------------------------------- */
+
+/* fix (16.16 OS units) -> Draw internal units (1/256 OS unit)        */
+#define TO_DRAW(f) ((s32) (f) >> 8)
+
+static u32 *
+draw_convert(RoRender *rr, const PdfPath *p, u32 *nwords)
+{
+    u32 need = p->n * 7 + 4;
+    u32 w = 0, i;
+    u32 *d;
+
+    if (need > rr->dpathcap) {
+        u32 *nd = realloc(rr->dpath, need * sizeof(u32));
+        if (nd == NULL) {
+            return NULL;
+        }
+        rr->dpath = nd;
+        rr->dpathcap = need;
+    }
+    d = rr->dpath;
+    for (i = 0; i < p->n; i++) {
+        const PdfPathEl *e = &p->el[i];
+        switch (e->op) {
+        case PDF_EL_MOVE:
+            d[w++] = 2;
+            d[w++] = (u32) TO_DRAW(e->p[0].x);
+            d[w++] = (u32) TO_DRAW(e->p[0].y);
+            break;
+        case PDF_EL_LINE:
+            d[w++] = 8;
+            d[w++] = (u32) TO_DRAW(e->p[0].x);
+            d[w++] = (u32) TO_DRAW(e->p[0].y);
+            break;
+        case PDF_EL_CURVE:
+            d[w++] = 6;
+            d[w++] = (u32) TO_DRAW(e->p[0].x);
+            d[w++] = (u32) TO_DRAW(e->p[0].y);
+            d[w++] = (u32) TO_DRAW(e->p[1].x);
+            d[w++] = (u32) TO_DRAW(e->p[1].y);
+            d[w++] = (u32) TO_DRAW(e->p[2].x);
+            d[w++] = (u32) TO_DRAW(e->p[2].y);
+            break;
+        case PDF_EL_CLOSE:
+            d[w++] = 5;
+            break;
+        }
+    }
+    d[w++] = 0;                         /* end of path                */
+    d[w++] = 0;
+    *nwords = w;
+    return d;
+}
+
+/* Is the path a single axis-aligned rectangle?  Highlight annotations
+   (the only Multiply users worth handling) always are.  Returns the
+   device-space bounds through the out params.                        */
+static int
+path_is_axis_rect(const PdfPath *p, int *x0, int *y0, int *x1, int *y1)
+{
+    fix xmin, ymin, xmax, ymax;
+    u32 i, npt = 0;
+    PdfPt pts[8];
+
+    for (i = 0; i < p->n; i++) {
+        if (p->el[i].op == PDF_EL_CURVE) {
+            return 0;
+        }
+        if (p->el[i].op == PDF_EL_CLOSE) {
+            continue;
+        }
+        if (npt >= 8) {
+            return 0;
+        }
+        pts[npt++] = p->el[i].p[0];
+    }
+    if (npt < 4 || npt > 5) {
+        return 0;
+    }
+    if (npt == 5 &&
+        (pts[4].x != pts[0].x || pts[4].y != pts[0].y)) {
+        return 0;
+    }
+    xmin = xmax = pts[0].x;
+    ymin = ymax = pts[0].y;
+    for (i = 1; i < 4; i++) {
+        if (pts[i].x < xmin) xmin = pts[i].x;
+        if (pts[i].x > xmax) xmax = pts[i].x;
+        if (pts[i].y < ymin) ymin = pts[i].y;
+        if (pts[i].y > ymax) ymax = pts[i].y;
+    }
+    /* every corner must sit on the bounding box - that is what makes
+       it axis aligned rather than a rotated quad                     */
+    for (i = 0; i < 4; i++) {
+        if ((pts[i].x != xmin && pts[i].x != xmax) ||
+            (pts[i].y != ymin && pts[i].y != ymax)) {
+            return 0;
+        }
+    }
+    *x0 = FX_TOINT(xmin);
+    *y0 = FX_TOINT(ymin);
+    *x1 = FX_TOINT(xmax + 0xffff);
+    *y1 = FX_TOINT(ymax + 0xffff);
+    return *x1 > *x0 && *y1 > *y0;
+}
+
+/* Composite a rectangle into the output sprite: Multiply, or
+   source-over with constant alpha.
+   This is what makes highlight annotations behave: yellow over black
+   text leaves the text black, exactly as a PDF viewer shows it.
+   Only possible because output is a 32bpp sprite we own - in direct
+   (printer) mode there is nothing to read back, so the caller skips
+   the paint instead of hiding the text under it.                    */
+static void
+blend_rect(RoRender *rr, int x0, int y0, int x1, int y1, u32 rgb,
+           int blend, fix alpha)
+{
+    const u32 *hdr = rr->sprite;
+    u8 *base;
+    int w = rr->devw, h = rr->devh;
+    int cr = (int) (rgb & 0xff);
+    int cg = (int) ((rgb >> 8) & 0xff);
+    int cb = (int) ((rgb >> 16) & 0xff);
+    int x, y;
+
+    /* clip to the current graphics window and the sprite itself      */
+    if (x0 < rr->clip[rr->csp].x0) x0 = rr->clip[rr->csp].x0;
+    if (y0 < rr->clip[rr->csp].y0) y0 = rr->clip[rr->csp].y0;
+    if (x1 > rr->clip[rr->csp].x1 + 1) x1 = rr->clip[rr->csp].x1 + 1;
+    if (y1 > rr->clip[rr->csp].y1 + 1) y1 = rr->clip[rr->csp].y1 + 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+    {
+        u32 a = (u32) (alpha < 0 ? 0 : alpha > FX_ONE ? FX_ONE : alpha);
+        u32 a8 = (a * 255u) >> 16;      /* 0..255 coverage            */
+
+        base = (u8 *) rr->sprite + hdr[8];  /* +32: image data offset */
+        for (y = y0; y < y1; y++) {
+            /* device y is up from the bottom; sprite row 0 is top    */
+            u32 *row = (u32 *) (base + (u32) (h - 1 - y) * (u32) w * 4);
+            for (x = x0; x < x1; x++) {
+                u32 px = row[x];
+                u32 dr = px & 0xff, dg = (px >> 8) & 0xff;
+                u32 db = (px >> 16) & 0xff;
+                u32 sr, sg, sb;
+
+                if (blend == PDF_BLEND_MULTIPLY) {
+                    sr = dr * (u32) cr / 255u;
+                    sg = dg * (u32) cg / 255u;
+                    sb = db * (u32) cb / 255u;
+                } else {
+                    sr = (u32) cr;
+                    sg = (u32) cg;
+                    sb = (u32) cb;
+                }
+                /* source-over: dst = dst*(1-a) + src*a               */
+                sr = (dr * (255u - a8) + sr * a8) / 255u;
+                sg = (dg * (255u - a8) + sg * a8) / 255u;
+                sb = (db * (255u - a8) + sb * a8) / 255u;
+                row[x] = sr | (sg << 8) | (sb << 16);
+            }
+        }
+    }
+}
+
+/* Colour approximated against a white page, for the paths we cannot
+   composite exactly (non-rectangular, or printing).                 */
+static u32
+approx_towhite(u32 rgb, fix a)
+{
+    u32 r, g, b;
+
+    if (a >= FX_ONE) {
+        return rgb;
+    }
+    if (a < 0) {
+        a = 0;
+    }
+    r = rgb & 0xff;
+    g = (rgb >> 8) & 0xff;
+    b = (rgb >> 16) & 0xff;
+    r = 255 - (u32) (((s64) (255 - r) * a) >> 16);
+    g = 255 - (u32) (((s64) (255 - g) * a) >> 16);
+    b = 255 - (u32) (((s64) (255 - b) * a) >> 16);
+    return r | (g << 8) | (b << 16);
+}
+
+static void
+be_fill(void *ctx, const PdfPath *p, u32 rgb, int evenodd, int blend,
+        fix alpha)
+{
+    RoRender *rr = ctx;
+    u32 nw;
+    u32 *d;
+
+    if (blend == PDF_BLEND_MULTIPLY || alpha < FX_ONE) {
+        int x0, y0, x1, y1;
+
+        /* Exact path: composite into the sprite we own.  Highlight
+           annotations are always axis-aligned rectangles, so this
+           covers the case that matters and leaves the text under
+           them readable.                                            */
+        if (rr->redirected &&
+            path_is_axis_rect(p, &x0, &y0, &x1, &y1)) {
+            blend_rect(rr, x0, y0, x1, y1, rgb, blend, alpha);
+            return;
+        }
+        if (blend == PDF_BLEND_MULTIPLY) {
+            return;             /* cannot fake multiply - leave be   */
+        }
+        rgb = approx_towhite(rgb, alpha);   /* translucent-ish fill  */
+    }
+    d = draw_convert(rr, p, &nw);
+    if (d == NULL) {
+        return;
+    }
+    setgcol(rgb, 0);
+    /* style: plot-to-boundary bits &30, winding rule in bits 0-1     */
+    _swix(XDraw_Fill, _INR(0, 3), d, evenodd ? 0x32 : 0x30, 0, 0);
+}
+
+static void
+be_stroke(void *ctx, const PdfPath *p, u32 rgb, fix width,
+          int cap, int join, const fix *dash, int ndash, fix phase)
+{
+    RoRender *rr = ctx;
+    u32 nw;
+    u32 *d = draw_convert(rr, p, &nw);
+    u32 capjoin[4];
+    u32 dashblk[2 + 8];
+    u32 *dashp = NULL;
+    int rocap, i;
+
+    if (d == NULL) {
+        return;
+    }
+    /* PDF and RISC OS use the same cap/join numbering (0,1,2)        */
+    rocap = cap < 0 || cap > 2 ? 0 : cap;
+    capjoin[0] = (u32) (join < 0 || join > 2 ? 0 : join) |
+                 ((u32) rocap << 8) | ((u32) rocap << 16);
+    capjoin[1] = 10u << 16;             /* mitre limit 10.0           */
+    capjoin[2] = 0;
+    capjoin[3] = 0;
+    if (ndash > 0) {
+        dashblk[0] = (u32) TO_DRAW(phase);
+        dashblk[1] = (u32) ndash;
+        for (i = 0; i < ndash && i < 8; i++) {
+            u32 el = (u32) TO_DRAW(dash[i]);
+            if (el == 0) {
+                el = 1;                 /* zero-length dash: avoid    */
+            }
+            dashblk[2 + i] = el;
+        }
+        dashp = dashblk;
+    }
+    setgcol(rgb, 0);
+    _swix(XDraw_Stroke, _INR(0, 6), d, 0, 0, 0,
+          (u32) TO_DRAW(width), capjoin, dashp);
+}
+
+/* --- text ----------------------------------------------------------- */
+
+static int
+find_font(RoRender *rr, const char *name, int sx, int sy)
+{
+    int i, slot = 0;
+    u32 oldest = 0xffffffffu;
+
+    for (i = 0; i < RO_NFONTS; i++) {
+        if (rr->fonts[i].handle && rr->fonts[i].sx == sx &&
+            rr->fonts[i].sy == sy &&
+            strcmp(rr->fonts[i].name, name) == 0) {
+            rr->fonts[i].tick = ++rr->tick;
+            return rr->fonts[i].handle;
+        }
+        if (rr->fonts[i].tick < oldest) {
+            oldest = rr->fonts[i].tick;
+            slot = i;
+        }
+    }
+    {
+        int handle = 0;
+        if (_swix(XFont_FindFont, _INR(1, 5) | _OUT(0),
+                  name, sx, sy, 0, 0, &handle) != NULL || handle == 0) {
+            /* fall back to Homerton so text is never silently lost   */
+            if (_swix(XFont_FindFont, _INR(1, 5) | _OUT(0),
+                      "Homerton.Medium", sx, sy, 0, 0, &handle) != NULL) {
+                return 0;
+            }
+        }
+        if (rr->fonts[slot].handle) {
+            _swix(XFont_LoseFont, _IN(0), rr->fonts[slot].handle);
+        }
+        strncpy(rr->fonts[slot].name, name, sizeof rr->fonts[slot].name - 1);
+        rr->fonts[slot].name[sizeof rr->fonts[slot].name - 1] = 0;
+        rr->fonts[slot].sx = sx;
+        rr->fonts[slot].sy = sy;
+        rr->fonts[slot].handle = handle;
+        rr->fonts[slot].tick = ++rr->tick;
+        return handle;
+    }
+}
+
+/* OS-unit sizes (16.16) to 1/16 pt: pt = os/2.5, so /16pt = os*32/5  */
+static int
+ossize_to_16pt(fix os)
+{
+    s64 v = ((s64) os * 32) / 5;
+
+    v >>= 16;
+    if (v < 1) v = 1;
+    if (v > 32767) v = 32767;
+    return (int) v;
+}
+
+static void
+be_text(void *ctx, const char *rofont, const u8 *s, u32 len,
+        const fix m[6], u32 rgb)
+{
+    RoRender *rr = ctx;
+    fix m0 = m[0] < 0 ? -m[0] : m[0];
+    fix m3 = m[3] < 0 ? -m[3] : m[3];
+    int axis = m[1] == 0 && m[2] == 0 && m[0] > 0 && m[3] > 0;
+    int handle;
+    s32 mpx, mpy;
+
+    if (m3 < 0x2000) {
+        return;                         /* under 1/8 px: invisible    */
+    }
+    /* background white gives correct AA on the usual white page      */
+    _swix(XColourTrans_SetFontColours, _INR(0, 3),
+          0, 0xFFFFFF00u, rgb << 8, 14);
+
+    mpx = (s32) (((s64) m[4] * OSUNIT_MILLIPOINTS) >> 16);
+    mpy = (s32) (((s64) m[5] * OSUNIT_MILLIPOINTS) >> 16);
+
+    if (axis) {
+        handle = find_font(rr, rofont, ossize_to_16pt(m0),
+                           ossize_to_16pt(m3));
+        if (handle == 0) {
+            return;
+        }
+        /* flags: bit7 length in R7, bit8 handle in R0; millipoints   */
+        _swix(XFont_Paint, _INR(0, 4) | _IN(7),
+              handle, s, (1u << 7) | (1u << 8), mpx, mpy, len);
+    } else {
+        /* rotated/sheared: size from |m3|, normalised matrix         */
+        fix mm[6];
+        int k;
+        handle = find_font(rr, rofont, ossize_to_16pt(m3),
+                           ossize_to_16pt(m3));
+        if (handle == 0) {
+            return;
+        }
+        for (k = 0; k < 4; k++) {
+            mm[k] = fx_div(m[k], m3);
+        }
+        mm[4] = 0;
+        mm[5] = 0;
+        _swix(XFont_Paint, _INR(0, 4) | _IN(6) | _IN(7),
+              handle, s, (1u << 6) | (1u << 7) | (1u << 8),
+              mpx, mpy, mm, len);
+    }
+}
+
+static s32
+be_textwidth(void *ctx, const char *rofont, const u8 *s, u32 len)
+{
+    RoRender *rr = ctx;
+    /* measure at 16pt: width millipoints / 16 = 1/1000 em            */
+    int handle = find_font(rr, rofont, 16 * 16, 16 * 16);
+    s32 x = -1;
+
+    if (handle == 0) {
+        return -1;
+    }
+    if (_swix(XFont_ScanString, _INR(0, 4) | _IN(7) | _OUT(3),
+              handle, s, (1u << 7) | (1u << 8),
+              0x7ffffff, 0x7ffffff, len, &x) != NULL) {
+        return -1;
+    }
+    return x / 16;
+}
+
+/* --- images --------------------------------------------------------- */
+
+typedef struct {
+    u32 size;                   /* area control block                 */
+    u32 count;
+    u32 first;
+    u32 free;
+    /* sprite header follows */
+    u32 next;
+    char name[12];
+    u32 wwords;
+    u32 hlines;
+    u32 firstbit;
+    u32 lastbit;
+    u32 imgoff;
+    u32 maskoff;
+    u32 mode;
+} SpriteBlock;
+
+static void
+be_image(void *ctx, const PdfImg *img, const fix m[6])
+{
+    RoRender *rr = ctx;
+    int dx, dy, dw, dh;
+    int flipv = 0;
+    u32 scale[4];
+
+    (void) rr;
+    /* axis-aligned placement from the matrix (bbox when rotated)     */
+    {
+        fix x0 = m[4], y0 = m[5];
+        fix x1 = m[4] + m[0] + m[2];
+        fix y1 = m[5] + m[1] + m[3];
+        fix t;
+        if (m[3] < 0 || m[1] < 0) {
+            flipv = 1;
+        }
+        if (x1 < x0) { t = x0; x0 = x1; x1 = t; }
+        if (y1 < y0) { t = y0; y0 = y1; y1 = t; }
+        dx = FX_TOINT(x0);
+        dy = FX_TOINT(y0);
+        dw = FX_TOINT(x1 + 0xffff) - dx;
+        dh = FX_TOINT(y1 + 0xffff) - dy;
+    }
+    if (dw < 1 || dh < 1 || img->w < 1 || img->h < 1) {
+        return;
+    }
+
+    if (img->kind == PDFIMG_JPEG) {
+        int jw = 0, jh = 0;
+        if (_swix(XJPEG_Info, _INR(0, 2) | _OUT(2) | _OUT(3),
+                  1, img->jpeg, img->jpeglen, &jw, &jh) != NULL ||
+            jw < 1 || jh < 1) {
+            return;
+        }
+        scale[0] = (u32) dw;
+        scale[1] = (u32) dh;
+        scale[2] = (u32) jw;
+        scale[3] = (u32) jh;
+        _swix(XJPEG_PlotScaled, _INR(0, 5),
+              img->jpeg, dx, dy, scale, img->jpeglen, 0);
+        return;
+    }
+
+    /* XRGB32: wrap the pixel buffer in a temporary sprite            */
+    {
+        u32 rowbytes = (u32) img->w * 4;
+        u32 imgbytes = rowbytes * (u32) img->h;
+        u32 total = sizeof(SpriteBlock) + imgbytes;
+        SpriteBlock *sb = malloc(total);
+        u32 *dst;
+        int y;
+
+        if (sb == NULL) {
+            return;
+        }
+        memset(sb, 0, sizeof *sb);
+        sb->size = total;
+        sb->count = 1;
+        sb->first = 16;
+        sb->free = total;
+        sb->next = total - 16;
+        memcpy(sb->name, "pdfimg", 6);
+        sb->wwords = (u32) img->w - 1;
+        sb->hlines = (u32) img->h - 1;
+        sb->firstbit = 0;
+        sb->lastbit = 31;
+        sb->imgoff = sizeof(SpriteBlock) - 16;
+        sb->maskoff = sb->imgoff;
+        sb->mode = SPRITE_MODE_32BPP_180;
+        dst = (u32 *) ((u8 *) sb + sizeof(SpriteBlock));
+        /* PdfImg row 0 is the top; sprite row 0 is also the top.
+           A negative-height matrix means the PDF wants it flipped.  */
+        if (!flipv) {
+            memcpy(dst, img->pix, imgbytes);
+        } else {
+            for (y = 0; y < img->h; y++) {
+                memcpy(dst + (u32) y * (u32) img->w,
+                       img->pix + (u32) (img->h - 1 - y) * (u32) img->w,
+                       rowbytes);
+            }
+        }
+        scale[0] = (u32) dw;
+        scale[1] = (u32) dh;
+        scale[2] = (u32) img->w;
+        scale[3] = (u32) img->h;
+        /* +512: R1 = user area, R2 = sprite pointer                  */
+        _swix(XOS_SpriteOp, _INR(0, 7),
+              52 + 512, sb, (u8 *) sb + 16, dx, dy, 0, scale, 0);
+        free(sb);
+    }
+}
+
+/* --- begin / end ---------------------------------------------------- */
+
+/* The FontManager only anti-aliases up to the configured FontMax2
+   (and caches up to FontMax3), so large zooms and headings go jagged
+   on typical setups.  Raise both for the duration of a render and
+   restore afterwards - Font_SetFontMax alters only the live values,
+   not the CMOS configuration.                                        */
+static void
+fontmax_raise(RoRender *rr)
+{
+    if (_swix(XFont_ReadFontMax, _OUTR(0, 5),
+              &rr->fmax[0], &rr->fmax[1], &rr->fmax[2],
+              &rr->fmax[3], &rr->fmax[4], &rr->fmax[5]) != NULL) {
+        return;
+    }
+    rr->fmax_saved = 1;
+    {
+        int m2 = rr->fmax[2] < 64 ? 64 : rr->fmax[2];
+        int m3 = rr->fmax[3] < 64 ? 64 : rr->fmax[3];
+        _swix(XFont_SetFontMax, _INR(0, 7),
+              rr->fmax[0], rr->fmax[1], m2, m3,
+              rr->fmax[4], rr->fmax[5], 0, 0);
+    }
+}
+
+static void
+fontmax_restore(RoRender *rr)
+{
+    if (rr->fmax_saved) {
+        _swix(XFont_SetFontMax, _INR(0, 7),
+              rr->fmax[0], rr->fmax[1], rr->fmax[2], rr->fmax[3],
+              rr->fmax[4], rr->fmax[5], 0, 0);
+        rr->fmax_saved = 0;
+    }
+}
+
+static void
+setup_vtable(RoRender *rr)
+{
+    rr->be.ctx = rr;
+    rr->be.gsave = be_gsave;
+    rr->be.grestore = be_grestore;
+    rr->be.clip = be_clip;
+    rr->be.fill = be_fill;
+    rr->be.stroke = be_stroke;
+    rr->be.text = be_text;
+    rr->be.textwidth = be_textwidth;
+    rr->be.image = be_image;
+}
+
+int
+rorender_begin_direct(RoRender *rr, int devw, int devh)
+{
+    memset(rr, 0, sizeof *rr);
+    rr->devw = devw;
+    rr->devh = devh;
+    rr->clip[0].x0 = 0;
+    rr->clip[0].y0 = 0;
+    rr->clip[0].x1 = devw - 1;
+    rr->clip[0].y1 = devh - 1;
+    fontmax_raise(rr);
+    setup_vtable(rr);
+    return PDF_OK;
+}
+
+int
+rorender_begin(RoRender *rr, void *area, void *sprite, int whitebg)
+{
+    u32 savesize = 0;
+
+    memset(rr, 0, sizeof *rr);
+    rr->area = area;
+    rr->sprite = sprite;
+
+    /* sprite geometry: width from words-1 (32bpp: 1 word = 1 px)     */
+    {
+        const u32 *sp = sprite;
+        rr->devw = (int) sp[4] + 1;
+        rr->devh = (int) sp[5] + 1;
+    }
+    if (_swix(XOS_SpriteOp, _INR(0, 2) | _OUT(3),
+              62 + 512, area, sprite, &savesize) != NULL) {
+        return PDF_E_UNSUP;
+    }
+    rr->savearea = malloc(savesize + 4);
+    if (rr->savearea == NULL) {
+        return PDF_E_NOMEM;
+    }
+    *(u32 *) rr->savearea = 0;
+    if (_swix(XOS_SpriteOp, _INR(0, 3) | _OUT(1) | _OUT(2) | _OUT(3),
+              60 + 512, area, sprite, rr->savearea,
+              &rr->old[1], &rr->old[2], &rr->old[3]) != NULL) {
+        free(rr->savearea);
+        rr->savearea = NULL;
+        return PDF_E_UNSUP;
+    }
+    rr->redirected = 1;
+
+    rr->clip[0].x0 = 0;
+    rr->clip[0].y0 = 0;
+    rr->clip[0].x1 = rr->devw - 1;
+    rr->clip[0].y1 = rr->devh - 1;
+    clip_apply(rr);
+
+    if (whitebg) {
+        u8 cls = 16;                    /* VDU 16: clear graphics win */
+        setgcol(0xFFFFFFu, 1);
+        vdu_bytes(&cls, 1);
+    }
+
+    fontmax_raise(rr);
+    setup_vtable(rr);
+    return PDF_OK;
+}
+
+void
+rorender_end(RoRender *rr)
+{
+    int i;
+
+    for (i = 0; i < RO_NFONTS; i++) {
+        if (rr->fonts[i].handle) {
+            _swix(XFont_LoseFont, _IN(0), rr->fonts[i].handle);
+            rr->fonts[i].handle = 0;
+        }
+    }
+    fontmax_restore(rr);
+    if (rr->redirected) {
+        _swix(XOS_SpriteOp, _INR(0, 3),
+              60 + 512, rr->old[1], rr->old[2], rr->old[3]);
+        rr->redirected = 0;
+    }
+    free(rr->savearea);
+    rr->savearea = NULL;
+    free(rr->dpath);
+    rr->dpath = NULL;
+}

@@ -1,0 +1,110 @@
+/*
+  PDFRender - PDF object model, pool allocator and lexer interface.
+
+  Objects live in a per-document arena pool: allocation is a pointer
+  bump, and the whole document is freed in one go at close.  Nothing
+  in here touches the OS.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFOBJ_H
+#define PDFOBJ_H
+
+#include "pdftypes.h"
+
+/* --- arena pool ----------------------------------------------------- */
+
+typedef struct PdfPool PdfPool;
+
+PdfPool *pdfpool_new(void);
+void    *pdfpool_alloc(PdfPool *p, u32 size);      /* 8-aligned, or NULL */
+void     pdfpool_free(PdfPool *p);
+
+/* --- objects -------------------------------------------------------- */
+
+enum {
+    PDF_NULL = 0,
+    PDF_BOOL,           /* u.i = 0/1                                  */
+    PDF_INT,            /* u.i                                        */
+    PDF_REAL,           /* u.f, 16.16 fixed                           */
+    PDF_STRING,         /* u.str, may contain NULs                    */
+    PDF_NAME,           /* u.str, NUL-terminated (no NULs inside)     */
+    PDF_ARRAY,          /* u.arr                                      */
+    PDF_DICT,           /* u.dict                                     */
+    PDF_STREAM,         /* u.stm: dict + raw byte span in the file    */
+    PDF_REF             /* u.ref: indirect reference                  */
+};
+
+typedef struct PdfObj PdfObj;
+
+typedef struct {
+    char   *key;        /* pool copy, NUL-terminated, no leading /    */
+    PdfObj *val;
+} PdfDictEnt;
+
+struct PdfObj {
+    u8 type;
+    union {
+        s32 i;
+        fix f;
+        struct { u8 *p; u32 len; } str;
+        struct { PdfObj **v; u16 n, cap; } arr;
+        struct { PdfDictEnt *e; u16 n, cap; } dict;
+        struct { PdfObj *dict; u32 off, len; } stm;
+        struct { u32 num; u16 gen; } ref;
+    } u;
+};
+
+/* Constructors (pool-allocated; NULL on out-of-memory). */
+PdfObj *pdfobj_new(PdfPool *p, int type);
+PdfObj *pdfobj_int(PdfPool *p, s32 v);
+PdfObj *pdfobj_name(PdfPool *p, const char *name);
+
+/* Number access: 0 for non-numbers. */
+fix pdfobj_fix(PdfObj *o);
+s32 pdfobj_int_of(PdfObj *o);
+
+/* Dict/array access.  pdf_dictget on a PDF_STREAM reads its dict.
+   Keys are given without the leading /.  NULL when absent.           */
+PdfObj *pdf_dictget(PdfObj *d, const char *key);
+int     pdf_dictput(PdfPool *p, PdfObj *d, const char *key, PdfObj *val);
+PdfObj *pdf_arrget(PdfObj *a, u32 i);
+u32     pdf_arrlen(PdfObj *a);
+int     pdf_arrpush(PdfPool *p, PdfObj *a, PdfObj *val);
+int     pdf_isname(PdfObj *o, const char *name);
+
+/* --- lexer ---------------------------------------------------------- */
+
+typedef struct {
+    const u8 *buf;
+    u32 len, pos;
+    PdfPool *pool;
+} PdfLex;
+
+#define PDF_MAXDEPTH 32             /* array/dict nesting limit       */
+
+void pdflex_init(PdfLex *lx, const u8 *buf, u32 len, PdfPool *pool);
+void pdflex_skipws(PdfLex *lx);     /* whitespace and % comments      */
+
+/* Try to lex an unsigned integer / a bare keyword at the cursor.
+   Return 0 on success (cursor advanced), else nonzero (cursor put
+   back).  kw must hold PDF_KWMAX bytes.                              */
+#define PDF_KWMAX 16
+int pdflex_uint(PdfLex *lx, u32 *out);
+int pdflex_kw(PdfLex *lx, char kw[PDF_KWMAX]);
+
+/* Parse one complete object (composites recursively).  true/false/
+   null become objects; "<int> <int> R" becomes PDF_REF.              */
+int pdf_parseobj(PdfLex *lx, PdfObj **out, int depth);
+
+/* Content-stream tokenizer: yields an object (PDF_TOK_OBJ), a bare
+   operator keyword (PDF_TOK_KW), or PDF_TOK_EOF; negative = error.   */
+#define PDF_TOK_EOF 0
+#define PDF_TOK_OBJ 1
+#define PDF_TOK_KW  2
+int pdf_parseany(PdfLex *lx, PdfObj **out, char kw[PDF_KWMAX], int depth);
+
+#endif

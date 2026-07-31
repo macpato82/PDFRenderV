@@ -1,0 +1,53 @@
+/*
+  PDFRender - shared basic types, fixed-point arithmetic and error codes.
+
+  The core (pdfflt, pdfobj, pdffile, pdffont, pdfpage) is portable C:
+  no OS headers, no floating point.  All PDF "real" numbers are 16.16
+  signed fixed point so the module needs neither FPEmulator nor VFP and
+  runs at full speed on every CPU from ARMv5 to ARMv8 AArch32.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFTYPES_H
+#define PDFTYPES_H
+
+typedef unsigned char       u8;
+typedef signed   char       s8;
+typedef unsigned short      u16;
+typedef signed   short      s16;
+typedef unsigned int        u32;
+typedef signed   int        s32;
+typedef unsigned long long  u64;
+typedef signed   long long  s64;
+
+/* 16.16 signed fixed point.  Range +-32767, resolution 1/65536 -
+   ample for PDF user space (pages are ~600x850 units).             */
+typedef s32 fix;
+
+#define FX_ONE       0x10000
+#define FX_HALF      0x8000
+#define FX_FROMINT(i) ((fix)((u32)(s32)(i) << 16))   /* shift in u32:
+                                 defined for negatives, same bits    */
+#define FX_TOINT(f)   ((s32)(f) >> 16)                    /* floor  */
+#define FX_ROUND(f)   (((s32)(f) + FX_HALF) >> 16)
+#define fx_mul(a, b)  ((fix)(((s64)(a) * (s64)(b)) >> 16))
+#define fx_div(a, b)  ((fix)(((s64)(a) << 16) / (s64)(b)))
+
+/* Error codes.  0 = success; negative = failure (so handles/counts
+   can share a return register with errors at the SWI boundary).    */
+enum {
+    PDF_OK           = 0,
+    PDF_E_NOMEM      = -1,     /* allocation failed                 */
+    PDF_E_SYNTAX     = -2,     /* malformed PDF syntax              */
+    PDF_E_DATA       = -3,     /* corrupt stream / filter data      */
+    PDF_E_BADXREF    = -4,     /* cross-reference damage            */
+    PDF_E_UNSUP      = -5,     /* valid PDF, feature not supported  */
+    PDF_E_ENCRYPTED  = -6,     /* encrypted document                */
+    PDF_E_RANGE      = -7,     /* bad page number / argument        */
+    PDF_E_LIMIT      = -8      /* implementation limit exceeded     */
+};
+
+#endif

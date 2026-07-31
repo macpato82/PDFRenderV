@@ -1,0 +1,3 @@
+#define OPJ_PACKAGE_VERSION "2.5.2"
+#define OPJ_HAVE_INTTYPES_H 1
+#define OPJ_HAVE_STDINT_H 1

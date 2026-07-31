@@ -1,0 +1,706 @@
+/*
+  PDFRender - module glue: init/final, SWI dispatch and *Commands.
+
+  SWI interface (chunk base is a PLACEHOLDER, see cmhg/modhead):
+    PDFRender_Open      R1 -> ctrl-terminated filename
+                        => R0 = document handle, R1 = page count
+    PDFRender_Close     R0 = handle
+    PDFRender_Info      R0 = handle
+                        => R0 = pages, R1 = (major<<8)|minor
+    PDFRender_PageSize  R0 = handle, R1 = page (1-based)
+                        => R0 = width mpt, R1 = height mpt, R2 = rot
+    PDFRender_Render    R0 = flags (bit 0: white background)
+                        R1 = handle, R2 = page (1-based)
+                        R3 = sprite area ptr, R4 = sprite ptr
+                        (page is scaled to fit the sprite)
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdfflt.h"
+#include "pdffile.h"
+#include "pdffont.h"
+#include "pdfimg.h"
+#include "pdfpage.h"
+#include "pdfdraw.h"
+#include "modhead.h"
+#include "module.h"
+
+#define XOS_File        (0x08)
+#define XOS_SpriteOp    (0x2E)
+#define XOS_Write0      (0x02)
+#define XOS_NewLine     (0x03)
+#define XOS_Module      (0x1E)
+#define XOS_CLI         (0x05)
+#define XOS_ReadVarVal  (0x23)
+#define XOS_SetVarVal   (0x24)
+
+#define RUNTYPE_VAR   "Alias$@RunType_ADF"
+#define VIEWER_VAR    "PDFRenderV$Viewer"
+
+#define SPRITE_MODE_32BPP_180 \
+    ((6u << 27) | (180u << 14) | (180u << 1) | 1u)
+
+#define MAXDOCS 8
+
+typedef struct {
+    int inuse;
+    PdfDoc *doc;
+    u8 *buf;
+} DocSlot;
+
+static DocSlot docs[MAXDOCS];
+
+/* --- helpers -------------------------------------------------------- */
+
+static void
+wr0(const char *s)
+{
+    _swix(XOS_Write0, _IN(0), s);
+    _swix(XOS_NewLine, 0);
+}
+
+static _kernel_oserror *
+pdferr_to_os(int err)
+{
+    switch (err) {
+    case PDF_OK:
+        return NULL;
+    case PDF_E_NOMEM:
+        return err_NoMem;
+    case PDF_E_ENCRYPTED:
+        return err_Encrypted;
+    case PDF_E_UNSUP:
+        return err_Unsup;
+    case PDF_E_RANGE:
+        return err_BadPage;
+    default:
+        return err_BadPDF;
+    }
+}
+
+/* Copy a CLI token (CR-terminated tail rule: anything <= ' ' ends).  */
+static const char *
+get_token(const char *p, char *out, int outsz)
+{
+    int n = 0;
+
+    while (*p == ' ') {
+        p++;
+    }
+    while ((unsigned char) *p > ' ' && n < outsz - 1) {
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+    return p;
+}
+
+/* Load a whole file into a malloc'd buffer.                          */
+static _kernel_oserror *
+load_file(const char *name, u8 **bufp, u32 *lenp)
+{
+    _kernel_oserror *e;
+    int objtype = 0, size = 0;
+    u8 *buf;
+
+    e = _swix(XOS_File, _INR(0, 1) | _OUT(0) | _OUT(4),
+              17, name, &objtype, &size);
+    if (e != NULL) {
+        return e;
+    }
+    if (objtype != 1 && objtype != 3) {
+        return err_BadPDF;
+    }
+    if (size < 32 || size > 0x10000000) {
+        return err_BadPDF;
+    }
+    buf = malloc((u32) size);
+    if (buf == NULL) {
+        return err_NoMem;
+    }
+    e = _swix(XOS_File, _INR(0, 3), 255, name, buf, 0);
+    if (e != NULL) {
+        free(buf);
+        return e;
+    }
+    *bufp = buf;
+    *lenp = (u32) size;
+    return NULL;
+}
+
+static _kernel_oserror *
+open_doc(const char *name, int *handlep)
+{
+    int i;
+    u8 *buf;
+    u32 len;
+    PdfDoc *doc;
+    _kernel_oserror *e;
+    int err;
+
+    for (i = 0; i < MAXDOCS; i++) {
+        if (!docs[i].inuse) {
+            break;
+        }
+    }
+    if (i == MAXDOCS) {
+        return err_NoMem;
+    }
+    e = load_file(name, &buf, &len);
+    if (e != NULL) {
+        return e;
+    }
+    err = pdf_open(&doc, buf, len);
+    if (err != PDF_OK) {
+        free(buf);
+        return pdferr_to_os(err);
+    }
+    docs[i].inuse = 1;
+    docs[i].doc = doc;
+    docs[i].buf = buf;
+    *handlep = i + 1;
+    return NULL;
+}
+
+static DocSlot *
+get_doc(int handle)
+{
+    if (handle < 1 || handle > MAXDOCS || !docs[handle - 1].inuse) {
+        return NULL;
+    }
+    return &docs[handle - 1];
+}
+
+static void
+close_doc(DocSlot *ds)
+{
+    pdf_close(ds->doc);
+    free(ds->buf);
+    ds->doc = NULL;
+    ds->buf = NULL;
+    ds->inuse = 0;
+}
+
+/* Render page (0-based) direct to the current VDU output at zoom
+   (16.16 device units per point).  Used inside PDriver print jobs,
+   which intercept the Draw/Font/sprite calls.                        */
+static _kernel_oserror *
+render_direct(PdfDoc *doc, u32 page, fix zoom)
+{
+    RoRender *rr;
+    fix pw, ph;
+    int rot, err;
+
+    if (zoom <= 0) {
+        return err_BadPage;
+    }
+    if (pdf_pagegeom(doc, page, &pw, &ph, &rot) != PDF_OK) {
+        return err_BadPage;
+    }
+    if (rot == 90 || rot == 270) {
+        fix t = pw;
+        pw = ph;
+        ph = t;
+    }
+    rr = malloc(sizeof *rr);
+    if (rr == NULL) {
+        return err_NoMem;
+    }
+    rorender_begin_direct(rr, FX_TOINT(fx_mul(pw, zoom)),
+                          FX_TOINT(fx_mul(ph, zoom)));
+    err = pdf_runpage(doc, page, &rr->be, zoom);
+    rorender_end(rr);
+    free(rr);
+    return pdferr_to_os(err);
+}
+
+/* Render page (0-based) into sprite, scaled to fit.                  */
+static _kernel_oserror *
+render_into_sprite(PdfDoc *doc, u32 page, void *area, void *sprite,
+                   int whitebg)
+{
+    RoRender *rr;
+    fix pw, ph, zoom, zx, zy;
+    int rot, err;
+
+    if (pdf_pagegeom(doc, page, &pw, &ph, &rot) != PDF_OK) {
+        return err_BadPage;
+    }
+    if (rot == 90 || rot == 270) {
+        fix t = pw;
+        pw = ph;
+        ph = t;
+    }
+    rr = malloc(sizeof *rr);
+    if (rr == NULL) {
+        return err_NoMem;
+    }
+    err = rorender_begin(rr, area, sprite, whitebg);
+    if (err != PDF_OK) {
+        free(rr);
+        return pdferr_to_os(err);
+    }
+    zx = fx_div(FX_FROMINT(rr->devw), pw);
+    zy = fx_div(FX_FROMINT(rr->devh), ph);
+    zoom = zx < zy ? zx : zy;
+    err = pdf_runpage(doc, page, &rr->be, zoom);
+    rorender_end(rr);
+    free(rr);
+    return pdferr_to_os(err);
+}
+
+/* --- module lifecycle ----------------------------------------------- */
+
+_kernel_oserror *
+mod_init(const char *cmd_tail, int podule_base, void *pw)
+{
+    /* refuse to stack a second instance (the newest instance would
+       otherwise shadow this one and confuse testing)                 */
+    int count = 0, module = 0, section = 0;
+
+    (void) cmd_tail;
+    (void) podule_base;
+    (void) pw;
+    for (;;) {
+        u8 *base = NULL;
+        /* OS_Module 12: R1/R2 enumerate, R3 = module base; the title
+           lives at base + word[base+&10] (PRM: Modules)              */
+        if (_swix(XOS_Module, _INR(0, 2) | _OUT(1) | _OUT(2) | _OUT(3),
+                  12, module, section, &module, &section,
+                  &base) != NULL) {
+            break;
+        }
+        if (base != NULL) {
+            u32 toff = *(u32 *) (base + 0x10);
+            if (toff != 0 &&
+                strcmp((const char *) base + toff, "PDFRenderV") == 0) {
+                count++;
+            }
+        }
+    }
+    if (count >= 2) {
+        return err_Already;
+    }
+    memset(docs, 0, sizeof docs);
+    /* claim the PDF filetype (&ADF) if a viewer app is registered:
+       double-click then runs it on the file                          */
+    {
+        char viewer[200];
+        int len = 0;
+        if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+                  VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
+                  &len) == NULL && len > 0) {
+            char alias[256];
+            viewer[len] = 0;
+            sprintf(alias, "Run %s %%*0", viewer);
+            _swix(XOS_SetVarVal, _INR(0, 4),
+                  RUNTYPE_VAR, alias, strlen(alias), 0, 0);
+        }
+    }
+    return NULL;
+}
+
+_kernel_oserror *
+mod_final(int fatal, int podule, void *pw)
+{
+    int i;
+
+    (void) fatal;
+    (void) podule;
+    (void) pw;
+    for (i = 0; i < MAXDOCS; i++) {
+        if (docs[i].inuse) {
+            close_doc(&docs[i]);
+        }
+    }
+    /* drop the RunType alias, but only if it looks like ours         */
+    {
+        char cur[256], viewer[200];
+        int len = 0, vlen = 0;
+        if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+                  VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
+                  &vlen) == NULL && vlen > 0 &&
+            _swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+                  RUNTYPE_VAR, cur, (int) sizeof cur - 1, 0, 0,
+                  &len) == NULL && len > 4) {
+            cur[len] = 0;
+            viewer[vlen] = 0;
+            if (strncmp(cur, "Run ", 4) == 0 &&
+                strncmp(cur + 4, viewer, strlen(viewer)) == 0) {
+                _swix(XOS_SetVarVal, _INR(0, 4),
+                      RUNTYPE_VAR, 0, -1, 0, 0);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* --- SWI dispatch --------------------------------------------------- */
+
+_kernel_oserror *
+mod_swi(int swi_no, _kernel_swi_regs *r, void *pw)
+{
+    (void) pw;
+    switch (swi_no) {
+    case SWIOFF_Open:
+        {
+            int handle = 0;
+            _kernel_oserror *e =
+                open_doc((const char *) r->r[1], &handle);
+            if (e != NULL) {
+                return e;
+            }
+            r->r[0] = handle;
+            r->r[1] = (int) get_doc(handle)->doc->npages;
+            return NULL;
+        }
+    case SWIOFF_Close:
+        {
+            DocSlot *ds = get_doc(r->r[0]);
+            if (ds == NULL) {
+                return err_BadHandle;
+            }
+            close_doc(ds);
+            return NULL;
+        }
+    case SWIOFF_Info:
+        {
+            DocSlot *ds = get_doc(r->r[0]);
+            if (ds == NULL) {
+                return err_BadHandle;
+            }
+            r->r[0] = (int) ds->doc->npages;
+            r->r[1] = (ds->doc->vermajor << 8) | ds->doc->verminor;
+            return NULL;
+        }
+    case SWIOFF_PageSize:
+        {
+            DocSlot *ds = get_doc(r->r[0]);
+            fix w, h;
+            int rot;
+            if (ds == NULL) {
+                return err_BadHandle;
+            }
+            if (r->r[1] < 1 ||
+                pdf_pagegeom(ds->doc, (u32) r->r[1] - 1, &w, &h,
+                             &rot) != PDF_OK) {
+                return err_BadPage;
+            }
+            /* 16.16 points -> millipoints                            */
+            r->r[0] = (int) (((s64) w * 1000) >> 16);
+            r->r[1] = (int) (((s64) h * 1000) >> 16);
+            r->r[2] = rot;
+            return NULL;
+        }
+    case SWIOFF_Render:
+        {
+            DocSlot *ds = get_doc(r->r[1]);
+            if (ds == NULL) {
+                return err_BadHandle;
+            }
+            if (r->r[2] < 1 || (u32) r->r[2] > ds->doc->npages) {
+                return err_BadPage;
+            }
+            if (r->r[0] & 2) {
+                /* direct mode: R3 = zoom (16.16 device units/point)  */
+                return render_direct(ds->doc, (u32) r->r[2] - 1,
+                                     (fix) r->r[3]);
+            }
+            return render_into_sprite(ds->doc, (u32) r->r[2] - 1,
+                                      (void *) r->r[3],
+                                      (void *) r->r[4],
+                                      r->r[0] & 1);
+        }
+    case SWIOFF_ExtractText:
+        {
+            DocSlot *ds = get_doc(r->r[1]);
+            PdfGlyph *gl = NULL;
+            u32 n = 0, need;
+            int err;
+
+            if (ds == NULL) {
+                return err_BadHandle;
+            }
+            if (r->r[2] < 1 || (u32) r->r[2] > ds->doc->npages) {
+                return err_BadPage;
+            }
+            err = pdf_extracttext(ds->doc, (u32) r->r[2] - 1,
+                                  r->r[3] ? (fix) r->r[3] : FX_ONE,
+                                  &gl, &n);
+            if (err != PDF_OK) {
+                free(gl);
+                return pdferr_to_os(err);
+            }
+            need = n * (u32) sizeof(PdfGlyph);
+            if (r->r[4] != 0 && (u32) r->r[5] >= need && need > 0) {
+                memcpy((void *) r->r[4], gl, need);
+            }
+            free(gl);
+            r->r[0] = (int) need;
+            r->r[1] = (int) n;
+            return NULL;
+        }
+    default:
+        return err_BadSWI;
+    }
+}
+
+/* --- * commands ----------------------------------------------------- */
+
+static _kernel_oserror *
+cmd_pdfinfo(const char *tail)
+{
+    char name[256];
+    int handle = 0;
+    _kernel_oserror *e;
+    DocSlot *ds;
+    char line[128];
+    u32 p, show;
+
+    get_token(tail, name, sizeof name);
+    e = open_doc(name, &handle);
+    if (e != NULL) {
+        return e;
+    }
+    ds = get_doc(handle);
+    sprintf(line, "PDF %d.%d, %u page%s", ds->doc->vermajor,
+            ds->doc->verminor, ds->doc->npages,
+            ds->doc->npages == 1 ? "" : "s");
+    wr0(line);
+    show = ds->doc->npages < 8 ? ds->doc->npages : 8;
+    for (p = 0; p < show; p++) {
+        fix w, h;
+        int rot;
+        if (pdf_pagegeom(ds->doc, p, &w, &h, &rot) == PDF_OK) {
+            sprintf(line, "  page %u: %d x %d pt%s%d", p + 1,
+                    FX_ROUND(w), FX_ROUND(h),
+                    rot ? ", rotated " : "", rot);
+            if (!rot) {
+                line[strlen(line) - 1] = 0;
+            }
+            wr0(line);
+        }
+    }
+    close_doc(ds);
+    return NULL;
+}
+
+/* Turn a page's glyphs into plain text, inserting spaces and line
+   breaks from the geometry (a PDF stores neither).                  */
+static char *
+glyphs_to_text(PdfGlyph *gl, u32 n, u32 *lenp)
+{
+    char *out = malloc((u32) n * 2 + 8);
+    u32 i, k = 0;
+
+    *lenp = 0;
+    if (out == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        if (i > 0) {
+            PdfGlyph *p = &gl[i - 1];
+            s32 half = (p->y1 - p->y0) / 2;
+            if (gl[i].y0 < p->y0 - half || gl[i].y0 > p->y0 + half) {
+                out[k++] = 10;
+            } else if (gl[i].x0 > p->x1 + (p->x1 - p->x0) / 3) {
+                out[k++] = ' ';
+            }
+        }
+        if (gl[i].ch >= 32 && gl[i].ch < 256) {
+            out[k++] = (char) gl[i].ch;
+        }
+    }
+    out[k] = 0;
+    *lenp = k;
+    return out;
+}
+
+static _kernel_oserror *
+cmd_pdftext(const char *tail)
+{
+    char name[256], pagestr[16], out[256];
+    int handle = 0, page;
+    _kernel_oserror *e;
+    DocSlot *ds;
+    PdfGlyph *gl = NULL;
+    u32 n = 0, len = 0;
+    char *text;
+
+    tail = get_token(tail, name, sizeof name);
+    tail = get_token(tail, pagestr, sizeof pagestr);
+    get_token(tail, out, sizeof out);
+    page = atoi(pagestr);
+    if (page < 1) {
+        return err_Syntax;
+    }
+    e = open_doc(name, &handle);
+    if (e != NULL) {
+        return e;
+    }
+    ds = get_doc(handle);
+    if ((u32) page > ds->doc->npages) {
+        close_doc(ds);
+        return err_BadPage;
+    }
+    if (pdf_extracttext(ds->doc, (u32) page - 1, FX_ONE, &gl, &n)
+        != PDF_OK) {
+        close_doc(ds);
+        return err_NoMem;
+    }
+    text = glyphs_to_text(gl, n, &len);
+    free(gl);
+    close_doc(ds);
+    if (text == NULL) {
+        return err_NoMem;
+    }
+    if (out[0] != 0) {
+        e = _swix(XOS_File, _INR(0, 5), 10, out, 0xFFF, 0,
+                  text, text + len);
+        if (e == NULL) {
+            char line[320];
+            sprintf(line, "Wrote %u characters (%u glyphs) to %s",
+                    len, n, out);
+            wr0(line);
+        }
+    } else {
+        char line[80];
+        sprintf(line, "%u glyphs, %u characters:", n, len);
+        wr0(line);
+        wr0(text);
+        e = NULL;
+    }
+    free(text);
+    return e;
+}
+
+static _kernel_oserror *
+cmd_pdftosprite(const char *tail)
+{
+    char name[256], pagestr[16], out[256], widthstr[16];
+    int handle = 0, page, width;
+    _kernel_oserror *e;
+    DocSlot *ds;
+    fix pw, ph;
+    int rot, height;
+    u8 *area = NULL;
+    u32 areasize;
+
+    tail = get_token(tail, name, sizeof name);
+    tail = get_token(tail, pagestr, sizeof pagestr);
+    tail = get_token(tail, out, sizeof out);
+    get_token(tail, widthstr, sizeof widthstr);
+    page = atoi(pagestr);
+    width = widthstr[0] ? atoi(widthstr) : 1000;
+    if (page < 1 || width < 16 || width > 4096) {
+        return err_Syntax;
+    }
+
+    e = open_doc(name, &handle);
+    if (e != NULL) {
+        return e;
+    }
+    ds = get_doc(handle);
+    if ((u32) page > ds->doc->npages ||
+        pdf_pagegeom(ds->doc, (u32) page - 1, &pw, &ph, &rot) != PDF_OK) {
+        close_doc(ds);
+        return err_BadPage;
+    }
+    if (rot == 90 || rot == 270) {
+        fix t = pw;
+        pw = ph;
+        ph = t;
+    }
+    height = (int) (((s64) width * ph) / pw);
+    if (height < 1) {
+        height = 1;
+    }
+    if (height > 4096) {
+        height = 4096;
+        width = (int) (((s64) height * pw) / ph);
+    }
+
+    areasize = 16 + 44 + (u32) width * (u32) height * 4 + 64;
+    area = malloc(areasize);
+    if (area == NULL) {
+        close_doc(ds);
+        return err_NoMem;
+    }
+    ((u32 *) area)[0] = areasize;
+    ((u32 *) area)[1] = 0;
+    ((u32 *) area)[2] = 16;
+    ((u32 *) area)[3] = 16;
+    e = _swix(XOS_SpriteOp, _INR(0, 6),
+              15 + 256, area, "page", 0, width, height,
+              SPRITE_MODE_32BPP_180);
+    if (e == NULL) {
+        e = render_into_sprite(ds->doc, (u32) page - 1,
+                               area, area + 16, 1);
+    }
+    if (e == NULL) {
+        e = _swix(XOS_SpriteOp, _INR(0, 2), 12 + 256, area, out);
+    }
+    if (e == NULL) {
+        /* stamp it as a sprite file                                  */
+        e = _swix(XOS_File, _INR(0, 2), 18, out, 0xFF9);
+    }
+    free(area);
+    close_doc(ds);
+    if (e == NULL) {
+        char line[192];
+        sprintf(line, "Rendered page %d to %s (%d x %d)",
+                page, out, width, height);
+        wr0(line);
+    }
+    return e;
+}
+
+_kernel_oserror *
+cmd_handler(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+    (void) argc;
+    (void) pw;
+    switch (cmd_no) {
+    case CMD_PDFInfo:
+        return cmd_pdfinfo(arg_string);
+    case CMD_PDFToSprite:
+        return cmd_pdftosprite(arg_string);
+    case CMD_PDFText:
+        return cmd_pdftext(arg_string);
+    case CMD_PDFRenderVOpen:
+        /* run the viewer application on the file (replaces the
+           current application, as *Run always does)                  */
+        {
+            char viewer[200], cmd[512], tail[256];
+            int vlen = 0, n = 0;
+            const char *p = arg_string;
+            _kernel_oserror *e =
+                _swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+                      VIEWER_VAR, viewer, (int) sizeof viewer - 1,
+                      0, 0, &vlen);
+            if (e != NULL || vlen <= 0) {
+                return err_Syntax;      /* no viewer registered */
+            }
+            viewer[vlen] = 0;
+            while ((unsigned char) *p >= ' ' && n < 255) {
+                tail[n++] = *p++;      /* CR-terminated CLI tail  */
+            }
+            tail[n] = 0;
+            sprintf(cmd, "Run %s %s", viewer, tail);
+            return _swix(XOS_CLI, _IN(0), cmd);
+        }
+    default:
+        return NULL;
+    }
+}

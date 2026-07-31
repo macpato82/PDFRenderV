@@ -1,0 +1,68 @@
+/*
+  PDFRender - font model.
+
+  PDF fonts are mapped onto RISC OS outline fonts: the standard 14
+  (and anything metrically similar) onto Acorn's metric clones -
+  Helvetica->Homerton, Times->Trinity, Courier->Corpus, plus
+  Symbol->Sidney and ZapfDingbats->Selwyn.  Embedded font programs
+  are NOT interpreted; unknown fonts fall back by descriptor flags
+  (fixed pitch / serif) so text keeps its position and measure even
+  when the exact face differs.
+
+  Simple fonts carry /Widths in 1/1000 em; Type0 (CID) fonts carry
+  /W ranges and are mapped to Latin-1 through their /ToUnicode CMap
+  when present.  Type3 fonts are not rendered in this version.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFFONT_H
+#define PDFFONT_H
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdffile.h"
+
+enum {
+    PDFF_SIMPLE = 0,            /* Type1/TrueType/MMType1, 1-byte     */
+    PDFF_TYPE0,                 /* composite, 2-byte CIDs             */
+    PDFF_TYPE3                  /* glyph procedures - not rendered    */
+};
+
+typedef struct {
+    u16 lo, hi;                 /* CID range                          */
+    u16 w;                      /* width, 1/1000 em                   */
+} PdfWRange;
+
+typedef struct {
+    u16 lo, hi;                 /* CID range                          */
+    u32 dst;                    /* unicode of lo (increments across)  */
+} PdfURange;
+
+typedef struct PdfFont {
+    char rofont[48];            /* RISC OS font to render with        */
+    int type;
+    int firstchar, lastchar;
+    u16 *widths;                /* simple: [first..last], 1/1000 em   */
+    u16 defwidth;               /* missing-width value                */
+    u8 enc[256];                /* simple: code -> Latin-1 for FM     */
+    /* Type0 */
+    PdfWRange *wr;              /* CID widths                         */
+    u32 nwr;
+    PdfURange *ur;              /* CID -> unicode (from ToUnicode)    */
+    u32 nur;
+} PdfFont;
+
+/* Build a PdfFont from a /Font resource dict (pool-allocated).       */
+PdfFont *pdffont_make(PdfDoc *doc, PdfObj *fontdict);
+
+/* Width of a character code, 1/1000 em (already through /Widths or
+   /W; falls back to defwidth).                                       */
+int pdffont_width(PdfFont *f, u32 code);
+
+/* Map a code to a Latin-1 byte for FontManager (0 = no mapping).     */
+int pdffont_tolatin1(PdfFont *f, u32 code);
+
+#endif

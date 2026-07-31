@@ -1,0 +1,1558 @@
+/*
+  PDFRender - content-stream interpreter.
+
+  Walks a page's (or form XObject's) content stream, maintaining the
+  PDF graphics state, and drives the backend vtable with everything
+  already transformed to device space (16.16 OS units, origin bottom
+  left, y up - same convention as both PDF and RISC OS).
+
+  Error policy: a damaged operator never aborts the page - operands
+  are cleared and interpretation continues, so a torn PDF still
+  renders everything that can be rendered.  Only out-of-memory stops
+  the run.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfobj.h"
+#include "pdfflt.h"
+#include "pdffile.h"
+#include "pdffont.h"
+#include "pdfimg.h"
+#include "pdfpage.h"
+
+#define MAX_GSTATE   32
+#define MAX_OPS      32
+#define MAX_FORMDEPTH 12
+#define MAX_FCACHE   16
+#define MAX_DASH     8
+
+typedef struct {
+    fix m[6];                   /* CTM (user -> device)               */
+    u32 fillrgb, strokergb;
+    PdfObj *fillcs, *strokecs;  /* resolved colour-space objects      */
+    fix linewidth;
+    int cap, join;
+    fix dash[MAX_DASH];
+    int ndash;
+    fix dashphase;
+    /* transparency (constant alpha from ExtGState /ca /CA) */
+    fix fillalpha, strokealpha;
+    int blend;                  /* PDF_BLEND_*                        */
+    int softmask;               /* an /SMask we cannot evaluate       */
+    /* text parameters (saved/restored by q/Q, per spec) */
+    fix charsp, wordsp, hscale, leading, rise;
+    int render;
+    PdfFont *font;
+    fix fontsize;
+} GState;
+
+typedef struct {
+    PdfDoc *doc;
+    PdfBackend *be;
+    PdfPool *rpool;             /* per-run pool for content objects   */
+    GState gs[MAX_GSTATE];
+    int gsp;
+    /* current path (device space) */
+    PdfPath path;
+    PdfPt curu;                 /* current point, user space          */
+    PdfPt startu;               /* subpath start, user space          */
+    int haspath;
+    int pendclip;               /* clip after next paint op           */
+    /* text object */
+    fix tm[6], tlm[6];
+    /* operand stack */
+    PdfObj *ops[MAX_OPS];
+    int nops;
+    /* resources */
+    PdfObj *res;
+    int formdepth;
+    /* font cache (per run) */
+    struct {
+        PdfObj *dict;
+        PdfFont *font;
+    } fc[MAX_FCACHE];
+    int nfc;
+    /* Depth of nested form XObjects invoked through a soft mask (or
+       partial alpha).  A transparency group is composited as a whole
+       through that mask, so a `gs` *inside* the form cannot clear it
+       - which is exactly what highlight annotations rely on.        */
+    int maskdepth;
+    int fatal;
+} Interp;
+
+/* --- matrices ------------------------------------------------------- */
+
+/* r = a then b (PDF row-vector convention: p' = p . a . b) */
+static void
+mat_mul(fix *r, const fix *a, const fix *b)
+{
+    fix t[6];
+
+    t[0] = fx_mul(a[0], b[0]) + fx_mul(a[1], b[2]);
+    t[1] = fx_mul(a[0], b[1]) + fx_mul(a[1], b[3]);
+    t[2] = fx_mul(a[2], b[0]) + fx_mul(a[3], b[2]);
+    t[3] = fx_mul(a[2], b[1]) + fx_mul(a[3], b[3]);
+    t[4] = fx_mul(a[4], b[0]) + fx_mul(a[5], b[2]) + b[4];
+    t[5] = fx_mul(a[4], b[1]) + fx_mul(a[5], b[3]) + b[5];
+    memcpy(r, t, sizeof t);
+}
+
+static void
+mat_apply(PdfPt *out, const fix *m, fix x, fix y)
+{
+    out->x = fx_mul(x, m[0]) + fx_mul(y, m[2]) + m[4];
+    out->y = fx_mul(x, m[1]) + fx_mul(y, m[3]) + m[5];
+}
+
+static void
+mat_ident(fix *m)
+{
+    m[0] = FX_ONE; m[1] = 0;
+    m[2] = 0;      m[3] = FX_ONE;
+    m[4] = 0;      m[5] = 0;
+}
+
+static fix
+fx_abs(fix v)
+{
+    return v < 0 ? -v : v;
+}
+
+static int
+is_ws_byte(u8 c)
+{
+    return c == 0 || c == 9 || c == 10 || c == 12 || c == 13 || c == 32;
+}
+
+static u32 alpha_towhite(u32 rgb, fix a);
+
+/* --- operand helpers ------------------------------------------------ */
+
+static GState *
+cur(Interp *it)
+{
+    return &it->gs[it->gsp];
+}
+
+static fix
+opf(Interp *it, int nargs, int k)
+{
+    if (it->nops < nargs) {
+        return 0;
+    }
+    return pdfobj_fix(it->ops[it->nops - nargs + k]);
+}
+
+static PdfObj *
+opo(Interp *it, int nargs, int k)
+{
+    if (it->nops < nargs) {
+        return NULL;
+    }
+    return it->ops[it->nops - nargs + k];
+}
+
+/* --- path building -------------------------------------------------- */
+
+static int
+path_add(Interp *it, int op, const PdfPt *a, const PdfPt *b,
+         const PdfPt *c)
+{
+    PdfPath *p = &it->path;
+
+    if (p->n >= p->cap) {
+        u32 ncap = p->cap ? p->cap * 2 : 64;
+        PdfPathEl *ne;
+        if (ncap > 1u << 20) {
+            return PDF_E_LIMIT;
+        }
+        ne = realloc(p->el, ncap * sizeof *ne);
+        if (ne == NULL) {
+            it->fatal = PDF_E_NOMEM;
+            return PDF_E_NOMEM;
+        }
+        p->el = ne;
+        p->cap = ncap;
+    }
+    p->el[p->n].op = (u8) op;
+    if (a) p->el[p->n].p[0] = *a;
+    if (b) p->el[p->n].p[1] = *b;
+    if (c) p->el[p->n].p[2] = *c;
+    p->n++;
+    it->haspath = 1;
+    return PDF_OK;
+}
+
+static void
+path_moveto(Interp *it, fix x, fix y)
+{
+    PdfPt d;
+
+    it->curu.x = x;
+    it->curu.y = y;
+    it->startu = it->curu;
+    mat_apply(&d, cur(it)->m, x, y);
+    path_add(it, PDF_EL_MOVE, &d, NULL, NULL);
+}
+
+static void
+path_lineto(Interp *it, fix x, fix y)
+{
+    PdfPt d;
+
+    it->curu.x = x;
+    it->curu.y = y;
+    mat_apply(&d, cur(it)->m, x, y);
+    path_add(it, PDF_EL_LINE, &d, NULL, NULL);
+}
+
+static void
+path_curveto(Interp *it, fix x1, fix y1, fix x2, fix y2, fix x3, fix y3)
+{
+    PdfPt d1, d2, d3;
+    const fix *m = cur(it)->m;
+
+    mat_apply(&d1, m, x1, y1);
+    mat_apply(&d2, m, x2, y2);
+    mat_apply(&d3, m, x3, y3);
+    it->curu.x = x3;
+    it->curu.y = y3;
+    path_add(it, PDF_EL_CURVE, &d1, &d2, &d3);
+}
+
+static void
+path_close(Interp *it)
+{
+    it->curu = it->startu;
+    path_add(it, PDF_EL_CLOSE, NULL, NULL, NULL);
+}
+
+static void
+path_clear(Interp *it)
+{
+    it->path.n = 0;
+    it->haspath = 0;
+}
+
+static void
+path_bbox(const PdfPath *p, fix *x0, fix *y0, fix *x1, fix *y1)
+{
+    u32 i;
+    int any = 0;
+
+    *x0 = *y0 = 0x7fffffff;
+    *x1 = *y1 = (fix) 0x80000000;
+    for (i = 0; i < p->n; i++) {
+        int np = p->el[i].op == PDF_EL_CURVE ? 3
+               : p->el[i].op == PDF_EL_CLOSE ? 0 : 1;
+        int k;
+        for (k = 0; k < np; k++) {
+            fix x = p->el[i].p[k].x, y = p->el[i].p[k].y;
+            if (x < *x0) *x0 = x;
+            if (y < *y0) *y0 = y;
+            if (x > *x1) *x1 = x;
+            if (y > *y1) *y1 = y;
+            any = 1;
+        }
+    }
+    if (!any) {
+        *x0 = *y0 = *x1 = *y1 = 0;
+    }
+}
+
+/* --- painting ------------------------------------------------------- */
+
+static void
+apply_pending_clip(Interp *it)
+{
+    if (it->pendclip && it->path.n) {
+        fix x0, y0, x1, y1;
+        path_bbox(&it->path, &x0, &y0, &x1, &y1);
+        it->be->clip(it->be->ctx, x0, y0, x1, y1);
+    }
+    it->pendclip = 0;
+}
+
+static void
+paint(Interp *it, int dofill, int dostroke, int evenodd, int closefirst)
+{
+    GState *g = cur(it);
+
+    if (closefirst) {
+        path_close(it);
+    }
+    /* alpha 0: invisible - never paint (painting white would wrongly
+       erase what is underneath)                                      */
+    if (g->fillalpha <= 0 && g->blend != PDF_BLEND_MULTIPLY &&
+        !g->softmask && it->maskdepth == 0) {
+        dofill = 0;
+    }
+    if (g->strokealpha <= 0) {
+        dostroke = 0;
+    }
+    if (it->path.n) {
+        if (dofill) {
+            /* Pass colour and alpha through untouched: the backend
+               composites against what it has already drawn, which is
+               what makes highlight annotations (translucent yellow
+               over text) come out right.
+
+               A soft mask we cannot evaluate degrades to Multiply
+               rather than an opaque fill.  Highlight annotations are
+               exactly this shape - /SMask luminosity, BM Normal,
+               ca 1 - and painting them opaque would bury the text
+               they are meant to emphasise.  Multiply can only ever
+               darken, so it is the safe approximation generally.    */
+            int bl = (g->blend == PDF_BLEND_MULTIPLY || g->softmask ||
+                      it->maskdepth > 0)
+                     ? PDF_BLEND_MULTIPLY : PDF_BLEND_NORMAL;
+            it->be->fill(it->be->ctx, &it->path, g->fillrgb, evenodd,
+                         bl, g->fillalpha);
+        }
+        if (dostroke) {
+            fix sc = (fx_abs(g->m[0]) + fx_abs(g->m[3])) / 2;
+            fix w = fx_mul(g->linewidth, sc);
+            fix dash[MAX_DASH];
+            int i;
+            for (i = 0; i < g->ndash; i++) {
+                dash[i] = fx_mul(g->dash[i], sc);
+            }
+            it->be->stroke(it->be->ctx, &it->path,
+                           alpha_towhite(g->strokergb, g->strokealpha),
+                           w, g->cap, g->join, dash, g->ndash,
+                           fx_mul(g->dashphase, sc));
+        }
+    }
+    apply_pending_clip(it);
+    path_clear(it);
+}
+
+/* --- colour --------------------------------------------------------- */
+
+/* Constant alpha, approximated against the white page: blend the
+   paint colour towards white.  Exact for alpha 0 (callers skip the
+   paint entirely) and 1; a fair stand-in between.                    */
+static u32
+alpha_towhite(u32 rgb, fix a)
+{
+    u32 r, g, b;
+
+    if (a >= FX_ONE) {
+        return rgb;
+    }
+    if (a < 0) {
+        a = 0;
+    }
+    r = rgb & 0xff;
+    g = (rgb >> 8) & 0xff;
+    b = (rgb >> 16) & 0xff;
+    r = 255 - (u32) ((fx_mul((fix) (255 - r) << 16, a)) >> 16);
+    g = 255 - (u32) ((fx_mul((fix) (255 - g) << 16, a)) >> 16);
+    b = 255 - (u32) ((fx_mul((fix) (255 - b) << 16, a)) >> 16);
+    return r | (g << 8) | (b << 16);
+}
+
+static u32
+rgb_pack(fix r, fix g, fix b)
+{
+    s32 ri = FX_ROUND(r * 255);
+    s32 gi = FX_ROUND(g * 255);
+    s32 bi = FX_ROUND(b * 255);
+
+    if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+    if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+    if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+    return (u32) ri | ((u32) gi << 8) | ((u32) bi << 16);
+}
+
+static u32
+cmyk_pack(fix c, fix m, fix y, fix k)
+{
+    fix r = FX_ONE - (c + k > FX_ONE ? FX_ONE : c + k);
+    fix g = FX_ONE - (m + k > FX_ONE ? FX_ONE : m + k);
+    fix b = FX_ONE - (y + k > FX_ONE ? FX_ONE : y + k);
+
+    return rgb_pack(r, g, b);
+}
+
+/* component count of a colour-space object; 0 = unknown/pattern      */
+static int
+cs_ncomp(Interp *it, PdfObj *cs)
+{
+    cs = pdf_resolve(it->doc, cs);
+    if (cs == NULL) {
+        return 0;
+    }
+    if (cs->type == PDF_NAME) {
+        const char *n = (const char *) cs->u.str.p;
+        if (strcmp(n, "DeviceGray") == 0 || strcmp(n, "CalGray") == 0 ||
+            strcmp(n, "G") == 0) {
+            return 1;
+        }
+        if (strcmp(n, "DeviceRGB") == 0 || strcmp(n, "CalRGB") == 0 ||
+            strcmp(n, "RGB") == 0) {
+            return 3;
+        }
+        if (strcmp(n, "DeviceCMYK") == 0 || strcmp(n, "CMYK") == 0) {
+            return 4;
+        }
+        return 0;
+    }
+    if (cs->type == PDF_ARRAY && pdf_arrlen(cs) >= 1) {
+        PdfObj *fam = pdf_resolve(it->doc, pdf_arrget(cs, 0));
+        if (pdf_isname(fam, "ICCBased")) {
+            PdfObj *stm = pdf_resolve(it->doc, pdf_arrget(cs, 1));
+            PdfObj *n = stm ? pdf_resolve(it->doc, pdf_dictget(stm, "N"))
+                            : NULL;
+            return n ? pdfobj_int_of(n) : 3;
+        }
+        if (pdf_isname(fam, "Indexed")) {
+            return -1;                  /* special: 1 index component */
+        }
+        if (pdf_isname(fam, "CalRGB") || pdf_isname(fam, "Lab")) {
+            return 3;
+        }
+        if (pdf_isname(fam, "CalGray")) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* indexed colour lookup: index -> packed rgb                         */
+static u32
+indexed_colour(Interp *it, PdfObj *cs, int idx)
+{
+    PdfObj *base, *lookup;
+    int nbase, hival;
+    const u8 *tab = NULL;
+    u32 tablen = 0;
+    PdfBuf tmp = { 0 };
+    u32 rgb = 0;
+
+    cs = pdf_resolve(it->doc, cs);
+    base = pdf_resolve(it->doc, pdf_arrget(cs, 1));
+    hival = pdfobj_int_of(pdf_resolve(it->doc, pdf_arrget(cs, 2)));
+    lookup = pdf_resolve(it->doc, pdf_arrget(cs, 3));
+    nbase = cs_ncomp(it, base);
+    if (nbase <= 0) {
+        nbase = 3;
+    }
+    if (idx < 0) idx = 0;
+    if (idx > hival) idx = hival;
+    if (lookup && lookup->type == PDF_STRING) {
+        tab = lookup->u.str.p;
+        tablen = lookup->u.str.len;
+    } else if (lookup && lookup->type == PDF_STREAM) {
+        if (pdf_streamdata(it->doc, lookup, &tmp, NULL) == PDF_OK) {
+            tab = tmp.p;
+            tablen = tmp.len;
+        }
+    }
+    if (tab && (u32) (idx + 1) * nbase <= tablen) {
+        const u8 *e = tab + idx * nbase;
+        if (nbase == 1) {
+            rgb = (u32) e[0] | ((u32) e[0] << 8) | ((u32) e[0] << 16);
+        } else if (nbase == 4) {
+            int r = 255 - (e[0] + e[3] > 255 ? 255 : e[0] + e[3]);
+            int g = 255 - (e[1] + e[3] > 255 ? 255 : e[1] + e[3]);
+            int b = 255 - (e[2] + e[3] > 255 ? 255 : e[2] + e[3]);
+            rgb = (u32) r | ((u32) g << 8) | ((u32) b << 16);
+        } else {
+            rgb = (u32) e[0] | ((u32) e[1] << 8) | ((u32) e[2] << 16);
+        }
+    }
+    pdfbuf_free(&tmp);
+    return rgb;
+}
+
+/* sc/scn/SC/SCN with n operands against space cs                     */
+static u32
+setcolour(Interp *it, PdfObj *cs, u32 prev)
+{
+    int nc = cs ? cs_ncomp(it, cs) : 0;
+
+    if (nc == -1 && it->nops >= 1) {
+        return indexed_colour(it, cs, FX_TOINT(opf(it, 1, 0) + FX_HALF));
+    }
+    if (nc == 0) {
+        nc = it->nops >= 4 ? 4 : it->nops >= 3 ? 3 : it->nops >= 1 ? 1 : 0;
+    }
+    if (nc == 1 && it->nops >= 1) {
+        fix v = opf(it, 1, 0);
+        return rgb_pack(v, v, v);
+    }
+    if (nc == 3 && it->nops >= 3) {
+        return rgb_pack(opf(it, 3, 0), opf(it, 3, 1), opf(it, 3, 2));
+    }
+    if (nc == 4 && it->nops >= 4) {
+        return cmyk_pack(opf(it, 4, 0), opf(it, 4, 1),
+                         opf(it, 4, 2), opf(it, 4, 3));
+    }
+    if (it->nops >= 1 && it->ops[it->nops - 1]->type == PDF_NAME) {
+        return 0x808080;                /* pattern: mid grey stand-in */
+    }
+    return prev;
+}
+
+/* --- resources ------------------------------------------------------ */
+
+static PdfObj *
+res_get(Interp *it, const char *category, PdfObj *name)
+{
+    PdfObj *cat;
+
+    if (name == NULL || name->type != PDF_NAME) {
+        return NULL;
+    }
+    cat = pdf_resolve(it->doc, pdf_dictget(it->res, category));
+    return pdf_resolve(it->doc,
+                       pdf_dictget(cat, (const char *) name->u.str.p));
+}
+
+static PdfFont *
+get_font(Interp *it, PdfObj *fontdict)
+{
+    int i;
+
+    if (fontdict == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < it->nfc; i++) {
+        if (it->fc[i].dict == fontdict) {
+            return it->fc[i].font;
+        }
+    }
+    {
+        PdfFont *f = pdffont_make(it->doc, fontdict);
+        if (f && it->nfc < MAX_FCACHE) {
+            it->fc[it->nfc].dict = fontdict;
+            it->fc[it->nfc].font = f;
+            it->nfc++;
+        }
+        return f;
+    }
+}
+
+/* --- text ----------------------------------------------------------- */
+
+static void
+show_string(Interp *it, const u8 *s, u32 len)
+{
+    GState *g = cur(it);
+    u8 out[512];
+    u32 n = 0;
+    fix trm[6], tsm[6], tmp[6];
+    fix tx = 0;
+    int twobyte = g->font && g->font->type == PDFF_TYPE0;
+    int visible = g->render != 3 && g->render != 7 &&
+                  g->font != NULL && g->font->type != PDFF_TYPE3;
+    int nglyph = 0, nspace = 0;
+    s32 emitsum = 0;            /* PDF width of emitted glyphs, /1000 */
+    u32 i = 0;
+    fix tdm[6];                 /* text space (points) -> device      */
+    fix pen = 0;                /* pen along the run, text space      */
+
+    if (g->fontsize == 0 || g->font == NULL) {
+        return;
+    }
+    tsm[0] = fx_mul(g->fontsize, g->hscale);
+    tsm[1] = 0;
+    tsm[2] = 0;
+    tsm[3] = g->fontsize;
+    tsm[4] = 0;
+    tsm[5] = g->rise;
+    mat_mul(tmp, tsm, it->tm);
+    mat_mul(trm, tmp, g->m);
+    /* Glyph boxes are wanted in unscaled text-space points, so build
+       the text-space-to-device matrix without the font-size scale.  */
+    mat_mul(tdm, it->tm, g->m);
+
+    while (i < len) {
+        u32 code;
+        int w0, lat;
+
+        if (twobyte) {
+            if (i + 1 >= len) {
+                break;
+            }
+            code = ((u32) s[i] << 8) | s[i + 1];
+            i += 2;
+        } else {
+            code = s[i++];
+        }
+        w0 = pdffont_width(g->font, code);
+        lat = pdffont_tolatin1(g->font, code);
+        if (lat > 0 && n < sizeof out) {
+            out[n++] = (u8) lat;
+            emitsum += w0;
+        }
+        nglyph++;
+        if (!twobyte && code == 32) {
+            nspace++;
+        }
+        {
+            fix adv = (fix) ((fx_mul(FX_FROMINT(w0), g->fontsize)) / 1000);
+            adv += g->charsp;
+            if (!twobyte && code == 32) {
+                adv += g->wordsp;
+            }
+            adv = fx_mul(adv, g->hscale);
+
+            /* Report the glyph box even when the run is invisible
+               (render mode 3 is how scanned PDFs carry their OCR
+               text layer, and that is exactly what one selects).   */
+            if (it->be->glyph != NULL) {
+                fix asc = fx_mul(g->fontsize, 50000);   /* ~0.76 em  */
+                fix desc = fx_mul(g->fontsize, 16000);  /* ~0.24 em  */
+                PdfPt a, b;
+                fix bx0, by0, bx1, by1, t;
+
+                mat_apply(&a, tdm, pen, g->rise - desc);
+                mat_apply(&b, tdm, pen + adv, g->rise + asc);
+                bx0 = a.x; by0 = a.y; bx1 = b.x; by1 = b.y;
+                if (bx1 < bx0) { t = bx0; bx0 = bx1; bx1 = t; }
+                if (by1 < by0) { t = by0; by0 = by1; by1 = t; }
+                it->be->glyph(it->be->ctx, (u32) (lat > 0 ? lat : 0),
+                              bx0, by0, bx1, by1);
+            }
+            if (g->font->widths != NULL || g->font->type == PDFF_TYPE0) {
+                tx += adv;
+            }
+            pen += adv;
+        }
+    }
+    /* no PDF widths: measure with the device font */
+    if (g->font->widths == NULL && g->font->type != PDFF_TYPE0) {
+        s32 tw = -1;
+        if (it->be->textwidth && n) {
+            tw = it->be->textwidth(it->be->ctx, g->font->rofont, out, n);
+        }
+        if (tw < 0) {
+            tw = nglyph * 500;
+        }
+        tx = (fix) (fx_mul(FX_FROMINT(tw), g->fontsize) / 1000);
+        tx += nglyph * g->charsp + nspace * g->wordsp;
+        tx = fx_mul(tx, g->hscale);
+    }
+    if (visible && n) {
+        int stroking = g->render == 1 || g->render == 5;
+        fix alpha = stroking ? g->strokealpha : g->fillalpha;
+        u32 col = stroking ? g->strokergb : g->fillrgb;
+        if (alpha > 0) {
+            /* Metric compensation: the RISC OS face is only a stand-
+               in for the PDF's font, so squeeze/stretch the run's x
+               axis until it occupies exactly the PDF's width - this
+               is what keeps substituted text from overlapping its
+               neighbours.                                            */
+            if ((g->font->widths != NULL || g->font->type == PDFF_TYPE0)
+                && emitsum > 0 && it->be->textwidth != NULL) {
+                s32 fmw = it->be->textwidth(it->be->ctx,
+                                            g->font->rofont, out, n);
+                if (fmw > 0) {
+                    fix ratio = (fix) (((s64) emitsum << 16) / fmw);
+                    if (ratio < FX_HALF) {
+                        ratio = FX_HALF;
+                    }
+                    if (ratio > 2 * FX_ONE) {
+                        ratio = 2 * FX_ONE;
+                    }
+                    trm[0] = fx_mul(trm[0], ratio);
+                    trm[1] = fx_mul(trm[1], ratio);
+                }
+            }
+            it->be->text(it->be->ctx, g->font->rofont, out, n, trm,
+                         alpha_towhite(col, alpha));
+        }
+    }
+    /* advance: Tm = translate(tx, 0) . Tm */
+    it->tm[4] += fx_mul(tx, it->tm[0]);
+    it->tm[5] += fx_mul(tx, it->tm[1]);
+}
+
+static void
+op_Td(Interp *it, fix txv, fix tyv)
+{
+    fix t[6];
+
+    mat_ident(t);
+    t[4] = txv;
+    t[5] = tyv;
+    mat_mul(it->tlm, t, it->tlm);
+    memcpy(it->tm, it->tlm, sizeof it->tm);
+}
+
+static void
+show_tj_array(Interp *it, PdfObj *arr)
+{
+    u32 i;
+    GState *g = cur(it);
+
+    for (i = 0; i < pdf_arrlen(arr); i++) {
+        PdfObj *e = pdf_arrget(arr, i);
+        if (e == NULL) {
+            continue;
+        }
+        if (e->type == PDF_STRING) {
+            show_string(it, e->u.str.p, e->u.str.len);
+        } else if (e->type == PDF_INT || e->type == PDF_REAL) {
+            fix v = pdfobj_fix(e);
+            fix tx = -(fix) (fx_mul(v, g->fontsize) / 1000);
+            tx = fx_mul(tx, g->hscale);
+            it->tm[4] += fx_mul(tx, it->tm[0]);
+            it->tm[5] += fx_mul(tx, it->tm[1]);
+        }
+    }
+}
+
+/* --- XObjects and inline images ------------------------------------- */
+
+static int run_content(Interp *it, const u8 *cbuf, u32 clen);
+
+static void
+do_xobject(Interp *it, PdfObj *name)
+{
+    PdfObj *xo = res_get(it, "XObject", name);
+    PdfObj *sub;
+
+    if (xo == NULL || xo->type != PDF_STREAM) {
+        return;
+    }
+    sub = pdf_resolve(it->doc, pdf_dictget(xo, "Subtype"));
+    if (pdf_isname(sub, "Image")) {
+        PdfImg img;
+        if (cur(it)->fillalpha <= 0) {
+            return;                     /* fully transparent          */
+        }
+        memset(&img, 0, sizeof img);
+        if (pdfimg_load(it->doc, xo, cur(it)->fillrgb, &img) == PDF_OK) {
+            it->be->image(it->be->ctx, &img, cur(it)->m);
+        }
+        pdfimg_free(&img);
+        return;
+    }
+    if (pdf_isname(sub, "Form")) {
+        PdfObj *mtx, *bbox, *fres;
+        PdfBuf content = { 0 };
+        GState saved = *cur(it);
+        PdfObj *savedres = it->res;
+        int masked = 0;
+
+        if (it->formdepth >= MAX_FORMDEPTH) {
+            return;
+        }
+        /* group composited through a mask/alpha we cannot evaluate  */
+        if (cur(it)->softmask || cur(it)->fillalpha < FX_ONE) {
+            masked = 1;
+        }
+
+        if (pdf_streamdata(it->doc, xo, &content, NULL) != PDF_OK) {
+            pdfbuf_free(&content);
+            return;
+        }
+        it->be->gsave(it->be->ctx);
+        mtx = pdf_resolve(it->doc, pdf_dictget(xo, "Matrix"));
+        if (mtx && pdf_arrlen(mtx) == 6) {
+            fix fm[6];
+            u32 k;
+            for (k = 0; k < 6; k++) {
+                fm[k] = pdfobj_fix(pdf_resolve(it->doc, pdf_arrget(mtx, k)));
+            }
+            mat_mul(cur(it)->m, fm, cur(it)->m);
+        }
+        bbox = pdf_resolve(it->doc, pdf_dictget(xo, "BBox"));
+        if (bbox && pdf_arrlen(bbox) == 4) {
+            fix bx0 = pdfobj_fix(pdf_resolve(it->doc, pdf_arrget(bbox, 0)));
+            fix by0 = pdfobj_fix(pdf_resolve(it->doc, pdf_arrget(bbox, 1)));
+            fix bx1 = pdfobj_fix(pdf_resolve(it->doc, pdf_arrget(bbox, 2)));
+            fix by1 = pdfobj_fix(pdf_resolve(it->doc, pdf_arrget(bbox, 3)));
+            PdfPt c[4];
+            fix x0, y0, x1, y1;
+            mat_apply(&c[0], cur(it)->m, bx0, by0);
+            mat_apply(&c[1], cur(it)->m, bx1, by0);
+            mat_apply(&c[2], cur(it)->m, bx0, by1);
+            mat_apply(&c[3], cur(it)->m, bx1, by1);
+            x0 = x1 = c[0].x;
+            y0 = y1 = c[0].y;
+            {
+                int k2;
+                for (k2 = 1; k2 < 4; k2++) {
+                    if (c[k2].x < x0) x0 = c[k2].x;
+                    if (c[k2].x > x1) x1 = c[k2].x;
+                    if (c[k2].y < y0) y0 = c[k2].y;
+                    if (c[k2].y > y1) y1 = c[k2].y;
+                }
+            }
+            it->be->clip(it->be->ctx, x0, y0, x1, y1);
+        }
+        fres = pdf_resolve(it->doc, pdf_dictget(xo, "Resources"));
+        if (fres) {
+            it->res = fres;
+        }
+        it->formdepth++;
+        it->maskdepth += masked;
+        run_content(it, content.p, content.len);
+        it->maskdepth -= masked;
+        it->formdepth--;
+        it->res = savedres;
+        *cur(it) = saved;
+        it->be->grestore(it->be->ctx);
+        pdfbuf_free(&content);
+    }
+}
+
+/* BI ... ID <data> EI.  Returns with the lexer positioned after EI.  */
+static void
+inline_image(Interp *it, PdfLex *lx)
+{
+    PdfObj *dict = pdfobj_new(it->rpool, PDF_DICT);
+    const u8 *data = NULL;
+    u32 dlen = 0;
+    char kw[PDF_KWMAX];
+    PdfObj *o;
+    int t;
+
+    if (dict == NULL) {
+        it->fatal = PDF_E_NOMEM;
+        return;
+    }
+    for (;;) {
+        t = pdf_parseany(lx, &o, kw, 0);
+        if (t == PDF_TOK_EOF) {
+            return;
+        }
+        if (t == PDF_TOK_KW && strcmp(kw, "ID") == 0) {
+            break;
+        }
+        if (t == PDF_TOK_OBJ && o->type == PDF_NAME) {
+            PdfObj *val;
+            if (pdf_parseobj(lx, &val, 0) != PDF_OK) {
+                continue;
+            }
+            pdf_dictput(it->rpool, dict, (const char *) o->u.str.p, val);
+        }
+    }
+    /* one whitespace byte separates ID from the data (CRLF = two)    */
+    if (lx->pos < lx->len && (lx->buf[lx->pos] == 13)) {
+        lx->pos++;
+    }
+    if (lx->pos < lx->len && (lx->buf[lx->pos] == 10 ||
+                              lx->buf[lx->pos] == 32 ||
+                              lx->buf[lx->pos] == 9)) {
+        lx->pos++;
+    }
+    data = lx->buf + lx->pos;
+
+    if (pdf_dictget(dict, "F") == NULL &&
+        pdf_dictget(dict, "Filter") == NULL) {
+        /* unfiltered: length is computable */
+        int w = pdfobj_int_of(pdf_dictget(dict, "W"));
+        int h = pdfobj_int_of(pdf_dictget(dict, "H"));
+        int bpc = pdfobj_int_of(pdf_dictget(dict, "BPC"));
+        int nc = 1;
+        PdfObj *csn = pdf_dictget(dict, "CS");
+        if (w == 0) w = pdfobj_int_of(pdf_dictget(dict, "Width"));
+        if (h == 0) h = pdfobj_int_of(pdf_dictget(dict, "Height"));
+        if (bpc == 0) bpc = pdfobj_int_of(pdf_dictget(dict, "BitsPerComponent"));
+        if (csn == NULL) csn = pdf_dictget(dict, "ColorSpace");
+        if (bpc == 0) bpc = 8;
+        if (pdf_isname(csn, "RGB") || pdf_isname(csn, "DeviceRGB")) {
+            nc = 3;
+        } else if (pdf_isname(csn, "CMYK") ||
+                   pdf_isname(csn, "DeviceCMYK")) {
+            nc = 4;
+        }
+        if (pdf_dictget(dict, "IM") || pdf_dictget(dict, "ImageMask")) {
+            nc = 1;
+            bpc = 1;
+        }
+        if (w > 0 && h > 0 && w <= 8192 && h <= 8192) {
+            u32 stride = ((u32) w * (u32) nc * (u32) bpc + 7) / 8;
+            dlen = stride * (u32) h;
+            if (dlen > lx->len - lx->pos) {
+                dlen = lx->len - lx->pos;
+            }
+        }
+        lx->pos += dlen;
+        /* consume the EI keyword */
+        if (pdflex_kw(lx, kw) != 0 || strcmp(kw, "EI") != 0) {
+            /* not where expected: rescue-scan */
+            dlen = 0;
+        }
+    }
+    if (dlen == 0) {
+        /* filtered (or rescue): scan for whitespace-delimited EI     */
+        u32 p = (u32) (data - lx->buf);
+        u32 st = p;
+        while (p + 1 < lx->len) {
+            if (lx->buf[p] == 'E' && lx->buf[p + 1] == 'I' &&
+                (p == st || is_ws_byte(lx->buf[p - 1])) &&
+                (p + 2 >= lx->len || is_ws_byte(lx->buf[p + 2]))) {
+                break;
+            }
+            p++;
+        }
+        dlen = p - st;
+        lx->pos = p + 1 < lx->len ? p + 2 : lx->len;
+    }
+    {
+        PdfImg img;
+        memset(&img, 0, sizeof img);
+        if (pdfimg_inline(it->doc, dict, data, dlen, cur(it)->fillrgb,
+                          &img) == PDF_OK) {
+            it->be->image(it->be->ctx, &img, cur(it)->m);
+        }
+        pdfimg_free(&img);
+    }
+}
+
+/* --- ExtGState ------------------------------------------------------ */
+
+static void
+apply_extgstate(Interp *it, PdfObj *name)
+{
+    PdfObj *egs = res_get(it, "ExtGState", name);
+    PdfObj *o;
+    GState *g = cur(it);
+
+    if (egs == NULL) {
+        return;
+    }
+    if ((o = pdf_resolve(it->doc, pdf_dictget(egs, "LW"))) != NULL) {
+        g->linewidth = pdfobj_fix(o);
+    }
+    if ((o = pdf_resolve(it->doc, pdf_dictget(egs, "LC"))) != NULL) {
+        g->cap = pdfobj_int_of(o);
+    }
+    if ((o = pdf_resolve(it->doc, pdf_dictget(egs, "LJ"))) != NULL) {
+        g->join = pdfobj_int_of(o);
+    }
+    if ((o = pdf_resolve(it->doc, pdf_dictget(egs, "Font"))) != NULL &&
+        o->type == PDF_ARRAY && pdf_arrlen(o) == 2) {
+        PdfObj *fd = pdf_resolve(it->doc, pdf_arrget(o, 0));
+        g->font = get_font(it, fd);
+        g->fontsize = pdfobj_fix(pdf_resolve(it->doc, pdf_arrget(o, 1)));
+    }
+    /* blend mode: Multiply is honoured, everything else is Normal   */
+    o = pdf_resolve(it->doc, pdf_dictget(egs, "BM"));
+    if (o != NULL) {
+        PdfObj *bm = o->type == PDF_ARRAY ? pdf_resolve(it->doc,
+                                                pdf_arrget(o, 0)) : o;
+        g->blend = pdf_isname(bm, "Multiply") || pdf_isname(bm, "Darken")
+                   ? PDF_BLEND_MULTIPLY : PDF_BLEND_NORMAL;
+    }
+    /* soft mask: we cannot evaluate one, but we can record that the
+       paint is masked so it degrades to Multiply instead of opaque  */
+    o = pdf_dictget(egs, "SMask");      /* deliberately unresolved:
+                                           the presence of anything
+                                           other than /None is the
+                                           signal, and the mask group
+                                           itself may not load       */
+    if (o != NULL) {
+        g->softmask = !pdf_isname(o, "None") && o->type != PDF_NULL;
+    }
+    /* constant alpha                                                 */
+    if ((o = pdf_resolve(it->doc, pdf_dictget(egs, "ca"))) != NULL) {
+        g->fillalpha = pdfobj_fix(o);
+    }
+    if ((o = pdf_resolve(it->doc, pdf_dictget(egs, "CA"))) != NULL) {
+        g->strokealpha = pdfobj_fix(o);
+    }
+}
+
+/* --- the operator machine ------------------------------------------- */
+
+#define OPK(a, b, c) ((u32) (a) | ((u32) (b) << 8) | ((u32) (c) << 16))
+
+static void
+dispatch(Interp *it, const char *kw, PdfLex *lx)
+{
+    GState *g = cur(it);
+    u32 key;
+
+    if (kw[0] == 0 || strlen(kw) > 3) {
+        return;
+    }
+    key = OPK(kw[0], kw[1], kw[1] ? kw[2] : 0);
+
+    switch (key) {
+    /* --- graphics state --- */
+    case OPK('q', 0, 0):
+        if (it->gsp < MAX_GSTATE - 1) {
+            it->gs[it->gsp + 1] = *g;
+            it->gsp++;
+            it->be->gsave(it->be->ctx);
+        }
+        break;
+    case OPK('Q', 0, 0):
+        if (it->gsp > 0) {
+            it->gsp--;
+            it->be->grestore(it->be->ctx);
+        }
+        break;
+    case OPK('c', 'm', 0):
+        if (it->nops >= 6) {
+            fix m[6];
+            int k;
+            for (k = 0; k < 6; k++) {
+                m[k] = opf(it, 6, k);
+            }
+            mat_mul(g->m, m, g->m);
+        }
+        break;
+    case OPK('w', 0, 0):
+        g->linewidth = opf(it, 1, 0);
+        break;
+    case OPK('J', 0, 0):
+        g->cap = FX_TOINT(opf(it, 1, 0) + FX_HALF);
+        break;
+    case OPK('j', 0, 0):
+        g->join = FX_TOINT(opf(it, 1, 0) + FX_HALF);
+        break;
+    case OPK('M', 0, 0):
+    case OPK('r', 'i', 0):
+    case OPK('i', 0, 0):
+        break;                          /* miter/intent/flatness      */
+    case OPK('d', 0, 0):
+        if (it->nops >= 2) {
+            PdfObj *arr = opo(it, 2, 0);
+            u32 k, na = pdf_arrlen(arr);
+            g->ndash = 0;
+            for (k = 0; k < na && k < MAX_DASH; k++) {
+                g->dash[k] = pdfobj_fix(pdf_arrget(arr, k));
+                g->ndash++;
+            }
+            g->dashphase = opf(it, 2, 1);
+        }
+        break;
+    case OPK('g', 's', 0):
+        apply_extgstate(it, opo(it, 1, 0));
+        break;
+
+    /* --- path construction --- */
+    case OPK('m', 0, 0):
+        if (it->nops >= 2) {
+            path_moveto(it, opf(it, 2, 0), opf(it, 2, 1));
+        }
+        break;
+    case OPK('l', 0, 0):
+        if (it->nops >= 2) {
+            path_lineto(it, opf(it, 2, 0), opf(it, 2, 1));
+        }
+        break;
+    case OPK('c', 0, 0):
+        if (it->nops >= 6) {
+            path_curveto(it, opf(it, 6, 0), opf(it, 6, 1),
+                         opf(it, 6, 2), opf(it, 6, 3),
+                         opf(it, 6, 4), opf(it, 6, 5));
+        }
+        break;
+    case OPK('v', 0, 0):
+        if (it->nops >= 4) {
+            path_curveto(it, it->curu.x, it->curu.y,
+                         opf(it, 4, 0), opf(it, 4, 1),
+                         opf(it, 4, 2), opf(it, 4, 3));
+        }
+        break;
+    case OPK('y', 0, 0):
+        if (it->nops >= 4) {
+            path_curveto(it, opf(it, 4, 0), opf(it, 4, 1),
+                         opf(it, 4, 2), opf(it, 4, 3),
+                         opf(it, 4, 2), opf(it, 4, 3));
+        }
+        break;
+    case OPK('h', 0, 0):
+        path_close(it);
+        break;
+    case OPK('r', 'e', 0):
+        if (it->nops >= 4) {
+            fix x = opf(it, 4, 0), y = opf(it, 4, 1);
+            fix w = opf(it, 4, 2), h = opf(it, 4, 3);
+            path_moveto(it, x, y);
+            path_lineto(it, x + w, y);
+            path_lineto(it, x + w, y + h);
+            path_lineto(it, x, y + h);
+            path_close(it);
+        }
+        break;
+
+    /* --- path painting --- */
+    case OPK('S', 0, 0):
+        paint(it, 0, 1, 0, 0);
+        break;
+    case OPK('s', 0, 0):
+        paint(it, 0, 1, 0, 1);
+        break;
+    case OPK('f', 0, 0):
+    case OPK('F', 0, 0):
+        paint(it, 1, 0, 0, 0);
+        break;
+    case OPK('f', '*', 0):
+        paint(it, 1, 0, 1, 0);
+        break;
+    case OPK('B', 0, 0):
+        paint(it, 1, 1, 0, 0);
+        break;
+    case OPK('B', '*', 0):
+        paint(it, 1, 1, 1, 0);
+        break;
+    case OPK('b', 0, 0):
+        paint(it, 1, 1, 0, 1);
+        break;
+    case OPK('b', '*', 0):
+        paint(it, 1, 1, 1, 1);
+        break;
+    case OPK('n', 0, 0):
+        paint(it, 0, 0, 0, 0);
+        break;
+    case OPK('W', 0, 0):
+    case OPK('W', '*', 0):
+        it->pendclip = 1;               /* bbox approximation         */
+        break;
+
+    /* --- colour --- */
+    case OPK('g', 0, 0):
+        if (it->nops >= 1) {
+            fix v = opf(it, 1, 0);
+            g->fillrgb = rgb_pack(v, v, v);
+        }
+        break;
+    case OPK('G', 0, 0):
+        if (it->nops >= 1) {
+            fix v = opf(it, 1, 0);
+            g->strokergb = rgb_pack(v, v, v);
+        }
+        break;
+    case OPK('r', 'g', 0):
+        if (it->nops >= 3) {
+            g->fillrgb = rgb_pack(opf(it, 3, 0), opf(it, 3, 1),
+                                  opf(it, 3, 2));
+        }
+        break;
+    case OPK('R', 'G', 0):
+        if (it->nops >= 3) {
+            g->strokergb = rgb_pack(opf(it, 3, 0), opf(it, 3, 1),
+                                    opf(it, 3, 2));
+        }
+        break;
+    case OPK('k', 0, 0):
+        if (it->nops >= 4) {
+            g->fillrgb = cmyk_pack(opf(it, 4, 0), opf(it, 4, 1),
+                                   opf(it, 4, 2), opf(it, 4, 3));
+        }
+        break;
+    case OPK('K', 0, 0):
+        if (it->nops >= 4) {
+            g->strokergb = cmyk_pack(opf(it, 4, 0), opf(it, 4, 1),
+                                     opf(it, 4, 2), opf(it, 4, 3));
+        }
+        break;
+    case OPK('c', 's', 0):
+        {
+            PdfObj *n = opo(it, 1, 0);
+            PdfObj *space = res_get(it, "ColorSpace", n);
+            g->fillcs = space ? space : n;
+            g->fillrgb = 0;
+        }
+        break;
+    case OPK('C', 'S', 0):
+        {
+            PdfObj *n = opo(it, 1, 0);
+            PdfObj *space = res_get(it, "ColorSpace", n);
+            g->strokecs = space ? space : n;
+            g->strokergb = 0;
+        }
+        break;
+    case OPK('s', 'c', 0):
+    case OPK('s', 'c', 'n'):
+        g->fillrgb = setcolour(it, g->fillcs, g->fillrgb);
+        break;
+    case OPK('S', 'C', 0):
+    case OPK('S', 'C', 'N'):
+        g->strokergb = setcolour(it, g->strokecs, g->strokergb);
+        break;
+
+    /* --- text --- */
+    case OPK('B', 'T', 0):
+        mat_ident(it->tm);
+        mat_ident(it->tlm);
+        break;
+    case OPK('E', 'T', 0):
+        break;
+    case OPK('T', 'c', 0):
+        g->charsp = opf(it, 1, 0);
+        break;
+    case OPK('T', 'w', 0):
+        g->wordsp = opf(it, 1, 0);
+        break;
+    case OPK('T', 'z', 0):
+        g->hscale = opf(it, 1, 0) / 100;
+        break;
+    case OPK('T', 'L', 0):
+        g->leading = opf(it, 1, 0);
+        break;
+    case OPK('T', 'f', 0):
+        if (it->nops >= 2) {
+            PdfObj *fd = res_get(it, "Font", opo(it, 2, 0));
+            g->font = get_font(it, fd);
+            g->fontsize = opf(it, 2, 1);
+        }
+        break;
+    case OPK('T', 'r', 0):
+        g->render = FX_TOINT(opf(it, 1, 0) + FX_HALF);
+        break;
+    case OPK('T', 's', 0):
+        g->rise = opf(it, 1, 0);
+        break;
+    case OPK('T', 'd', 0):
+        if (it->nops >= 2) {
+            op_Td(it, opf(it, 2, 0), opf(it, 2, 1));
+        }
+        break;
+    case OPK('T', 'D', 0):
+        if (it->nops >= 2) {
+            g->leading = -opf(it, 2, 1);
+            op_Td(it, opf(it, 2, 0), opf(it, 2, 1));
+        }
+        break;
+    case OPK('T', 'm', 0):
+        if (it->nops >= 6) {
+            int k;
+            for (k = 0; k < 6; k++) {
+                it->tlm[k] = opf(it, 6, k);
+            }
+            memcpy(it->tm, it->tlm, sizeof it->tm);
+        }
+        break;
+    case OPK('T', '*', 0):
+        op_Td(it, 0, -g->leading);
+        break;
+    case OPK('T', 'j', 0):
+        {
+            PdfObj *s = opo(it, 1, 0);
+            if (s && s->type == PDF_STRING) {
+                show_string(it, s->u.str.p, s->u.str.len);
+            }
+        }
+        break;
+    case OPK('T', 'J', 0):
+        {
+            PdfObj *a = opo(it, 1, 0);
+            if (a && a->type == PDF_ARRAY) {
+                show_tj_array(it, a);
+            }
+        }
+        break;
+    case OPK('\'', 0, 0):
+        op_Td(it, 0, -g->leading);
+        {
+            PdfObj *s = opo(it, 1, 0);
+            if (s && s->type == PDF_STRING) {
+                show_string(it, s->u.str.p, s->u.str.len);
+            }
+        }
+        break;
+    case OPK('"', 0, 0):
+        if (it->nops >= 3) {
+            PdfObj *s = opo(it, 3, 2);
+            g->wordsp = opf(it, 3, 0);
+            g->charsp = opf(it, 3, 1);
+            op_Td(it, 0, -g->leading);
+            if (s && s->type == PDF_STRING) {
+                show_string(it, s->u.str.p, s->u.str.len);
+            }
+        }
+        break;
+
+    /* --- XObjects, inline images, shading --- */
+    case OPK('D', 'o', 0):
+        do_xobject(it, opo(it, 1, 0));
+        break;
+    case OPK('B', 'I', 0):
+        inline_image(it, lx);
+        break;
+    case OPK('s', 'h', 0):              /* shading: not supported     */
+        break;
+
+    /* --- marked content / compatibility: operands only --- */
+    case OPK('B', 'M', 'C'):
+    case OPK('B', 'D', 'C'):
+    case OPK('E', 'M', 'C'):
+    case OPK('M', 'P', 0):
+    case OPK('D', 'P', 0):
+    case OPK('B', 'X', 0):
+    case OPK('E', 'X', 0):
+    case OPK('d', '0', 0):
+    case OPK('d', '1', 0):
+        break;
+
+    default:
+        break;                          /* unknown operator: ignore   */
+    }
+}
+
+static int
+run_content(Interp *it, const u8 *cbuf, u32 clen)
+{
+    PdfLex lx;
+    char kw[PDF_KWMAX];
+    PdfObj *o;
+
+    pdflex_init(&lx, cbuf, clen, it->rpool);
+    for (;;) {
+        int t = pdf_parseany(&lx, &o, kw, 0);
+        if (t == PDF_TOK_EOF) {
+            break;
+        }
+        if (t == PDF_E_NOMEM || it->fatal) {
+            return PDF_E_NOMEM;
+        }
+        if (t < 0) {
+            it->nops = 0;               /* junk: resynchronise        */
+            continue;
+        }
+        if (t == PDF_TOK_OBJ) {
+            if (it->nops < MAX_OPS) {
+                it->ops[it->nops++] = o;
+            }
+            continue;
+        }
+        dispatch(it, kw, &lx);
+        it->nops = 0;
+    }
+    return PDF_OK;
+}
+
+/* --- public API ----------------------------------------------------- */
+
+static void
+mediabox(PdfDoc *doc, PdfObj *page, fix *ox, fix *oy, fix *w, fix *h)
+{
+    PdfObj *mb = pdf_resolve(doc, pdf_dictget(page, "MediaBox"));
+    fix x0 = 0, y0 = 0, x1 = FX_FROMINT(612), y1 = FX_FROMINT(792);
+
+    if (mb && pdf_arrlen(mb) == 4) {
+        x0 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(mb, 0)));
+        y0 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(mb, 1)));
+        x1 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(mb, 2)));
+        y1 = pdfobj_fix(pdf_resolve(doc, pdf_arrget(mb, 3)));
+    }
+    if (x1 < x0) { fix t = x0; x0 = x1; x1 = t; }
+    if (y1 < y0) { fix t = y0; y0 = y1; y1 = t; }
+    if (x1 - x0 < FX_ONE || y1 - y0 < FX_ONE) {
+        x0 = y0 = 0;
+        x1 = FX_FROMINT(612);
+        y1 = FX_FROMINT(792);
+    }
+    *ox = x0;
+    *oy = y0;
+    *w = x1 - x0;
+    *h = y1 - y0;
+}
+
+int
+pdf_pagegeom(PdfDoc *doc, u32 pageidx, fix *w, fix *h, int *rotate)
+{
+    fix ox, oy;
+    PdfObj *rot;
+    int r;
+
+    if (doc == NULL || pageidx >= doc->npages) {
+        return PDF_E_RANGE;
+    }
+    mediabox(doc, doc->pages[pageidx], &ox, &oy, w, h);
+    rot = pdf_resolve(doc, pdf_dictget(doc->pages[pageidx], "Rotate"));
+    r = pdfobj_int_of(rot);
+    r = ((r % 360) + 360) % 360;
+    if (r != 90 && r != 180 && r != 270) {
+        r = 0;
+    }
+    *rotate = r;
+    return PDF_OK;
+}
+
+/* --- text extraction ------------------------------------------------ */
+
+typedef struct {
+    PdfGlyph *g;
+    u32 n, cap;
+    int oom;
+} Collector;
+
+static void tx_gsave(void *c) { (void) c; }
+static void tx_grestore(void *c) { (void) c; }
+static void tx_clip(void *c, fix a, fix b, fix d, fix e)
+{ (void) c; (void) a; (void) b; (void) d; (void) e; }
+static void tx_fill(void *c, const PdfPath *p, u32 rgb, int eo, int bl,
+                    fix al)
+{ (void) c; (void) p; (void) rgb; (void) eo; (void) bl; (void) al; }
+static void tx_stroke(void *c, const PdfPath *p, u32 rgb, fix w, int cp,
+                      int j, const fix *d, int nd, fix ph)
+{ (void) c; (void) p; (void) rgb; (void) w; (void) cp; (void) j;
+  (void) d; (void) nd; (void) ph; }
+static void tx_text(void *c, const char *f, const u8 *s, u32 l,
+                    const fix m[6], u32 rgb)
+{ (void) c; (void) f; (void) s; (void) l; (void) m; (void) rgb; }
+static void tx_image(void *c, const PdfImg *i, const fix m[6])
+{ (void) c; (void) i; (void) m; }
+
+static void
+tx_glyph(void *ctx, u32 ch, fix x0, fix y0, fix x1, fix y1)
+{
+    Collector *col = ctx;
+
+    if (col->n >= col->cap) {
+        u32 ncap = col->cap ? col->cap * 2 : 512;
+        PdfGlyph *ng;
+        if (ncap > (1u << 20)) {
+            col->oom = 1;
+            return;
+        }
+        ng = realloc(col->g, ncap * sizeof *ng);
+        if (ng == NULL) {
+            col->oom = 1;
+            return;
+        }
+        col->g = ng;
+        col->cap = ncap;
+    }
+    col->g[col->n].x0 = x0;
+    col->g[col->n].y0 = y0;
+    col->g[col->n].x1 = x1;
+    col->g[col->n].y1 = y1;
+    col->g[col->n].ch = ch;
+    col->n++;
+}
+
+int
+pdf_extracttext(PdfDoc *doc, u32 pageidx, fix zoom, PdfGlyph **outp,
+                u32 *nout)
+{
+    Collector col;
+    PdfBackend be;
+    int err;
+
+    *outp = NULL;
+    *nout = 0;
+    memset(&col, 0, sizeof col);
+    memset(&be, 0, sizeof be);
+    be.ctx = &col;
+    be.gsave = tx_gsave;
+    be.grestore = tx_grestore;
+    be.clip = tx_clip;
+    be.fill = tx_fill;
+    be.stroke = tx_stroke;
+    be.text = tx_text;
+    be.image = tx_image;
+    be.textwidth = NULL;        /* no device metrics: PDF widths only */
+    be.glyph = tx_glyph;
+
+    err = pdf_runpage(doc, pageidx, &be, zoom);
+    if (err != PDF_OK || col.oom) {
+        free(col.g);
+        return err != PDF_OK ? err : PDF_E_NOMEM;
+    }
+    *outp = col.g;
+    *nout = col.n;
+    return PDF_OK;
+}
+
+int
+pdf_runpage(PdfDoc *doc, u32 pageidx, PdfBackend *be, fix zoom)
+{
+    Interp *it;
+    PdfBuf content = { 0 };
+    fix ox, oy, pw, ph;
+    int rotate, err;
+    PdfObj *page;
+
+    if (doc == NULL || pageidx >= doc->npages || be == NULL || zoom <= 0) {
+        return PDF_E_RANGE;
+    }
+    page = doc->pages[pageidx];
+    err = pdf_pagecontent(doc, page, &content);
+    if (err) {
+        pdfbuf_free(&content);
+        return err;
+    }
+    it = calloc(1, sizeof *it);
+    if (it == NULL) {
+        pdfbuf_free(&content);
+        return PDF_E_NOMEM;
+    }
+    it->doc = doc;
+    it->be = be;
+    it->rpool = pdfpool_new();
+    if (it->rpool == NULL) {
+        free(it);
+        pdfbuf_free(&content);
+        return PDF_E_NOMEM;
+    }
+    it->res = pdf_resolve(doc, pdf_dictget(page, "Resources"));
+
+    mediabox(doc, page, &ox, &oy, &pw, &ph);
+    {
+        PdfObj *rot = pdf_resolve(doc, pdf_dictget(page, "Rotate"));
+        int r = pdfobj_int_of(rot);
+        rotate = ((r % 360) + 360) % 360;
+        if (rotate != 90 && rotate != 180 && rotate != 270) {
+            rotate = 0;
+        }
+    }
+    {
+        GState *g = &it->gs[0];
+        fix *m = g->m;
+        switch (rotate) {
+        default:                        /* 0 */
+            m[0] = zoom; m[1] = 0;
+            m[2] = 0;    m[3] = zoom;
+            m[4] = -fx_mul(ox, zoom);
+            m[5] = -fx_mul(oy, zoom);
+            break;
+        case 90:
+            m[0] = 0;    m[1] = -zoom;
+            m[2] = zoom; m[3] = 0;
+            m[4] = -fx_mul(oy, zoom);
+            m[5] = fx_mul(ox + pw, zoom);
+            break;
+        case 180:
+            m[0] = -zoom; m[1] = 0;
+            m[2] = 0;     m[3] = -zoom;
+            m[4] = fx_mul(ox + pw, zoom);
+            m[5] = fx_mul(oy + ph, zoom);
+            break;
+        case 270:
+            m[0] = 0;     m[1] = zoom;
+            m[2] = -zoom; m[3] = 0;
+            m[4] = fx_mul(oy + ph, zoom);
+            m[5] = -fx_mul(ox, zoom);
+            break;
+        }
+        g->fillrgb = 0;
+        g->strokergb = 0;
+        g->linewidth = FX_ONE;
+        g->hscale = FX_ONE;
+        g->fillalpha = FX_ONE;
+        g->strokealpha = FX_ONE;
+        mat_ident(it->tm);
+        mat_ident(it->tlm);
+    }
+
+    err = run_content(it, content.p, content.len);
+    if (it->fatal) {
+        err = it->fatal;
+    }
+
+    free(it->path.el);
+    pdfpool_free(it->rpool);
+    free(it);
+    pdfbuf_free(&content);
+    return err;
+}

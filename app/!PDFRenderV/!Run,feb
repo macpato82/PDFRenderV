@@ -1,0 +1,11 @@
+| !Run for PDFRenderV.  The Filer passes a double-clicked PDF as %*0
+| through Alias$@RunType_ADF; running the application directory with
+| no argument simply installs the module and claims the filetype.
+|
+| Copyright (c) RISC OS Technologies 2026.
+| SPDX-License-Identifier: CDDL-1.0
+| Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+
+Run <Obey$Dir>.!Boot
+If "%*0" <> "" Then WimpSlot -min 320K -max 4096K
+If "%*0" <> "" Then Run <PDFRenderV$Dir>.Viewer %*0

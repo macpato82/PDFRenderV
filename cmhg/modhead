@@ -1,0 +1,56 @@
+; PDFRender - fast PDF page renderer for RISC OS 5 (ARMv5-v8).
+; CMHG module header.
+;
+; Copyright (c) RISC OS Technologies 2026.
+; SPDX-License-Identifier: CDDL-1.0
+; Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+
+title-string:  PDFRenderV
+
+help-string:   PDFRenderV 1.00 Fast PDF page renderer
+
+; *** PLACEHOLDER CHUNK *** - must be replaced with a SWI chunk
+; allocated by RISC OS Open (see the allocating-resources skill)
+; before any public release.  &5B740 is a guess and may collide.
+swi-chunk-base-number:  &05B740
+
+swi-handler-code:       mod_swi
+; Offsets 0..4, matching SWIOFF_* in h/module.
+swi-decoding-table:     PDFRenderV Open, Close, Info, PageSize, Render,
+                        ExtractText
+
+initialisation-code:    mod_init
+finalisation-code:      mod_final
+
+; NOTE: the viewer is a separate absolute application (aif.Viewer,
+; built from c/viewapp) started via Alias$@RunType_ADF.  It was
+; originally in-module via 'module-is-runnable:', but entering an RMA
+; module as an application dies inside Wimp_Initialise on the Kinetic
+; Box RO5.31 softload (a clean-room minimal module reproduces it), so
+; the window/toolbar half lives in a plain application instead.
+
+; *** PLACEHOLDER ERROR CHUNK *** - allocate with ROOL before release.
+error-base:             &81B740
+error-identifiers:      err_Already("PDFRenderV is already loaded - *RMKill PDFRenderV first"),
+                        err_BadHandle("PDFRenderV: bad document handle"),
+                        err_BadPage("PDFRenderV: no such page"),
+                        err_NoMem("PDFRenderV: out of memory"),
+                        err_BadPDF("PDFRenderV: not a valid PDF"),
+                        err_Encrypted("PDFRenderV: encrypted PDFs are not supported"),
+                        err_Unsup("PDFRenderV: PDF uses an unsupported feature"),
+                        err_BadSWI("PDFRenderV: unknown SWI"),
+                        err_Syntax("Syntax: *PDFToSprite <pdf> <page> <spritefile> [<width px>]")
+
+command-keyword-table:  cmd_handler
+        PDFInfo(min-args: 1, max-args: 1,
+                help-text: "*PDFInfo reports the version, page count and page sizes of a PDF.\n",
+                invalid-syntax: "Syntax: *PDFInfo <pdffile>"),
+        PDFToSprite(min-args: 3, max-args: 4,
+                help-text: "*PDFToSprite renders a PDF page into a new sprite file.\n",
+                invalid-syntax: "Syntax: *PDFToSprite <pdf> <page> <spritefile> [<width px>]"),
+        PDFText(min-args: 2, max-args: 3,
+                help-text: "*PDFText extracts a page's text to a file (or the screen).\n",
+                invalid-syntax: "Syntax: *PDFText <pdf> <page> [<textfile>]"),
+        PDFRenderVOpen(min-args: 1, max-args: 7,
+                help-text: "*PDFRenderVOpen opens a PDF in the desktop viewer (the application named by PDFRenderV$Viewer). Double-clicking a PDF does this automatically once the module is loaded.\n",
+                invalid-syntax: "Syntax: *PDFRenderVOpen <pdffile>")

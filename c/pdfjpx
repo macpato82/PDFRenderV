@@ -1,0 +1,231 @@
+/*
+  PDFRender - JPEG 2000 decode wrapper around the vendored OpenJPEG.
+
+  OpenJPEG hands back planar, possibly subsampled, possibly signed
+  component arrays of arbitrary precision; this turns that into the
+  flat XRGB32 buffer the rest of PDFRender uses.  All OpenJPEG error
+  and warning callbacks are swallowed - a broken image must never
+  print to the CLI from inside a module.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "pdftypes.h"
+#include "pdfjpx.h"
+#include "openjpeg.h"
+
+/* --- memory stream -------------------------------------------------- */
+
+typedef struct {
+    const u8 *p;
+    OPJ_SIZE_T len, pos;
+} JpxMem;
+
+static OPJ_SIZE_T
+mem_read(void *buf, OPJ_SIZE_T n, void *ud)
+{
+    JpxMem *m = ud;
+    OPJ_SIZE_T avail = m->len - m->pos;
+
+    if (avail == 0) {
+        return (OPJ_SIZE_T) -1;         /* OpenJPEG's EOF convention */
+    }
+    if (n < avail) {
+        avail = n;
+    }
+    memcpy(buf, m->p + m->pos, avail);
+    m->pos += avail;
+    return avail;
+}
+
+static OPJ_OFF_T
+mem_skip(OPJ_OFF_T n, void *ud)
+{
+    JpxMem *m = ud;
+
+    if (n < 0) {
+        if ((OPJ_SIZE_T) -n > m->pos) {
+            n = -(OPJ_OFF_T) m->pos;
+        }
+    } else if (m->pos + (OPJ_SIZE_T) n > m->len) {
+        n = (OPJ_OFF_T) (m->len - m->pos);
+    }
+    m->pos += n;
+    return n;
+}
+
+static OPJ_BOOL
+mem_seek(OPJ_OFF_T n, void *ud)
+{
+    JpxMem *m = ud;
+
+    if (n < 0 || (OPJ_SIZE_T) n > m->len) {
+        return OPJ_FALSE;
+    }
+    m->pos = (OPJ_SIZE_T) n;
+    return OPJ_TRUE;
+}
+
+static void
+msg_quiet(const char *msg, void *client)
+{
+    (void) msg;
+    (void) client;
+}
+
+/* --- component sampling --------------------------------------------- */
+
+/* Fetch component c's sample at image pixel (x, y), scaled to 0..255.
+   Handles subsampling (dx/dy), signed data and precision != 8.        */
+static int
+comp_at(const opj_image_comp_t *c, int x, int y)
+{
+    u32 cx, cy;
+    s32 v;
+    int prec = (int) c->prec;
+
+    cx = (u32) x / (c->dx ? c->dx : 1);
+    cy = (u32) y / (c->dy ? c->dy : 1);
+    if (cx >= c->w) {
+        cx = c->w - 1;
+    }
+    if (cy >= c->h) {
+        cy = c->h - 1;
+    }
+    v = c->data[cy * c->w + cx];
+    if (c->sgnd) {
+        v += 1 << (prec - 1);           /* level shift to unsigned    */
+    }
+    if (prec > 8) {
+        v >>= (prec - 8);
+    } else if (prec < 8 && prec > 0) {
+        s32 maxv = (1 << prec) - 1;
+        v = maxv ? (v * 255) / maxv : 0;
+    }
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 255) {
+        v = 255;
+    }
+    return (int) v;
+}
+
+/* --- public --------------------------------------------------------- */
+
+int
+pdfjpx_decode(const u8 *src, u32 srclen, int *wp, int *hp, u32 **pixp)
+{
+    JpxMem m;
+    opj_stream_t *stream = NULL;
+    opj_codec_t *codec = NULL;
+    opj_image_t *img = NULL;
+    opj_dparameters_t param;
+    u32 *pix = NULL;
+    int w, h, x, y, err = PDF_E_DATA;
+    int fmt;
+
+    *wp = *hp = 0;
+    *pixp = NULL;
+    if (src == NULL || srclen < 12) {
+        return PDF_E_DATA;
+    }
+    /* JP2 box signature vs bare codestream (SOC marker FF 4F)        */
+    fmt = (src[0] == 0xFF && src[1] == 0x4F) ? OPJ_CODEC_J2K
+                                             : OPJ_CODEC_JP2;
+    m.p = src;
+    m.len = srclen;
+    m.pos = 0;
+
+    stream = opj_stream_default_create(OPJ_TRUE);
+    if (stream == NULL) {
+        return PDF_E_NOMEM;
+    }
+    opj_stream_set_read_function(stream, mem_read);
+    opj_stream_set_skip_function(stream, mem_skip);
+    opj_stream_set_seek_function(stream, mem_seek);
+    opj_stream_set_user_data(stream, &m, NULL);
+    opj_stream_set_user_data_length(stream, m.len);
+
+    codec = opj_create_decompress((OPJ_CODEC_FORMAT) fmt);
+    if (codec == NULL) {
+        err = PDF_E_NOMEM;
+        goto out;
+    }
+    opj_set_error_handler(codec, msg_quiet, NULL);
+    opj_set_warning_handler(codec, msg_quiet, NULL);
+    opj_set_info_handler(codec, msg_quiet, NULL);
+
+    opj_set_default_decoder_parameters(&param);
+    if (!opj_setup_decoder(codec, &param) ||
+        !opj_read_header(stream, codec, &img) || img == NULL) {
+        goto out;
+    }
+    if (!opj_decode(codec, stream, img) ||
+        !opj_end_decompress(codec, stream)) {
+        goto out;
+    }
+    if (img->numcomps < 1 || img->comps[0].data == NULL) {
+        goto out;
+    }
+
+    w = (int) (img->x1 - img->x0);
+    h = (int) (img->y1 - img->y0);
+    if (w < 1 || h < 1 || w > 8192 || h > 8192 ||
+        (u32) w * (u32) h > 4194304u) {
+        err = PDF_E_LIMIT;
+        goto out;
+    }
+    pix = malloc((u32) w * (u32) h * sizeof *pix);
+    if (pix == NULL) {
+        err = PDF_E_NOMEM;
+        goto out;
+    }
+
+    for (y = 0; y < h; y++) {
+        u32 *row = pix + (u32) y * (u32) w;
+        for (x = 0; x < w; x++) {
+            int r, g, b;
+            if (img->numcomps >= 4) {
+                /* CMYK (rare from PDF, but legal)                    */
+                int c = comp_at(&img->comps[0], x, y);
+                int mg = comp_at(&img->comps[1], x, y);
+                int yl = comp_at(&img->comps[2], x, y);
+                int k = comp_at(&img->comps[3], x, y);
+                r = 255 - (c + k > 255 ? 255 : c + k);
+                g = 255 - (mg + k > 255 ? 255 : mg + k);
+                b = 255 - (yl + k > 255 ? 255 : yl + k);
+            } else if (img->numcomps >= 3) {
+                r = comp_at(&img->comps[0], x, y);
+                g = comp_at(&img->comps[1], x, y);
+                b = comp_at(&img->comps[2], x, y);
+            } else {
+                r = g = b = comp_at(&img->comps[0], x, y);
+            }
+            row[x] = (u32) r | ((u32) g << 8) | ((u32) b << 16);
+        }
+    }
+    *wp = w;
+    *hp = h;
+    *pixp = pix;
+    pix = NULL;
+    err = PDF_OK;
+
+out:
+    free(pix);
+    if (img) {
+        opj_image_destroy(img);
+    }
+    if (codec) {
+        opj_destroy_codec(codec);
+    }
+    if (stream) {
+        opj_stream_destroy(stream);
+    }
+    return err;
+}

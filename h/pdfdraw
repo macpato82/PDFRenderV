@@ -1,0 +1,66 @@
+/*
+  PDFRender - RISC OS render backend interface (module side only;
+  not part of the host build).
+
+  Renders into a caller-supplied 32bpp sprite by redirecting VDU
+  output (OS_SpriteOp 60) and then driving the OS renderers:
+  Draw module for paths, FontManager for anti-aliased text,
+  OS_SpriteOp 52 for decoded images and SpriteExtend's
+  JPEG_PlotScaled for DCT passthrough.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef PDFDRAW_H
+#define PDFDRAW_H
+
+#include "pdftypes.h"
+#include "pdfpage.h"
+
+#define RO_NFONTS 8
+
+typedef struct {
+    /* redirection */
+    void *area;                 /* sprite area                        */
+    void *sprite;               /* sprite pointer                     */
+    u8 *savearea;
+    u32 old[4];                 /* previous redirection R0-R3         */
+    int redirected;
+    /* sprite geometry, OS units (= pixels, 180dpi sprite)            */
+    int devw, devh;
+    /* clip stack mirrors interpreter q/Q                             */
+    struct { int x0, y0, x1, y1; } clip[40];
+    int csp;
+    /* font handle cache */
+    struct {
+        char name[48];
+        int sx, sy;             /* 1/16 pt                            */
+        int handle;
+        u32 tick;
+    } fonts[RO_NFONTS];
+    u32 tick;
+    /* saved FontMax state (anti-alias/cache ceilings) */
+    int fmax[6];
+    int fmax_saved;
+    /* Draw path conversion buffer */
+    u32 *dpath;
+    u32 dpathcap;               /* words                              */
+    PdfBackend be;              /* vtable handed to pdf_runpage       */
+} RoRender;
+
+/* Switch VDU output into the sprite and prepare the vtable.
+   whitebg nonzero clears the sprite to white first.
+   sprite is a direct sprite pointer within area.                     */
+int rorender_begin(RoRender *rr, void *area, void *sprite, int whitebg);
+
+/* Prepare the vtable WITHOUT redirecting output: used inside a
+   PDriver print job, where Draw/Font/Sprite calls are intercepted by
+   the printer driver.  devw/devh are the page size in OS units.      */
+int rorender_begin_direct(RoRender *rr, int devw, int devh);
+
+/* Restore VDU output and release fonts/buffers.                      */
+void rorender_end(RoRender *rr);
+
+#endif

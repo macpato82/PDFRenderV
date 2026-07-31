@@ -1,0 +1,20 @@
+/*
+  PDFRender - module-internal shared declarations.
+
+  Copyright (c) RISC OS Technologies 2026.
+  SPDX-License-Identifier: CDDL-1.0
+  Licensed under the Common Development and Distribution License 1.0; see LICENSE.
+*/
+
+#ifndef MODULE_H
+#define MODULE_H
+
+/* SWI offsets from the chunk base (order = swi-decoding-table)       */
+#define SWIOFF_Open     0
+#define SWIOFF_Close    1
+#define SWIOFF_Info     2
+#define SWIOFF_PageSize 3
+#define SWIOFF_Render   4
+#define SWIOFF_ExtractText 5
+
+#endif
