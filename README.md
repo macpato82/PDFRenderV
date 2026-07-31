@@ -87,7 +87,10 @@ click-drag text selection.
 | Draw | &AFF | `DrawFile_Render` |
 
 `PDFRenderV$Claim` lists which filetypes the module takes over
-(default: all five).  Drop `FF9` to keep Paint on sprites, or `AFF`
+(default: all five).  An application whose `!Boot` runs after ours can
+take one back - ChangeFSI claims JPEG, for instance - so the module
+re-claims on Service_StartWimp and `*PDFClaim` re-asserts them at any
+time (the app's `!Boot` calls it).  Drop `FF9` to keep Paint on sprites, or `AFF`
 to keep Draw on drawings; every claimed type is handed back when the
 module is killed, and only if the alias still points at our viewer.
 

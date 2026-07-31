@@ -53,6 +53,18 @@ _kernel_oserror *mod_final(int fatal, int podule_base, void *pw);
 
 
 /***************************************************************************
+ * Function:     mod_service
+ * Description:  Service call handler routine. All services which are being
+ *               received by the module will be passed to this routine.
+ * Parameters:   service = service call number
+ *               r       = pointer to register block on entry
+ *               pw      = private word for module
+ * On exit:      Update register values on return by updating r.
+ **************************************************************************/
+void mod_service(int service, _kernel_swi_regs *r, void *pw);
+
+
+/***************************************************************************
  * Description:  Star command and help request handler routines.
  * Parameters:   arg_string = pointer to argument string (control
  *                            terminated), or output buffer
@@ -94,8 +106,10 @@ _kernel_oserror *cmd_handler(const char *arg_string, int argc, int number,
 #define CMD_PDFToSprite (1)
 #undef CMD_PDFText
 #define CMD_PDFText (2)
+#undef CMD_PDFClaim
+#define CMD_PDFClaim (3)
 #undef CMD_PDFRenderVOpen
-#define CMD_PDFRenderVOpen (3)
+#define CMD_PDFRenderVOpen (4)
 
 
 /***************************************************************************

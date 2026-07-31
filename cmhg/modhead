@@ -22,9 +22,15 @@ swi-decoding-table:     PDFRenderV Open, Close, Info, PageSize, Render,
 initialisation-code:    mod_init
 finalisation-code:      mod_final
 
+; Service_StartWimp (&49) is issued as the desktop starts, after the
+; !Boot of every application has run.  We re-assert our filetype
+; claims there because an app booted after us (ChangeFSI claims JPEG,
+; for one) would otherwise silently take them back.
+service-call-handler:   mod_service &49
+
 ; NOTE: the viewer is a separate absolute application (aif.Viewer,
 ; built from c/viewapp) started via Alias$@RunType_ADF.  It was
-; originally in-module via 'module-is-runnable:', but entering an RMA
+; originally in-module via module-is-runnable, but entering an RMA
 ; module as an application dies inside Wimp_Initialise on the Kinetic
 ; Box RO5.31 softload (a clean-room minimal module reproduces it), so
 ; the window/toolbar half lives in a plain application instead.
@@ -49,8 +55,10 @@ command-keyword-table:  cmd_handler
                 help-text: "*PDFToSprite renders a PDF page into a new sprite file.\n",
                 invalid-syntax: "Syntax: *PDFToSprite <pdf> <page> <spritefile> [<width px>]"),
         PDFText(min-args: 2, max-args: 3,
-                help-text: "*PDFText extracts a page's text to a file (or the screen).\n",
+                help-text: "*PDFText extracts the text of a page to a file (or the screen).\n",
                 invalid-syntax: "Syntax: *PDFText <pdf> <page> [<textfile>]"),
+        PDFClaim(min-args: 0, max-args: 0,
+                help-text: "*PDFClaim (re)claims the filetypes in PDFRenderV$Claim for the viewer. Useful when an application booted later has taken one back.\n"),
         PDFRenderVOpen(min-args: 1, max-args: 7,
                 help-text: "*PDFRenderVOpen opens a PDF in the desktop viewer (the application named by PDFRenderV$Viewer). Double-clicking a PDF does this automatically once the module is loaded.\n",
                 invalid-syntax: "Syntax: *PDFRenderVOpen <pdffile>")

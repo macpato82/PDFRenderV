@@ -26,3 +26,9 @@ Set File$Type_ADF PDF
 | application - for example drop FF9 to keep Paint on sprites.
 | Types: ADF PDF, C85 JPEG, B60 PNG, FF9 Sprite, AFF Draw.
 If "<PDFRenderV$Claim>" = "" Then Set PDFRenderV$Claim ADF,C85,B60,FF9,AFF
+
+| Re-assert the filetype claims.  Another application booted after us
+| can take one back (ChangeFSI claims JPEG, for instance); running
+| *PDFClaim at any time puts them back, and the module does the same
+| when the desktop starts.
+PDFClaim

@@ -597,6 +597,8 @@ render_into_sprite(DocSlot *ds, u32 page, void *area, void *sprite,
 
 /* --- module lifecycle ----------------------------------------------- */
 
+static void claim_filetypes(void);
+
 _kernel_oserror *
 mod_init(const char *cmd_tail, int podule_base, void *pw)
 {
@@ -628,43 +630,59 @@ mod_init(const char *cmd_tail, int podule_base, void *pw)
         return err_Already;
     }
     memset(docs, 0, sizeof docs);
-    /* Claim filetypes if a viewer app is registered: double-clicking
-       one then opens it in the viewer.  PDFRenderV$Claim lists the
-       types to take, so a user who would rather keep Paint on
-       sprites can say so; the default is everything we render.     */
-    {
-        char viewer[200];
-        int len = 0;
-        if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
-                  VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
-                  &len) == NULL && len > 0) {
-            static const char *const types[] = {
-                "ADF", "C85", "B60", "FF9", "AFF"
-            };
-            char claim[128];
-            int clen = 0, i;
+    claim_filetypes();
+    return NULL;
+}
 
-            viewer[len] = 0;
-            if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
-                      CLAIM_VAR, claim, (int) sizeof claim - 1, 0, 0,
-                      &clen) != NULL || clen <= 0) {
-                strcpy(claim, "ADF,C85,B60,FF9,AFF");
-            } else {
-                claim[clen] = 0;
+/* Claim the filetypes listed in PDFRenderV$Claim (default: all the
+   ones we can render) for the registered viewer.  Called at module
+   init and again on Service_StartWimp, because applications whose
+   !Boot runs after ours would otherwise take them back.            */
+static void
+claim_filetypes(void)
+{
+    char viewer[200];
+    int len = 0;
+
+    if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+              VIEWER_VAR, viewer, (int) sizeof viewer - 1, 0, 0,
+              &len) == NULL && len > 0) {
+        static const char *const types[] = {
+            "ADF", "C85", "B60", "FF9", "AFF"
+        };
+        char claim[128];
+        int clen = 0, i;
+
+        viewer[len] = 0;
+        if (_swix(XOS_ReadVarVal, _INR(0, 4) | _OUT(2),
+                  CLAIM_VAR, claim, (int) sizeof claim - 1, 0, 0,
+                  &clen) != NULL || clen <= 0) {
+            strcpy(claim, "ADF,C85,B60,FF9,AFF");
+        } else {
+            claim[clen] = 0;
+        }
+        for (i = 0; i < 5; i++) {
+            char var[40], alias[256];
+
+            if (strstr(claim, types[i]) == NULL) {
+                continue;
             }
-            for (i = 0; i < 5; i++) {
-                char var[40], alias[256];
-                if (strstr(claim, types[i]) == NULL) {
-                    continue;
-                }
-                sprintf(var, "Alias$@RunType_%s", types[i]);
-                sprintf(alias, "Run %s %%*0", viewer);
-                _swix(XOS_SetVarVal, _INR(0, 4),
-                      var, alias, strlen(alias), 0, 0);
-            }
+            sprintf(var, "Alias$@RunType_%s", types[i]);
+            sprintf(alias, "Run %s %%*0", viewer);
+            _swix(XOS_SetVarVal, _INR(0, 4),
+                  var, alias, strlen(alias), 0, 0);
         }
     }
-    return NULL;
+}
+
+void
+mod_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+    (void) r;
+    (void) pw;
+    if (service_number == 0x49) {       /* Service_StartWimp         */
+        claim_filetypes();
+    }
 }
 
 _kernel_oserror *
@@ -1080,6 +1098,9 @@ cmd_handler(const char *arg_string, int argc, int cmd_no, void *pw)
         return cmd_pdftosprite(arg_string);
     case CMD_PDFText:
         return cmd_pdftext(arg_string);
+    case CMD_PDFClaim:
+        claim_filetypes();
+        return NULL;
     case CMD_PDFRenderVOpen:
         /* run the viewer application on the file (replaces the
            current application, as *Run always does)                  */

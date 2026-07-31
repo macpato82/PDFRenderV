@@ -525,13 +525,16 @@ set_extent(void)
 {
     int ext[4];
 
+    /* The work area extends TOOLH above the page: that strip lives
+       under the toolbar pane, so the page itself starts just below
+       the toolbar and the window keeps its own title bar.          */
     ext[0] = 0;
     ext[1] = -(vw.sprh << vw.yeig);
     ext[2] = vw.sprw << vw.xeig;
-    ext[3] = 0;
+    ext[3] = TOOLH;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
-          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
+          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, TOOLH);
 }
 
 /* icon block helper: bbox + flags + 12 bytes of data                 */
@@ -569,7 +572,7 @@ create_windows(void)
 
         screen_size(&sw, &sh);
         ww = vw.sprw << vw.xeig;
-        wh = (vw.sprh << vw.yeig) + TOOLH;
+        wh = (vw.sprh << vw.yeig) + TOOLH;      /* page + toolbar     */
         if (ww > sw - 80) {
             ww = sw - 80;
         }
@@ -601,11 +604,11 @@ create_windows(void)
     ((u8 *) &blk[9])[1] = 1;            /* scroll inner               */
     ((u8 *) &blk[9])[2] = 12;           /* highlight                  */
     blk[4] = 0;                         /* scroll x                   */
-    blk[5] = 0;                         /* scroll y                   */
+    blk[5] = TOOLH;                     /* scroll y: page below pane  */
     blk[10] = 0;                        /* work area extent           */
     blk[11] = -(vw.sprh << vw.yeig);
     blk[12] = vw.sprw << vw.xeig;
-    blk[13] = 0;
+    blk[13] = TOOLH;
     blk[14] = 0x00000109;               /* title: text+indirected+ctr */
     /* work-area button type 10 (click/drag): without this the Wimp
        never reports clicks in the page and text cannot be selected  */
@@ -679,23 +682,28 @@ create_windows(void)
 static void
 open_with_pane(int *open)
 {
-    int pblk[8];
+    int st[16], pblk[8];
 
-    /* Standard pane technique: the toolbar takes the top TOOLH of
-       the window's outline and the document's visible area starts
-       below it, so no strip of empty work area is ever exposed.     */
+    /* Open the document window FIRST, then read back where it really
+       landed: the Wimp forces a new window on-screen, so a pane
+       placed from the requested coordinates can end up somewhere
+       else entirely (or off the top of the screen, which is how the
+       toolbar went missing).  The pane then goes in front of it.   */
+    _swix(XWimp_OpenWindow, _IN(1), open);
+
+    st[0] = vw.win;
+    if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
+        return;
+    }
     pblk[0] = vw.pane;
-    pblk[1] = open[1];
-    pblk[2] = open[4] - TOOLH;
-    pblk[3] = open[3];
-    pblk[4] = open[4];
+    pblk[1] = st[1];                    /* x0 of the visible area     */
+    pblk[2] = st[4] - TOOLH;            /* sit on its top strip       */
+    pblk[3] = st[3];                    /* x1                         */
+    pblk[4] = st[4];                    /* y1                         */
     pblk[5] = 0;
     pblk[6] = 0;
-    pblk[7] = open[7];                  /* behind                     */
+    pblk[7] = -1;                       /* in front of the document   */
     _swix(XWimp_OpenWindow, _IN(1), pblk);
-    open[4] -= TOOLH;                   /* document sits below it     */
-    open[7] = vw.pane;
-    _swix(XWimp_OpenWindow, _IN(1), open);
 }
 
 /* Paint the selection as EOR'd rectangles over the plotted page, so
