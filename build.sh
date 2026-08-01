@@ -110,6 +110,9 @@ if [ -d "$HERE/app/!Viewer" ]; then
     # Toolbox_Initialise loads <dir>.Res from the application
     # directory, so the resource file has to travel with it
     cp "$HERE/res/Resources,fae" "$HERE/app/!Viewer/Res,fae"
+    # the Toolbox opens Messages for the task name, and takes its
+    # sprites from Sprites, so both have to be in the directory too
+    cp "$HERE/app/!Viewer/!Sprites,ff9" "$HERE/app/!Viewer/Sprites,ff9"
     echo "   refreshed app/!Viewer"
 fi
 
