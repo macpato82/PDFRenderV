@@ -64,6 +64,7 @@ typedef s32 fix;
 #define URI_DISPATCH_FAILED     1
 
 #define XOS_File                (0x08)
+#define XOS_FSControl           (0x29)
 #define XOS_ReadVarVal          (0x23)
 #define XOS_SetVarVal           (0x24)
 #define XOS_Find                (0x0D)
@@ -116,16 +117,13 @@ typedef s32 fix;
    Only the horizontal layout is fixed.  (Nested Wimp; see
    arrange_toolbar.)                                                 */
 static const struct { int x0, x1; } toollayout[] = {
-    {   8,  56 },                       /* IC_PREV   <                */
-    {  60, 172 },                       /* IC_PAGE   n/N              */
-    { 176, 224 },                       /* IC_NEXT   >                */
-    { 244, 292 },                       /* IC_ZOUT   -                */
-    { 296, 384 },                       /* IC_ZOOM   100%             */
-    { 388, 436 },                       /* IC_ZIN    +                */
-    { 456, 568 }                        /* IC_PRINT  Print            */
+    {   8,  56 },                       /* IC_ZOUT   -                */
+    {  60, 148 },                       /* IC_ZOOM   100%             */
+    { 152, 200 },                       /* IC_ZIN    +                */
+    { 220, 332 }                        /* IC_PRINT  Print            */
 };
 #define NTOOL ((int) (sizeof toollayout / sizeof toollayout[0]))
-#define TOOLW 576                       /* bar width, OS units        */
+#define TOOLW 340                       /* bar width, OS units        */
 
 /* Nested Wimp: R2 of the extended Wimp_OpenWindow, and the nesting
    flags for R4.  Every anchor (bits 16-27) is %01, "link to the left
@@ -133,6 +131,12 @@ static const struct { int x0, x1; } toollayout[] = {
    parent's bottom-left corner at a fixed size.                      */
 #define WIMP_NEST_MAGIC 0x4B534154
 #define NEST_BOTTOMLEFT 0x05550000
+
+/* The top bar spans the window: its left edge and x scroll follow the
+   parent's left (%01), and its right, top and bottom edges and y
+   scroll follow the parent's right and top (%10).  Six two-bit fields
+   from bit 16: left, bottom, right, top, x scroll, y scroll.        */
+#define NEST_TOPSPAN    0x09A90000
 
 /* Wimp message numbers (PRM / ROOL wiki: Message Codes)              */
 #define Msg_DataSave        0x1
@@ -177,14 +181,30 @@ typedef struct {
 #define OUTL_INDENT  32         /* per nesting level                 */
 #define OUTL_WIDTH   620        /* work area width                   */
 
-/* toolbar icon numbers (creation order below) */
-#define IC_PREV  0
-#define IC_PAGE  1
-#define IC_NEXT  2
-#define IC_ZOUT  3
-#define IC_ZOOM  4
-#define IC_ZIN   5
-#define IC_PRINT 6
+/* The top toolbar follows Select's ImageViewer, which this replaces:
+   a pair of arrows to step through, a wide field saying what is being
+   shown, and the index within the file in a writable field with bump
+   arrows beside it.  Zoom and printing stay in the bottom bar, in the
+   horizontal scroll bar row.                                        */
+#define TOPBARH  68             /* height of the top bar, OS units   */
+
+/* top toolbar icon numbers (creation order below) */
+#define TB_PREV  0
+#define TB_NEXT  1
+#define TB_INFO  2
+#define TB_PAGE  3
+#define TB_UP    4
+#define TB_DOWN  5
+
+/* fixed part of the top bar: the info field takes what is left       */
+#define TB_LEFTW  116           /* the two arrows and their margin    */
+#define TB_RIGHTW 176           /* page field plus bump arrows        */
+
+/* bottom toolbar icon numbers */
+#define IC_ZOUT  0
+#define IC_ZOOM  1
+#define IC_ZIN   2
+#define IC_PRINT 3
 
 static const int zoomsteps[] = { 25, 50, 75, 100, 125, 150, 200, 300, 400 };
 #define NZOOM ((int) (sizeof zoomsteps / sizeof zoomsteps[0]))
@@ -202,10 +222,15 @@ typedef struct {
     /* wimp */
     int task;
     int win, pane;
+    int topbar;                 /* the ImageViewer-style top bar       */
+    int topw;                   /* its width when last laid out        */
+    int topnested;
     int barh;                   /* scroll bar row height last laid out */
     int barnested;              /* the bar has been nested in already  */
     int xeig, yeig;
     char pagetxt[16], zoomtxt[12];
+    char infotxt[160];          /* what the wide field says            */
+    char pagebox[12];           /* the writable page number            */
     char titletxt[300];
     /* text selection */
     Glyph *glyphs;
@@ -442,13 +467,33 @@ load_links(fix zoomfix)
     vw.nlinks = (u32) count;
 }
 
+/* The top bar occupies the first TOPBARH of the work area, so the
+   page hangs below it rather than starting at the top.  Everything
+   that maps between page coordinates and work-area coordinates goes
+   through these.                                                    */
+static int
+page_w(void)
+{
+    return vw.sprw << vw.xeig;
+}
+
+static int
+page_h(void)
+{
+    return vw.sprh << vw.yeig;
+}
+
+/* work-area y of the page's top and bottom edges                     */
+#define PAGE_TOP  (-TOPBARH)
+#define PAGE_BOT  (PAGE_TOP - page_h())
+
 /* Which link is at this work-area point, or -1.  Work-area y runs
    downwards from 0, the same mapping glyph_at uses.                 */
 static int
 link_at(int wx, int wy)
 {
     const Link *l = (const Link *) vw.links;
-    int top = -(vw.sprh << vw.yeig);
+    int top = PAGE_BOT;
     u32 i;
 
     for (i = 0; i < vw.nlinks; i++) {
@@ -585,7 +630,7 @@ load_glyphs(fix zoomfix)
 static void
 glyph_box(const Glyph *g, int *x0, int *y0, int *x1, int *y1)
 {
-    int top = -(vw.sprh << vw.yeig);
+    int top = PAGE_BOT;
 
     *x0 = (FX_TOINT(g->x0)) << vw.xeig;
     *x1 = (FX_TOINT(g->x1)) << vw.xeig;
@@ -721,6 +766,58 @@ fit_zoom(void)
 
 /* --- window management ---------------------------------------------- */
 
+/* What the wide field says.  ImageViewer described the image being
+   shown - "Sprite: 1024x1024, 65535 dpi, full colour" - so this
+   describes the document: its format, the size of the page in points,
+   and where you are in it.  For a previewed image there are no pages,
+   so it gives the format and the pixel size instead.               */
+static void
+build_info(void)
+{
+    int pages = 0, ver = 0, rot = 0;
+    int wmpt = 0, hmpt = 0;
+
+    if (_swix(PDFRenderV_Info, _IN(0) | _OUT(0) | _OUT(1),
+              vw.handle, &pages, &ver) != NULL) {
+        strcpy(vw.infotxt, "No information on this file");
+        return;
+    }
+    if (_swix(PDFRenderV_PageSize, _INR(0, 1) | _OUTR(0, 2),
+              vw.handle, vw.page + 1, &wmpt, &hmpt, &rot) != NULL) {
+        wmpt = hmpt = 0;
+    }
+    if (vw.isimage) {
+        /* R1 held the file type rather than a PDF version.  The OS
+           turns that into text so the field says "JPEG" rather than
+           "&C85": FSControl 18 returns eight characters in R2 and R3,
+           padded with spaces rather than terminated (PRM 2-99).    */
+        char tname[12];
+        int r2 = 0, r3 = 0, i;
+
+        if (_swix(XOS_FSControl, _INR(0, 2) | _OUTR(2, 3), 18, 0,
+                  ver & 0xFFF, &r2, &r3) == NULL) {
+            memcpy(tname, &r2, 4);
+            memcpy(tname + 4, &r3, 4);
+            tname[8] = 0;
+            for (i = 7; i >= 0 && tname[i] == ' '; i--) {
+                tname[i] = 0;
+            }
+        } else {
+            tname[0] = 0;
+        }
+        if (tname[0] == 0) {
+            sprintf(tname, "&%03X", (unsigned) ver & 0xFFF);
+        }
+        sprintf(vw.infotxt, "%s: %d x %d points, shown at %d%%",
+                tname, wmpt / 1000, hmpt / 1000, vw.zoom);
+    } else {
+        sprintf(vw.infotxt, "PDF %d.%d: %d x %d points, page %u of %u",
+                (ver >> 8) & 0xFF, ver & 0xFF,
+                wmpt / 1000, hmpt / 1000,
+                (unsigned) vw.page + 1, (unsigned) vw.npages);
+    }
+}
+
 static void
 update_toolbar_texts(void)
 {
@@ -728,13 +825,18 @@ update_toolbar_texts(void)
 
     sprintf(vw.pagetxt, "%u/%u", vw.page + 1, vw.npages);
     sprintf(vw.zoomtxt, "%d%%", vw.zoom);
+    sprintf(vw.pagebox, "%u", (unsigned) vw.page + 1);
+    build_info();
     /* Wimp_SetIconState takes a 4-word block in R1                   */
     blk[0] = vw.pane;
-    blk[1] = IC_PAGE;
+    blk[1] = IC_ZOOM;
     blk[2] = 0;
     blk[3] = 0;
     _swix(XWimp_SetIconState, _IN(1), blk);
-    blk[1] = IC_ZOOM;
+    blk[0] = vw.topbar;
+    blk[1] = TB_INFO;
+    _swix(XWimp_SetIconState, _IN(1), blk);
+    blk[1] = TB_PAGE;
     _swix(XWimp_SetIconState, _IN(1), blk);
 }
 
@@ -743,16 +845,16 @@ set_extent(void)
 {
     int ext[4];
 
-    /* The work area is exactly the page.  The toolbar no longer eats
-       into it: it lives in the horizontal scroll bar, which is
-       furniture, outside the work area entirely.                   */
+    /* The work area is the page with the top bar's strip above it.
+       The bottom bar is not in here at all: it lives in the
+       horizontal scroll bar, which is furniture.                   */
     ext[0] = 0;
-    ext[1] = -(vw.sprh << vw.yeig);
-    ext[2] = vw.sprw << vw.xeig;
+    ext[1] = PAGE_BOT;
+    ext[2] = page_w();
     ext[3] = 0;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
-          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
+          0, PAGE_BOT, page_w(), 0);
 }
 
 /* icon block helper: bbox + flags + 12 bytes of data                 */
@@ -789,18 +891,18 @@ create_windows(void)
         int sw, sh, ww, wh, x0, y1;
 
         screen_size(&sw, &sh);
-        ww = vw.sprw << vw.xeig;
-        wh = vw.sprh << vw.yeig;
+        ww = page_w();
+        wh = page_h() + TOPBARH;
         if (ww > sw - 80) {
             ww = sw - 80;
         }
         if (wh > sh - 160) {
             wh = sh - 160;
         }
-        /* never narrower than the embedded toolbar plus a usable
-           length of scroll bar beside it                           */
-        if (ww < TOOLW + 200) {
-            ww = TOOLW + 200;
+        /* never narrower than the top bar's fixed parts plus a
+           readable amount of the field between them                */
+        if (ww < TB_LEFTW + TB_RIGHTW + 160) {
+            ww = TB_LEFTW + TB_RIGHTW + 160;
         }
         if (wh < 200) {
             wh = 200;
@@ -826,8 +928,8 @@ create_windows(void)
     blk[4] = 0;                         /* scroll x                   */
     blk[5] = 0;                         /* scroll y                   */
     blk[10] = 0;                        /* work area extent           */
-    blk[11] = -(vw.sprh << vw.yeig);
-    blk[12] = vw.sprw << vw.xeig;
+    blk[11] = PAGE_BOT;
+    blk[12] = page_w();
     blk[13] = 0;
     blk[14] = 0x00000109;               /* title: text+indirected+ctr */
     /* work-area button type 10 (click/drag): without this the Wimp
@@ -838,7 +940,7 @@ create_windows(void)
        row, so refuse to be dragged narrower than it plus enough bar
        to be worth dragging (the Wimp will happily give a scroll well
        of negative length otherwise)                                */
-    blk[17] = (TOOLW + 160) | (128 << 16);
+    blk[17] = (TB_LEFTW + TB_RIGHTW + 160) | (128 << 16);
     blk[18] = (int) vw.titletxt;        /* indirected title           */
     blk[19] = -1;
     blk[20] = (int) sizeof vw.titletxt;
@@ -891,18 +993,12 @@ create_windows(void)
         int *ic = blk + 22;
 
         mkicon(ic + 0, toollayout[0].x0, -36, toollayout[0].x1, -4,
-               bf, "<", NULL, 0);
-        mkicon(ic + 8, toollayout[1].x0, -36, toollayout[1].x1, -4,
-               df | 0x100, NULL, vw.pagetxt, sizeof vw.pagetxt);
-        mkicon(ic + 16, toollayout[2].x0, -36, toollayout[2].x1, -4,
-               bf, ">", NULL, 0);
-        mkicon(ic + 24, toollayout[3].x0, -36, toollayout[3].x1, -4,
                bf, "-", NULL, 0);
-        mkicon(ic + 32, toollayout[4].x0, -36, toollayout[4].x1, -4,
+        mkicon(ic + 8, toollayout[1].x0, -36, toollayout[1].x1, -4,
                df | 0x100, NULL, vw.zoomtxt, sizeof vw.zoomtxt);
-        mkicon(ic + 40, toollayout[5].x0, -36, toollayout[5].x1, -4,
+        mkicon(ic + 16, toollayout[2].x0, -36, toollayout[2].x1, -4,
                bf, "+", NULL, 0);
-        mkicon(ic + 48, toollayout[6].x0, -36, toollayout[6].x1, -4,
+        mkicon(ic + 24, toollayout[3].x0, -36, toollayout[3].x1, -4,
                bf, "Print", NULL, 0);
     }
     e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.pane);
@@ -910,7 +1006,112 @@ create_windows(void)
         report_oserr(e);
         return -1;
     }
+
+    /* --- top toolbar --- */
+    memset(blk, 0, sizeof blk);
+    blk[0] = 200;                       /* placed properly at open    */
+    blk[1] = 900;
+    blk[2] = 900;
+    blk[3] = 900 + TOPBARH;
+    blk[6] = -1;
+    /* pane + auto-redraw + no control icons.  No furniture bit: this
+       one belongs inside the parent's work area, not in its border. */
+    blk[7] = (int) 0x80000030u;
+    ((u8 *) &blk[8])[0] = 0xFF;         /* no frame/title             */
+    ((u8 *) &blk[8])[1] = 2;
+    ((u8 *) &blk[8])[2] = 7;
+    ((u8 *) &blk[8])[3] = 1;
+    ((u8 *) &blk[9])[0] = 3;
+    ((u8 *) &blk[9])[1] = 1;
+    ((u8 *) &blk[9])[2] = 12;
+    blk[10] = 0;                        /* extent: set at open time   */
+    blk[11] = -TOPBARH;
+    blk[12] = 1024;
+    blk[13] = 0;
+    blk[14] = 0;
+    blk[15] = 0;
+    blk[16] = 1;
+    blk[17] = 0;
+    blk[18] = 0;
+    blk[19] = 0;
+    blk[20] = 0;
+    blk[21] = 6;                        /* icons follow               */
+    {
+        /* ImageViewer's row: two arrows, a field describing what is
+           shown, and the index within the file with bump arrows.
+           x coordinates for the info field are provisional -
+           arrange_topbar stretches it to the window.               */
+        unsigned bf = 0x1700303Du;      /* text, border, click        */
+        unsigned df = 0x1700013Du;      /* display only               */
+        unsigned wf = 0x0700F13Du;      /* writable, text             */
+        int *ic = blk + 22;
+        int y0 = -TOPBARH + 8, y1 = -8;
+
+        mkicon(ic + 0,   8, y0,  56, y1, bf, "<", NULL, 0);
+        mkicon(ic + 8,  60, y0, 108, y1, bf, ">", NULL, 0);
+        mkicon(ic + 16, TB_LEFTW, y0, 400, y1,
+               df | 0x100, NULL, vw.infotxt, sizeof vw.infotxt);
+        mkicon(ic + 24, 412, y0, 500, y1,
+               wf, NULL, vw.pagebox, sizeof vw.pagebox);
+        mkicon(ic + 32, 504, -TOPBARH + 34, 536, y1, bf, "^", NULL, 0);
+        mkicon(ic + 40, 504, y0, 536, -TOPBARH + 34, bf, "v", NULL, 0);
+    }
+    e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.topbar);
+    if (e != NULL) {
+        report_oserr(e);
+        return -1;
+    }
     return 0;
+}
+
+/* Lay the top bar across the window: the arrows and the page field
+   are fixed, and the field between them takes whatever is left.  Like
+   the bottom bar, the expensive part only runs when the width has
+   actually changed - open requests arrive continuously during a drag,
+   and resizing icons forces a redraw each time.                     */
+static void
+arrange_topbar(const int *mainst)
+{
+    int st[16], ext[4];
+    int w = mainst[3] - mainst[1];
+    int infox1;
+
+    if (w < TB_LEFTW + TB_RIGHTW + 40) {
+        return;
+    }
+    if (!vw.topnested || w != vw.topw) {
+        ext[0] = 0;
+        ext[1] = -TOPBARH;
+        ext[2] = w;
+        ext[3] = 0;
+        _swix(XWimp_SetExtent, _INR(0, 1), vw.topbar, ext);
+
+        infox1 = w - TB_RIGHTW;
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_INFO,
+              TB_LEFTW, -TOPBARH + 8, infox1, -8);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_PAGE,
+              infox1 + 12, -TOPBARH + 8, infox1 + 100, -8);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_UP,
+              infox1 + 104, -TOPBARH + 34, infox1 + 136, -8);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_DOWN,
+              infox1 + 104, -TOPBARH + 8, infox1 + 136, -TOPBARH + 34);
+        vw.topw = w;
+    }
+
+    st[0] = vw.topbar;
+    if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
+        return;
+    }
+    st[1] = mainst[1];
+    st[2] = mainst[4] - TOPBARH;
+    st[3] = mainst[3];
+    st[4] = mainst[4];
+    st[5] = 0;
+    st[6] = 0;
+    st[7] = -1;                         /* in front of the page       */
+    _swix(XWimp_OpenWindow, _INR(1, 4), st, WIMP_NEST_MAGIC,
+          vw.win, NEST_TOPSPAN);
+    vw.topnested = 1;
 }
 
 /* Fit the toolbar into the horizontal scroll bar of the document
@@ -1000,6 +1201,7 @@ open_with_pane(int *open)
     if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
         return;
     }
+    arrange_topbar(st);
     arrange_toolbar(st);
 }
 
@@ -1043,7 +1245,7 @@ redraw_main(int *blk)
         int ox = blk[1] - blk[5];
         int oy = blk[4] - blk[6];
         int sx = ox;
-        int sy = oy - (vw.sprh << vw.yeig);
+        int sy = oy + PAGE_BOT;
         if (vw.area != NULL) {
             _swix(XOS_SpriteOp, _INR(0, 7),
                   52 + 512, vw.area, vw.area + 16, sx, sy, 0, 0, 0);
@@ -1057,7 +1259,7 @@ static void
 redraw_doc(void)
 {
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
-          0, -(vw.sprh << vw.yeig), vw.sprw << vw.xeig, 0);
+          0, PAGE_BOT, page_w(), 0);
 }
 
 /* Resize the window to the page just rendered, keeping its top-left
@@ -1079,16 +1281,16 @@ size_to_page(void)
         return;                         /* not open: nothing to size  */
     }
     screen_size(&sw, &sh);
-    ww = vw.sprw << vw.xeig;
-    wh = vw.sprh << vw.yeig;
+    ww = page_w();
+    wh = page_h() + TOPBARH;
     if (ww > sw - 80) {
         ww = sw - 80;
     }
     if (wh > sh - 260) {
         wh = sh - 260;
     }
-    if (ww < TOOLW + 200) {
-        ww = TOOLW + 200;               /* room for the toolbar       */
+    if (ww < TB_LEFTW + TB_RIGHTW + 160) {
+        ww = TB_LEFTW + TB_RIGHTW + 160;    /* room for the top bar   */
     }
     if (wh < 200) {
         wh = 200;
@@ -1576,22 +1778,43 @@ clipboard_saveack(int *msg)
 
 /* --- event handling ------------------------------------------------- */
 
+/* A click in the top bar.  The arrows step a page; the bump arrows
+   beside the page field do the same, which is what ImageViewer's
+   number range did for the image index.                            */
+static void
+goto_page(u32 page)
+{
+    if (page < vw.npages && page != vw.page) {
+        vw.page = page;
+        rerender();
+    } else {
+        update_toolbar_texts();         /* put a bad number back      */
+    }
+}
+
+static void
+topbar_click(int icon)
+{
+    switch (icon) {
+    case TB_PREV:
+    case TB_DOWN:
+        if (vw.page > 0) {
+            goto_page(vw.page - 1);
+        }
+        break;
+    case TB_NEXT:
+    case TB_UP:
+        if (vw.page + 1 < vw.npages) {
+            goto_page(vw.page + 1);
+        }
+        break;
+    }
+}
+
 static void
 toolbar_click(int icon)
 {
     switch (icon) {
-    case IC_PREV:
-        if (vw.page > 0) {
-            vw.page--;
-            rerender();
-        }
-        break;
-    case IC_NEXT:
-        if (vw.page + 1 < vw.npages) {
-            vw.page++;
-            rerender();
-        }
-        break;
     case IC_ZOUT:
     case IC_ZIN:
         {
@@ -1659,8 +1882,8 @@ poll_loop(void)
         case 2:                         /* open                      */
             if (blk[0] == vw.win) {
                 open_with_pane(blk);
-            } else if (blk[0] == vw.pane) {
-                /* Deliberately nothing.  Once the bar is nested the
+            } else if (blk[0] == vw.pane || blk[0] == vw.topbar) {
+                /* Deliberately nothing.  Once a bar is nested the
                    Wimp keeps it with its parent, and re-opening it
                    with the plain form would drop the parent link and
                    leave it floating as a top-level window.        */
@@ -1681,6 +1904,8 @@ poll_loop(void)
                 outline_click(blk);
             } else if (blk[3] == vw.pane) {
                 toolbar_click(blk[4]);
+            } else if (blk[3] == vw.topbar) {
+                topbar_click(blk[4]);
             } else if (blk[3] == vw.win && (blk[2] & 2) != 0) {
                 /* Menu button over the page: the text menu          */
                 update_menu();
@@ -1750,9 +1975,20 @@ poll_loop(void)
                     redraw_doc();
                 }
             } else if (blk[6] == 0x18E) {   /* Page Down             */
-                toolbar_click(IC_NEXT);
+                topbar_click(TB_NEXT);
             } else if (blk[6] == 0x19E) {   /* Page Up               */
-                toolbar_click(IC_PREV);
+                topbar_click(TB_PREV);
+            } else if (blk[6] == 0x18C) {   /* left cursor           */
+                topbar_click(TB_PREV);
+            } else if (blk[6] == 0x18D) {   /* right cursor          */
+                topbar_click(TB_NEXT);
+            } else if (blk[6] == 13 && blk[0] == vw.topbar &&
+                       blk[1] == TB_PAGE) {
+                /* Return in the page field goes to that page, which is
+                   what the number range did in ImageViewer.        */
+                int n = atoi(vw.pagebox);
+
+                goto_page(n > 0 ? (u32) (n - 1) : 0);
             } else {
                 _swix(0x400E6, _INR(0, 1), 0, blk);     /* pass on   */
             }
