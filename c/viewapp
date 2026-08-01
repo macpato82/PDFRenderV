@@ -236,7 +236,7 @@ typedef struct {
    arrows beside it.  It sits at the foot of the work area with the
    horizontal scroll bar below it, exactly as ImageViewer's did.
    Zoom and printing stay in the scroll bar row itself.             */
-#define STATUSH  60             /* height of the status row, OS units */
+#define STATUSH  64             /* the toolbar's height in the resource */
 
 /* status row icon numbers (creation order below) */
 #define TB_PREV  0
@@ -2231,6 +2231,12 @@ main(int argc, char **argv)
             report_oserr(e2);
         }
     }
+    /* The template has to give the window some size, and it cannot
+       know the page's.  Now that it is open, fit it to what is in
+       it - otherwise the first document opens in whatever the
+       resource file happened to say and sits in a window larger than
+       itself.                                                     */
+    size_to_page();
     /* a PDF with bookmarks gets its contents listed beside it        */
     if (load_outline() > 0 && create_outline_window() == 0) {
         open_outline_window();
