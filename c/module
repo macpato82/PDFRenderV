@@ -1034,6 +1034,10 @@ mod_swi(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = ds->kind == FT_PDF
                       ? (ds->doc->vermajor << 8) | ds->doc->verminor
                       : ds->kind;
+            /* R1 alone cannot say which of the two it is: a PDF 1.3
+               reads as &103, and file types run through that range
+               too.  R2 says outright.                             */
+            r->r[2] = ds->kind == FT_PDF;
             return NULL;
         }
     case SWIOFF_PageSize:

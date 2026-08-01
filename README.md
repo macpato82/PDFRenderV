@@ -94,7 +94,7 @@ convention with no y-flips.
 |---|---|---|
 | `PDFRenderV_Open` | R1 filename | R0 handle, R1 pages |
 | `PDFRenderV_Close` | R0 handle | - |
-| `PDFRenderV_Info` | R0 handle | R0 pages, R1 version |
+| `PDFRenderV_Info` | R0 handle | R0 pages, R1 version or file type, R2 nonzero for a PDF |
 | `PDFRenderV_PageSize` | R0 handle, R1 page (1-based) | R0/R1 w/h millipoints, R2 rotation |
 | `PDFRenderV_Render` | R0 flags (b0 white bg), R1 handle, R2 page, R3 sprite area, R4 sprite ptr | - |
 
