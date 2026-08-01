@@ -273,6 +273,7 @@ typedef struct {
     int task;
     int win, pane;
     int mainobj;                /* Toolbox object id of the window     */
+    int extw, exth;             /* the extent as last set              */
     int toolobj;                /* and of its internal bottom toolbar  */
     int msgfd[4];               /* messages file descriptor            */
     IdBlock idb;
@@ -902,26 +903,14 @@ set_extent(void)
        size.  Growing the extent to the visible area gives us
        rectangles for the whole window, and clearing them is what
        redraw_main now does.                                       */
-    {
-        int st[16];
 
-        st[0] = vw.win;
-        if (_swix(XWimp_GetWindowState, _IN(1), st) == NULL) {
-            int vw_ = st[3] - st[1], vh = st[4] - st[2];
-
-            if (vw_ > w) {
-                w = vw_;
-            }
-            if (vh > h) {
-                h = vh;
-            }
-        }
-    }
     ext[0] = 0;
     ext[1] = -h;
     ext[2] = w;
     ext[3] = 0;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
+    vw.extw = w;
+    vw.exth = h;
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
           0, PAGE_BOT, page_w(), 0);
 }
@@ -1061,10 +1050,15 @@ redraw_main(int *blk)
         /* The window is not auto-redraw - it cannot be, because then
            the Wimp would never ask us to draw the page - so clearing
            the background is ours to do.  Without this, whatever the
-           window is larger than the page shows what was behind it. */
+           window is larger than the page shows what was behind it.
+
+           The rectangle to clear is the redraw block's clip box at
+           words 7 to 10, not the visible area at 1 to 4: filling the
+           wrong one clears an arbitrary part of the window and
+           leaves the rest showing the desktop.                   */
         _swix(XWimp_SetColour, _IN(0), 1);      /* work background   */
-        _swix(XOS_Plot, _INR(0, 2), 4, blk[2], blk[3]);
-        _swix(XOS_Plot, _INR(0, 2), 96 + 5, blk[4] - 1, blk[5] - 1);
+        _swix(XOS_Plot, _INR(0, 2), 4, blk[7], blk[8]);
+        _swix(XOS_Plot, _INR(0, 2), 96 + 5, blk[9] - 1, blk[10] - 1);
 
         if (vw.area != NULL) {
             _swix(XOS_SpriteOp, _INR(0, 7),
