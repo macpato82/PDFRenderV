@@ -132,11 +132,12 @@ static const struct { int x0, x1; } toollayout[] = {
 #define WIMP_NEST_MAGIC 0x4B534154
 #define NEST_BOTTOMLEFT 0x05550000
 
-/* The top bar spans the window: its left edge and x scroll follow the
-   parent's left (%01), and its right, top and bottom edges and y
-   scroll follow the parent's right and top (%10).  Six two-bit fields
-   from bit 16: left, bottom, right, top, x scroll, y scroll.        */
-#define NEST_TOPSPAN    0x09A90000
+/* The status row spans the foot of the window: everything follows the
+   parent's bottom-left as the fixed bar does (%01), except the right
+   edge, which follows the parent's right (%10) so the row stretches.
+   Six two-bit fields from bit 16: left, bottom, right, top, x scroll,
+   y scroll.                                                        */
+#define NEST_BOTSPAN    0x05650000
 
 /* Wimp message numbers (PRM / ROOL wiki: Message Codes)              */
 #define Msg_DataSave        0x1
@@ -181,14 +182,15 @@ typedef struct {
 #define OUTL_INDENT  32         /* per nesting level                 */
 #define OUTL_WIDTH   620        /* work area width                   */
 
-/* The top toolbar follows Select's ImageViewer, which this replaces:
+/* The status row follows Select's ImageViewer, which this replaces:
    a pair of arrows to step through, a wide field saying what is being
    shown, and the index within the file in a writable field with bump
-   arrows beside it.  Zoom and printing stay in the bottom bar, in the
-   horizontal scroll bar row.                                        */
-#define TOPBARH  68             /* height of the top bar, OS units   */
+   arrows beside it.  It sits at the foot of the work area with the
+   horizontal scroll bar below it, exactly as ImageViewer's did.
+   Zoom and printing stay in the scroll bar row itself.             */
+#define STATUSH  60             /* height of the status row, OS units */
 
-/* top toolbar icon numbers (creation order below) */
+/* status row icon numbers (creation order below) */
 #define TB_PREV  0
 #define TB_NEXT  1
 #define TB_INFO  2
@@ -222,9 +224,9 @@ typedef struct {
     /* wimp */
     int task;
     int win, pane;
-    int topbar;                 /* the ImageViewer-style top bar       */
-    int topw;                   /* its width when last laid out        */
-    int topnested;
+    int status;                 /* the ImageViewer-style status row    */
+    int statw;                  /* its width when last laid out        */
+    int statnested;
     int barh;                   /* scroll bar row height last laid out */
     int barnested;              /* the bar has been nested in already  */
     int xeig, yeig;
@@ -467,10 +469,10 @@ load_links(fix zoomfix)
     vw.nlinks = (u32) count;
 }
 
-/* The top bar occupies the first TOPBARH of the work area, so the
-   page hangs below it rather than starting at the top.  Everything
-   that maps between page coordinates and work-area coordinates goes
-   through these.                                                    */
+/* The page starts at the top of the work area; the status row takes
+   the last STATUSH of it, which the extent below allows for so the
+   page can be scrolled clear of the row.  Everything that maps
+   between page and work-area coordinates goes through these.       */
 static int
 page_w(void)
 {
@@ -484,8 +486,8 @@ page_h(void)
 }
 
 /* work-area y of the page's top and bottom edges                     */
-#define PAGE_TOP  (-TOPBARH)
-#define PAGE_BOT  (PAGE_TOP - page_h())
+#define PAGE_TOP  0
+#define PAGE_BOT  (-page_h())
 
 /* Which link is at this work-area point, or -1.  Work-area y runs
    downwards from 0, the same mapping glyph_at uses.                 */
@@ -833,7 +835,7 @@ update_toolbar_texts(void)
     blk[2] = 0;
     blk[3] = 0;
     _swix(XWimp_SetIconState, _IN(1), blk);
-    blk[0] = vw.topbar;
+    blk[0] = vw.status;
     blk[1] = TB_INFO;
     _swix(XWimp_SetIconState, _IN(1), blk);
     blk[1] = TB_PAGE;
@@ -849,7 +851,7 @@ set_extent(void)
        The bottom bar is not in here at all: it lives in the
        horizontal scroll bar, which is furniture.                   */
     ext[0] = 0;
-    ext[1] = PAGE_BOT;
+    ext[1] = PAGE_BOT - STATUSH;
     ext[2] = page_w();
     ext[3] = 0;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
@@ -877,6 +879,24 @@ mkicon(int *p, int x0, int y0, int x1, int y1, unsigned flags,
     }
 }
 
+/* As mkicon, but for an indirected icon with a validation string -
+   which is how a RISC OS icon gets a 3D border ("R2" sunken, "R5"
+   raised) or a sprite from the Wimp's own pool ("Sname").  The
+   strings must outlive the icon, so they are static.              */
+static void
+mkvicon(int *p, int x0, int y0, int x1, int y1, unsigned flags,
+        char *buf, int len, const char *valid)
+{
+    p[0] = x0;
+    p[1] = y0;
+    p[2] = x1;
+    p[3] = y1;
+    p[4] = (int) flags;
+    p[5] = (int) buf;
+    p[6] = (int) valid;
+    p[7] = len;
+}
+
 static int
 create_windows(void)
 {
@@ -892,7 +912,7 @@ create_windows(void)
 
         screen_size(&sw, &sh);
         ww = page_w();
-        wh = page_h() + TOPBARH;
+        wh = page_h() + STATUSH;
         if (ww > sw - 80) {
             ww = sw - 80;
         }
@@ -928,7 +948,7 @@ create_windows(void)
     blk[4] = 0;                         /* scroll x                   */
     blk[5] = 0;                         /* scroll y                   */
     blk[10] = 0;                        /* work area extent           */
-    blk[11] = PAGE_BOT;
+    blk[11] = PAGE_BOT - STATUSH;
     blk[12] = page_w();
     blk[13] = 0;
     blk[14] = 0x00000109;               /* title: text+indirected+ctr */
@@ -1012,7 +1032,7 @@ create_windows(void)
     blk[0] = 200;                       /* placed properly at open    */
     blk[1] = 900;
     blk[2] = 900;
-    blk[3] = 900 + TOPBARH;
+    blk[3] = 900 + STATUSH;
     blk[6] = -1;
     /* pane + auto-redraw + no control icons.  No furniture bit: this
        one belongs inside the parent's work area, not in its border. */
@@ -1025,7 +1045,7 @@ create_windows(void)
     ((u8 *) &blk[9])[1] = 1;
     ((u8 *) &blk[9])[2] = 12;
     blk[10] = 0;                        /* extent: set at open time   */
-    blk[11] = -TOPBARH;
+    blk[11] = -STATUSH;
     blk[12] = 1024;
     blk[13] = 0;
     blk[14] = 0;
@@ -1037,26 +1057,48 @@ create_windows(void)
     blk[20] = 0;
     blk[21] = 6;                        /* icons follow               */
     {
-        /* ImageViewer's row: two arrows, a field describing what is
-           shown, and the index within the file with bump arrows.
-           x coordinates for the info field are provisional -
-           arrange_topbar stretches it to the window.               */
-        unsigned bf = 0x1700303Du;      /* text, border, click        */
-        unsigned df = 0x1700013Du;      /* display only               */
-        unsigned wf = 0x0700F13Du;      /* writable, text             */
-        int *ic = blk + 22;
-        int y0 = -TOPBARH + 8, y1 = -8;
+        /* ImageViewer's row, with the controls RISC OS provides
+           rather than letters in boxes: the Wimp's own arrow sprites
+           for stepping and for the bump pair, a sunken field for the
+           text, and a sunken writable for the number.
 
-        mkicon(ic + 0,   8, y0,  56, y1, bf, "<", NULL, 0);
-        mkicon(ic + 8,  60, y0, 108, y1, bf, ">", NULL, 0);
-        mkicon(ic + 16, TB_LEFTW, y0, 400, y1,
-               df | 0x100, NULL, vw.infotxt, sizeof vw.infotxt);
-        mkicon(ic + 24, 412, y0, 500, y1,
-               wf, NULL, vw.pagebox, sizeof vw.pagebox);
-        mkicon(ic + 32, 504, -TOPBARH + 34, 536, y1, bf, "^", NULL, 0);
-        mkicon(ic + 40, 504, y0, 536, -TOPBARH + 34, bf, "v", NULL, 0);
+           Validation strings: "R5" is a raised (action) border, "R2"
+           a sunken one, and "S<name>" takes a sprite from the Wimp
+           pool.  Button type 10 auto-repeats while held, which is
+           what an arrow should do.                                */
+        static char v_left[]  = "R5;Sleft,pleft";
+        static char v_right[] = "R5;Sright,pright";
+        static char v_up[]    = "R5;Sup,pup";
+        static char v_down[]  = "R5;Sdown,pdown";
+        static char v_field[] = "R2";
+        static char nullbuf[] = "";
+        /* Icon flags, bit by bit, because getting one wrong shows
+           as a blank strip: 1 text, 2 sprite, 4 border, 8 centred
+           horizontally, &10 centred vertically, &20 filled, &100
+           indirected, &200 right justified, &F000 button type.
+
+           An icon with BOTH the text and sprite bits set takes its
+           sprite from the validation string's S command, which is
+           how a button gets a border and an arrow at once - an
+           indirected sprite icon has no validation word at all. */
+        unsigned af = 0x1700A13Fu;      /* arrows: text+sprite, click */
+        unsigned df = 0x17000135u;      /* info: text, left, sunken   */
+        unsigned wf = 0x0700F335u;      /* page: writable, right      */
+        int *ic = blk + 22;
+        int y0 = -STATUSH + 4, y1 = -4;
+        int ay0 = -STATUSH + 8, ay1 = -8;
+        int mid = -STATUSH / 2;
+
+        mkvicon(ic + 0,  4, ay0,  4 + 36, ay1, af, nullbuf, 1, v_left);
+        mkvicon(ic + 8, 44, ay0, 44 + 36, ay1, af, nullbuf, 1, v_right);
+        mkvicon(ic + 16, TB_LEFTW, y0, 400, y1, df,
+                vw.infotxt, sizeof vw.infotxt, v_field);
+        mkvicon(ic + 24, 412, y0, 500, y1, wf,
+                vw.pagebox, sizeof vw.pagebox, v_field);
+        mkvicon(ic + 32, 504, mid, 540, ay1, af, nullbuf, 1, v_up);
+        mkvicon(ic + 40, 504, ay0, 540, mid, af, nullbuf, 1, v_down);
     }
-    e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.topbar);
+    e = _swix(XWimp_CreateWindow, _IN(1) | _OUT(0), blk, &vw.status);
     if (e != NULL) {
         report_oserr(e);
         return -1;
@@ -1070,7 +1112,7 @@ create_windows(void)
    actually changed - open requests arrive continuously during a drag,
    and resizing icons forces a redraw each time.                     */
 static void
-arrange_topbar(const int *mainst)
+arrange_status(const int *mainst)
 {
     int st[16], ext[4];
     int w = mainst[3] - mainst[1];
@@ -1079,44 +1121,44 @@ arrange_topbar(const int *mainst)
     if (w < TB_LEFTW + TB_RIGHTW + 40) {
         return;
     }
-    if (!vw.topnested || w != vw.topw) {
+    if (!vw.statnested || w != vw.statw) {
         ext[0] = 0;
-        ext[1] = -TOPBARH;
+        ext[1] = -STATUSH;
         ext[2] = w;
         ext[3] = 0;
-        _swix(XWimp_SetExtent, _INR(0, 1), vw.topbar, ext);
+        _swix(XWimp_SetExtent, _INR(0, 1), vw.status, ext);
 
         infox1 = w - TB_RIGHTW;
-        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_INFO,
-              TB_LEFTW, -TOPBARH + 8, infox1, -8);
-        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_PAGE,
-              infox1 + 12, -TOPBARH + 8, infox1 + 100, -8);
-        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_UP,
-              infox1 + 104, -TOPBARH + 34, infox1 + 136, -8);
-        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.topbar, TB_DOWN,
-              infox1 + 104, -TOPBARH + 8, infox1 + 136, -TOPBARH + 34);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.status, TB_INFO,
+              TB_LEFTW, -STATUSH + 4, infox1, -4);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.status, TB_PAGE,
+              infox1 + 8, -STATUSH + 4, infox1 + 96, -4);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.status, TB_UP,
+              infox1 + 100, -STATUSH / 2, infox1 + 136, -8);
+        _swix(XWimp_ResizeIcon, _INR(0, 5), vw.status, TB_DOWN,
+              infox1 + 100, -STATUSH + 8, infox1 + 136, -STATUSH / 2);
         /* Resizing an icon redraws where it now is, not where it
-           was, so widening the bar leaves the old text sitting on
-           the bar beside the new.  Repaint the whole row.        */
-        _swix(XWimp_ForceRedraw, _INR(0, 4), vw.topbar,
-              0, -TOPBARH, w > vw.topw ? w : vw.topw, 0);
-        vw.topw = w;
+           was, so widening the row leaves the old text sitting on
+           it beside the new.  Repaint the whole row.            */
+        _swix(XWimp_ForceRedraw, _INR(0, 4), vw.status,
+              0, -STATUSH, w > vw.statw ? w : vw.statw, 0);
+        vw.statw = w;
     }
 
-    st[0] = vw.topbar;
+    st[0] = vw.status;
     if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
         return;
     }
     st[1] = mainst[1];
-    st[2] = mainst[4] - TOPBARH;
+    st[2] = mainst[2];                  /* on the floor of the window */
     st[3] = mainst[3];
-    st[4] = mainst[4];
+    st[4] = mainst[2] + STATUSH;
     st[5] = 0;
     st[6] = 0;
     st[7] = -1;                         /* in front of the page       */
     _swix(XWimp_OpenWindow, _INR(1, 4), st, WIMP_NEST_MAGIC,
-          vw.win, NEST_TOPSPAN);
-    vw.topnested = 1;
+          vw.win, NEST_BOTSPAN);
+    vw.statnested = 1;
 }
 
 /* Fit the toolbar into the horizontal scroll bar of the document
@@ -1206,7 +1248,7 @@ open_with_pane(int *open)
     if (_swix(XWimp_GetWindowState, _IN(1), st) != NULL) {
         return;
     }
-    arrange_topbar(st);
+    arrange_status(st);
     arrange_toolbar(st);
 }
 
@@ -1287,7 +1329,7 @@ size_to_page(void)
     }
     screen_size(&sw, &sh);
     ww = page_w();
-    wh = page_h() + TOPBARH;
+    wh = page_h() + STATUSH;
     if (ww > sw - 80) {
         ww = sw - 80;
     }
@@ -1798,7 +1840,7 @@ goto_page(u32 page)
 }
 
 static void
-topbar_click(int icon)
+status_click(int icon)
 {
     switch (icon) {
     case TB_PREV:
@@ -1887,7 +1929,7 @@ poll_loop(void)
         case 2:                         /* open                      */
             if (blk[0] == vw.win) {
                 open_with_pane(blk);
-            } else if (blk[0] == vw.pane || blk[0] == vw.topbar) {
+            } else if (blk[0] == vw.pane || blk[0] == vw.status) {
                 /* Deliberately nothing.  Once a bar is nested the
                    Wimp keeps it with its parent, and re-opening it
                    with the plain form would drop the parent link and
@@ -1909,8 +1951,8 @@ poll_loop(void)
                 outline_click(blk);
             } else if (blk[3] == vw.pane) {
                 toolbar_click(blk[4]);
-            } else if (blk[3] == vw.topbar) {
-                topbar_click(blk[4]);
+            } else if (blk[3] == vw.status) {
+                status_click(blk[4]);
             } else if (blk[3] == vw.win && (blk[2] & 2) != 0) {
                 /* Menu button over the page: the text menu          */
                 update_menu();
@@ -1980,14 +2022,14 @@ poll_loop(void)
                     redraw_doc();
                 }
             } else if (blk[6] == 0x18E) {   /* Page Down             */
-                topbar_click(TB_NEXT);
+                status_click(TB_NEXT);
             } else if (blk[6] == 0x19E) {   /* Page Up               */
-                topbar_click(TB_PREV);
+                status_click(TB_PREV);
             } else if (blk[6] == 0x18C) {   /* left cursor           */
-                topbar_click(TB_PREV);
+                status_click(TB_PREV);
             } else if (blk[6] == 0x18D) {   /* right cursor          */
-                topbar_click(TB_NEXT);
-            } else if (blk[6] == 13 && blk[0] == vw.topbar &&
+                status_click(TB_NEXT);
+            } else if (blk[6] == 13 && blk[0] == vw.status &&
                        blk[1] == TB_PAGE) {
                 /* Return in the page field goes to that page, which is
                    what the number range did in ImageViewer.        */
