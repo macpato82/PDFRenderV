@@ -27,6 +27,7 @@ test/host/testjbig2
 test/host/testjpg
 test/host/testlinks
 test/host/testoutline
+test/host/testmask
 test/host/testdbg
 test/host/jpgvec/
 

@@ -73,4 +73,8 @@ void pdfimg_cache_limit(u32 bytes);
 /* Hit/miss counts, so the cache can be checked rather than assumed. */
 void pdfimg_cache_stats(u32 *hits, u32 *misses);
 
+/* Hits and misses on the decoded-mask cache, which is what keeps a
+   JBIG2 stencil from being decoded again on every redraw.        */
+void pdfimg_mask_stats(u32 *hits, u32 *misses);
+
 #endif

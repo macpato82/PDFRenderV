@@ -373,11 +373,23 @@ build_template(int tmpl, const s8 *at, Pix *p)
     return n;
 }
 
+/* The context is assembled from one contiguous run of pixels per
+   template row, each held in a register and slid along by one pixel a
+   step.  Rows off the top of the image read as zero, which is what the
+   spare all-zero row is for: it takes a test out of the inner loop.
+   So does splitting the row at the last x whose rightmost template
+   pixel is still inside it - the bulk of the row then needs no bounds
+   check at all, and only the last few pixels do.
+
+   The last span of every template is the current row's own already-
+   decoded pixels ending at x-1, so what slides into it is the bit
+   just decoded rather than a fetch.                                 */
 static int
 decode_generic(Mq *mq, u8 *cx, int tmpl, int tpgdon, const s8 *at, Bm *bm)
 {
-    u8 *rows[3] = { NULL, NULL, NULL };  /* y-2, y-1 and the current   */
+    u8 *rows[3] = { NULL, NULL, NULL };
     u8 *store = NULL;
+    const u8 *zero = NULL;
     int w = bm->w, h = bm->h;
     int ltp = 0;
     int x, y, r;
@@ -385,13 +397,14 @@ decode_generic(Mq *mq, u8 *cx, int tmpl, int tpgdon, const s8 *at, Bm *bm)
     Pix tp[16];
     int ntp = 0;
 
-    store = calloc(3, (u32) w + 8);
+    store = calloc(4, (u32) w + 8);
     if (store == NULL) {
         return PDF_E_NOMEM;
     }
     for (r = 0; r < 3; r++) {
         rows[r] = store + (u32) r * ((u32) w + 8);
     }
+    zero = store + 3u * ((u32) w + 8);
     if (!nominal) {
         ntp = build_template(tmpl, at, tp);
     }
@@ -411,22 +424,21 @@ decode_generic(Mq *mq, u8 *cx, int tmpl, int tpgdon, const s8 *at, Bm *bm)
                 continue;
             }
         }
-        memset(cur, 0, (u32) w);
 
         if (nominal) {
             int ns = tmpl_nspan[tmpl];
             const Span *sp = tmpl_span[tmpl];
-            u8 *src[3];
+            const u8 *src[3];
             u32 acc[3], msk[3];
             int sh[3], wid[3];
-            int k;
+            int k, maxhi, xsafe;
 
             for (r = 0; r < ns; r++) {
                 wid[r] = sp[r].hi - sp[r].lo + 1;
                 msk[r] = (1u << wid[r]) - 1;
                 src[r] = sp[r].dy == 0 ? cur
-                       : sp[r].dy == -1 ? (y >= 1 ? m1 : NULL)
-                                        : (y >= 2 ? m2 : NULL);
+                       : sp[r].dy == -1 ? (y >= 1 ? m1 : zero)
+                                        : (y >= 2 ? m2 : zero);
             }
             sh[ns - 1] = 0;
             for (r = ns - 2; r >= 0; r--) {
@@ -435,30 +447,74 @@ decode_generic(Mq *mq, u8 *cx, int tmpl, int tpgdon, const s8 *at, Bm *bm)
             for (r = 0; r < ns; r++) {
                 acc[r] = 0;
                 for (k = sp[r].lo; k <= sp[r].hi; k++) {
-                    int v = src[r] != NULL && k >= 0 && k < w ? src[r][k] : 0;
+                    int v = k >= 0 && k < w ? src[r][k] : 0;
 
                     acc[r] = (acc[r] << 1) | (u32) v;
                 }
                 acc[r] &= msk[r];
             }
-            for (x = 0; x < w; x++) {
-                u32 ctx = 0;
-                int bit;
-
-                for (r = 0; r < ns; r++) {
-                    ctx |= acc[r] << sh[r];
+            maxhi = sp[0].hi;
+            for (r = 1; r < ns; r++) {
+                if (sp[r].hi > maxhi) {
+                    maxhi = sp[r].hi;
                 }
-                bit = mq_decode(mq, &cx[ctx]);
-                cur[x] = (u8) bit;
-                for (r = 0; r < ns; r++) {
-                    int nx = x + 1 + sp[r].hi;
-                    int v = src[r] != NULL && nx >= 0 && nx < w
-                            ? src[r][nx] : 0;
+            }
+            xsafe = w - 1 - maxhi;
+            if (xsafe < 0) {
+                xsafe = 0;
+            }
 
-                    acc[r] = ((acc[r] << 1) | (u32) v) & msk[r];
+            if (ns == 3) {
+                const u8 *p0 = src[0], *p1 = src[1];
+                u32 a0 = acc[0], a1 = acc[1], a2 = acc[2];
+                u32 k0 = msk[0], k1 = msk[1], k2 = msk[2];
+                int s0 = sh[0], s1 = sh[1];
+                int h0 = sp[0].hi + 1, h1 = sp[1].hi + 1;
+
+                for (x = 0; x < xsafe; x++) {
+                    u32 bit = (u32) mq_decode(mq,
+                                  &cx[(a0 << s0) | (a1 << s1) | a2]);
+
+                    cur[x] = (u8) bit;
+                    a0 = ((a0 << 1) | p0[x + h0]) & k0;
+                    a1 = ((a1 << 1) | p1[x + h1]) & k1;
+                    a2 = ((a2 << 1) | bit) & k2;
+                }
+                for (; x < w; x++) {
+                    int n0 = x + h0, n1 = x + h1;
+                    u32 bit = (u32) mq_decode(mq,
+                                  &cx[(a0 << s0) | (a1 << s1) | a2]);
+
+                    cur[x] = (u8) bit;
+                    a0 = ((a0 << 1) | (n0 < w ? p0[n0] : 0u)) & k0;
+                    a1 = ((a1 << 1) | (n1 < w ? p1[n1] : 0u)) & k1;
+                    a2 = ((a2 << 1) | bit) & k2;
+                }
+            } else {
+                const u8 *p0 = src[0];
+                u32 a0 = acc[0], a1 = acc[1];
+                u32 k0 = msk[0], k1 = msk[1];
+                int s0 = sh[0];
+                int h0 = sp[0].hi + 1;
+
+                for (x = 0; x < xsafe; x++) {
+                    u32 bit = (u32) mq_decode(mq, &cx[(a0 << s0) | a1]);
+
+                    cur[x] = (u8) bit;
+                    a0 = ((a0 << 1) | p0[x + h0]) & k0;
+                    a1 = ((a1 << 1) | bit) & k1;
+                }
+                for (; x < w; x++) {
+                    int n0 = x + h0;
+                    u32 bit = (u32) mq_decode(mq, &cx[(a0 << s0) | a1]);
+
+                    cur[x] = (u8) bit;
+                    a0 = ((a0 << 1) | (n0 < w ? p0[n0] : 0u)) & k0;
+                    a1 = ((a1 << 1) | bit) & k1;
                 }
             }
         } else {
+            memset(cur, 0, (u32) w);
             for (x = 0; x < w; x++) {
                 u32 ctx = 0;
                 int i, bit;

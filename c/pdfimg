@@ -78,6 +78,133 @@ cache_drop(int i)
     img_cache[i].bytes = 0;
 }
 
+/* --- decoded-mask cache ----------------------------------------------
+
+   A JBIG2 stencil is the most expensive thing on a scanned page:
+   arithmetic coding is sequential, so every pixel must be decoded
+   whatever size the page is being drawn at, and it is decoded again
+   every time the page is drawn.  Keeping the decoded bits turns
+   re-drawing - a zoom, a scroll that re-renders, going back to a page
+   - from that cost into nothing.
+
+   What is kept is the filter output, not the coverage plane built from
+   it, because the bits depend only on the stream while the plane
+   depends on the size being drawn: keyed this way a zoom still hits. */
+
+#define MASKCACHE_SLOTS 2
+
+typedef struct {
+    PdfDoc *doc;                /* NULL = empty slot                  */
+    u32 off;                    /* where the mask's stream sits       */
+    int w, h, bpc;
+    u8 *bits;
+    u32 len;
+    u32 tick;
+} MaskCache;
+
+static MaskCache mask_cache[MASKCACHE_SLOTS];
+static u32 mask_tick;
+static u32 mask_bytes;
+static u32 mask_hits, mask_misses;
+static u32 mask_limit = 3u * 1024u * 1024u;
+
+void
+pdfimg_mask_stats(u32 *hits, u32 *misses)
+{
+    if (hits) {
+        *hits = mask_hits;
+    }
+    if (misses) {
+        *misses = mask_misses;
+    }
+}
+
+static void
+mask_drop(int i)
+{
+    free(mask_cache[i].bits);
+    mask_bytes -= mask_cache[i].len;
+    mask_cache[i].bits = NULL;
+    mask_cache[i].doc = NULL;
+    mask_cache[i].len = 0;
+}
+
+static int
+mask_cache_find(PdfDoc *doc, u32 off, int w, int h)
+{
+    int i;
+
+    if (off == 0) {
+        return -1;
+    }
+    for (i = 0; i < MASKCACHE_SLOTS; i++) {
+        if (mask_cache[i].doc == doc && mask_cache[i].bits != NULL &&
+            mask_cache[i].off == off &&
+            mask_cache[i].w == w && mask_cache[i].h == h) {
+            mask_cache[i].tick = ++mask_tick;
+            mask_hits++;
+            return i;
+        }
+    }
+    mask_misses++;
+    return -1;
+}
+
+/* Takes ownership of bits on success, so the caller must not free
+   them; returns 0 if it did not, and then they are still the
+   caller's.                                                        */
+static int
+mask_cache_put(PdfDoc *doc, u32 off, int w, int h, int bpc, u8 *bits, u32 len)
+{
+    int i, slot = -1;
+    u32 oldest = 0xffffffffu;
+
+    if (off == 0 || bits == NULL || len == 0 || len > mask_limit) {
+        return 0;
+    }
+    while (mask_bytes + len > mask_limit) {
+        int victim = -1;
+        u32 old = 0xffffffffu;
+
+        for (i = 0; i < MASKCACHE_SLOTS; i++) {
+            if (mask_cache[i].bits != NULL && mask_cache[i].tick < old) {
+                old = mask_cache[i].tick;
+                victim = i;
+            }
+        }
+        if (victim < 0) {
+            break;
+        }
+        mask_drop(victim);
+    }
+    for (i = 0; i < MASKCACHE_SLOTS; i++) {
+        if (mask_cache[i].bits == NULL) {
+            slot = i;
+            break;
+        }
+        if (mask_cache[i].tick < oldest) {
+            oldest = mask_cache[i].tick;
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        return 0;
+    }
+    if (mask_cache[slot].bits != NULL) {
+        mask_drop(slot);
+    }
+    mask_cache[slot].doc = doc;
+    mask_cache[slot].off = off;
+    mask_cache[slot].w = w;
+    mask_cache[slot].h = h;
+    mask_cache[slot].bpc = bpc;
+    mask_cache[slot].bits = bits;
+    mask_cache[slot].len = len;
+    mask_cache[slot].tick = ++mask_tick;
+    mask_bytes += len;
+    return 1;
+}
+
 void
 pdfimg_cache_flush(PdfDoc *doc)
 {
@@ -87,6 +214,12 @@ pdfimg_cache_flush(PdfDoc *doc)
         if (img_cache[i].doc != NULL &&
             (doc == NULL || img_cache[i].doc == doc)) {
             cache_drop(i);
+        }
+    }
+    for (i = 0; i < MASKCACHE_SLOTS; i++) {
+        if (mask_cache[i].doc != NULL &&
+            (doc == NULL || mask_cache[i].doc == doc)) {
+            mask_drop(i);
         }
     }
 }
@@ -719,6 +852,51 @@ plane_at(const u8 *p, int w, int h, int x, int y, int dw, int dh)
     return p[(u32) sy * (u32) w + (u32) sx];
 }
 
+/* The mask's samples, filter-decoded.  JBIG2 is a codec rather than a
+   filter, so pdf_streamdata stops at it and it is finished off here;
+   its output is 1-bit samples either way.                          */
+static int
+mask_bits(PdfDoc *doc, PdfObj *mobj, s32 mw, s32 mh, s32 *bpcp, PdfBuf *out)
+{
+    char stopflt[16];
+    u8 *decoded = NULL;
+    u32 blen = 0;
+    PdfBuf gbuf = { 0 };
+    PdfObj *parms, *g = NULL;
+    int err;
+
+    err = pdf_streamdata(doc, mobj, out, stopflt);
+    if (err != PDF_OK) {
+        return err;
+    }
+    if (stopflt[0] == 0) {
+        return PDF_OK;
+    }
+    if (strcmp(stopflt, "JBIG2Decode") != 0) {
+        return PDF_E_UNSUP;             /* CCITT: not decoded here     */
+    }
+    parms = pdf_resolve(doc, pdf_dictget(mobj, "DecodeParms"));
+    if (parms != NULL && parms->type == PDF_DICT) {
+        g = pdf_resolve(doc, pdf_dictget(parms, "JBIG2Globals"));
+    }
+    if (g != NULL && g->type == PDF_STREAM &&
+        pdf_streamdata(doc, g, &gbuf, NULL) != PDF_OK) {
+        pdfbuf_free(&gbuf);
+    }
+    err = pdfjbig2_decode(gbuf.p, gbuf.len, out->p, out->len,
+                          (int) mw, (int) mh, &decoded, &blen);
+    pdfbuf_free(&gbuf);
+    pdfbuf_free(out);
+    if (err != PDF_OK) {
+        return err;
+    }
+    out->p = decoded;
+    out->len = blen;
+    out->cap = blen;
+    *bpcp = 1;
+    return PDF_OK;
+}
+
 /* Build the coverage plane straight from the mask's samples.
 
    A stencil is one bit a pixel at scan resolution, so it is routinely
@@ -738,11 +916,13 @@ mask_plane_direct(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
                   int stencil, u8 **outp)
 {
     PdfBuf buf = { 0 };
-    char stopflt[16];
     PdfObj *o;
     s32 mw, mh, bpc;
     u32 rowbytes;
     u8 *plane;
+    const u8 *bits = NULL;
+    u32 bitslen = 0;
+    int cached = 0;
     int *xmap = NULL, *ymap = NULL;
     int inv = 0, x, y, err;
 
@@ -775,45 +955,29 @@ mask_plane_direct(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
         inv = num_nonzero(pdf_resolve(doc, pdf_arrget(o, 0)));
     }
 
-    err = pdf_streamdata(doc, mobj, &buf, stopflt);
-    if (err != PDF_OK) {
-        pdfbuf_free(&buf);
-        return err;
-    }
-    if (stopflt[0] != 0) {
-        if (strcmp(stopflt, "JBIG2Decode") != 0) {
-            pdfbuf_free(&buf);
-            return PDF_E_UNSUP;
-        }
-        {
-            u8 *bits = NULL;
-            u32 blen = 0;
-            PdfBuf gbuf = { 0 };
-            PdfObj *parms = pdf_resolve(doc, pdf_dictget(mobj, "DecodeParms"));
-            PdfObj *g = NULL;
+    /* Decoded already?  Keyed on the stream, not on the size being
+       drawn, so a zoom still finds it.                             */
+    {
+        int slot = mask_cache_find(doc, mobj->u.stm.off, (int) mw, (int) mh);
 
-            if (parms != NULL && parms->type == PDF_DICT) {
-                g = pdf_resolve(doc, pdf_dictget(parms, "JBIG2Globals"));
-            }
-            if (g != NULL && g->type == PDF_STREAM &&
-                pdf_streamdata(doc, g, &gbuf, NULL) != PDF_OK) {
-                pdfbuf_free(&gbuf);
-            }
-            err = pdfjbig2_decode(gbuf.p, gbuf.len, buf.p, buf.len,
-                                  (int) mw, (int) mh, &bits, &blen);
-            pdfbuf_free(&gbuf);
-            pdfbuf_free(&buf);
-            if (err != PDF_OK) {
-                return err;
-            }
-            buf.p = bits;
-            buf.len = blen;
-            buf.cap = blen;
-            bpc = 1;
+        if (slot >= 0) {
+            bits = mask_cache[slot].bits;
+            bitslen = mask_cache[slot].len;
+            bpc = mask_cache[slot].bpc;
+            cached = 1;
         }
+    }
+    if (!cached) {
+        err = mask_bits(doc, mobj, mw, mh, &bpc, &buf);
+        if (err != PDF_OK) {
+            pdfbuf_free(&buf);
+            return err;
+        }
+        bits = buf.p;
+        bitslen = buf.len;
     }
     rowbytes = ((u32) mw * (u32) bpc + 7u) / 8u;
-    if (buf.len < rowbytes * (u32) mh) {
+    if (bitslen < rowbytes * (u32) mh) {
         pdfbuf_free(&buf);
         return PDF_E_DATA;
     }
@@ -869,7 +1033,7 @@ mask_plane_direct(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
             }
             xstep = (sx1 - sx0 + 7) / 8;
             for (sy = sy0; sy < sy1; sy += ystep) {
-                const u8 *row = buf.p + (u32) sy * rowbytes;
+                const u8 *row = bits + (u32) sy * rowbytes;
 
                 for (sx = sx0; sx < sx1; sx += xstep) {
                     u32 v;
@@ -898,6 +1062,12 @@ mask_plane_direct(PdfDoc *doc, PdfObj *mobj, int basew, int baseh,
     }
     free(xmap);
     free(ymap);
+    if (!cached &&
+        mask_cache_put(doc, mobj->u.stm.off, (int) mw, (int) mh, (int) bpc,
+                       buf.p, buf.len)) {
+        buf.p = NULL;                   /* the cache owns them now     */
+        buf.len = buf.cap = 0;
+    }
     pdfbuf_free(&buf);
     *outp = plane;
     return PDF_OK;
