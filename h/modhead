@@ -176,7 +176,8 @@ extern _kernel_oserror __err_err_BadPDF; /* &81b744 */
 extern _kernel_oserror __err_err_Encrypted; /* &81b745 */
 extern _kernel_oserror __err_err_Unsup; /* &81b746 */
 extern _kernel_oserror __err_err_BadSWI; /* &81b747 */
-extern _kernel_oserror __err_err_Syntax; /* &81b748 */
+extern _kernel_oserror __err_err_TooMany; /* &81b748 */
+extern _kernel_oserror __err_err_Syntax; /* &81b749 */
 
 #define err_Already (&__err_err_Already)
 #define err_BadHandle (&__err_err_BadHandle)
@@ -186,17 +187,19 @@ extern _kernel_oserror __err_err_Syntax; /* &81b748 */
 #define err_Encrypted (&__err_err_Encrypted)
 #define err_Unsup (&__err_err_Unsup)
 #define err_BadSWI (&__err_err_BadSWI)
+#define err_TooMany (&__err_err_TooMany)
 #define err_Syntax (&__err_err_Syntax)
 #elif defined(__GNUC__) /* RISC OS 32bit build with GCC */
-extern void __err_err_Already(void); /* &81b749 */
-extern void __err_err_BadHandle(void); /* &81b74a */
-extern void __err_err_BadPage(void); /* &81b74b */
-extern void __err_err_NoMem(void); /* &81b74c */
-extern void __err_err_BadPDF(void); /* &81b74d */
-extern void __err_err_Encrypted(void); /* &81b74e */
-extern void __err_err_Unsup(void); /* &81b74f */
-extern void __err_err_BadSWI(void); /* &81b750 */
-extern void __err_err_Syntax(void); /* &81b751 */
+extern void __err_err_Already(void); /* &81b74a */
+extern void __err_err_BadHandle(void); /* &81b74b */
+extern void __err_err_BadPage(void); /* &81b74c */
+extern void __err_err_NoMem(void); /* &81b74d */
+extern void __err_err_BadPDF(void); /* &81b74e */
+extern void __err_err_Encrypted(void); /* &81b74f */
+extern void __err_err_Unsup(void); /* &81b750 */
+extern void __err_err_BadSWI(void); /* &81b751 */
+extern void __err_err_TooMany(void); /* &81b752 */
+extern void __err_err_Syntax(void); /* &81b753 */
 
 #define err_Already ((_kernel_oserror*)(void *)__err_err_Already)
 #define err_BadHandle ((_kernel_oserror*)(void *)__err_err_BadHandle)
@@ -206,17 +209,19 @@ extern void __err_err_Syntax(void); /* &81b751 */
 #define err_Encrypted ((_kernel_oserror*)(void *)__err_err_Encrypted)
 #define err_Unsup ((_kernel_oserror*)(void *)__err_err_Unsup)
 #define err_BadSWI ((_kernel_oserror*)(void *)__err_err_BadSWI)
+#define err_TooMany ((_kernel_oserror*)(void *)__err_err_TooMany)
 #define err_Syntax ((_kernel_oserror*)(void *)__err_err_Syntax)
 #else /* Norcroft */
-extern void __err_err_Already(void); /* &81b752 */
-extern void __err_err_BadHandle(void); /* &81b753 */
-extern void __err_err_BadPage(void); /* &81b754 */
-extern void __err_err_NoMem(void); /* &81b755 */
-extern void __err_err_BadPDF(void); /* &81b756 */
-extern void __err_err_Encrypted(void); /* &81b757 */
-extern void __err_err_Unsup(void); /* &81b758 */
-extern void __err_err_BadSWI(void); /* &81b759 */
-extern void __err_err_Syntax(void); /* &81b75a */
+extern void __err_err_Already(void); /* &81b754 */
+extern void __err_err_BadHandle(void); /* &81b755 */
+extern void __err_err_BadPage(void); /* &81b756 */
+extern void __err_err_NoMem(void); /* &81b757 */
+extern void __err_err_BadPDF(void); /* &81b758 */
+extern void __err_err_Encrypted(void); /* &81b759 */
+extern void __err_err_Unsup(void); /* &81b75a */
+extern void __err_err_BadSWI(void); /* &81b75b */
+extern void __err_err_TooMany(void); /* &81b75c */
+extern void __err_err_Syntax(void); /* &81b75d */
 
 #define err_Already ((_kernel_oserror*)(int)__err_err_Already)
 #define err_BadHandle ((_kernel_oserror*)(int)__err_err_BadHandle)
@@ -226,6 +231,7 @@ extern void __err_err_Syntax(void); /* &81b75a */
 #define err_Encrypted ((_kernel_oserror*)(int)__err_err_Encrypted)
 #define err_Unsup ((_kernel_oserror*)(int)__err_err_Unsup)
 #define err_BadSWI ((_kernel_oserror*)(int)__err_err_BadSWI)
+#define err_TooMany ((_kernel_oserror*)(int)__err_err_TooMany)
 #define err_Syntax ((_kernel_oserror*)(int)__err_err_Syntax)
 #endif
 

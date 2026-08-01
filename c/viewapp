@@ -168,6 +168,10 @@ static const struct { int x0, x1; } toollayout[] = {
 #define CMP_NEXT   1
 #define CMP_INFO   2
 #define CMP_PAGE   3
+#define CMP_ZOOM   4
+
+#define Gadget_SetFlags         65
+#define Gadget_Faded            (1u << 31)
 
 /* The Toolbox fills this in before every event: which object and
    component it happened on, and what they were shown from.        */
@@ -881,9 +885,31 @@ update_toolbar_texts(void)
     }
     _swix(Toolbox_ObjectMiscOp, _INR(0, 4),
           0, vw.toolobj, DisplayField_SetValue, CMP_INFO, vw.infotxt);
+    /* Bounds before value, and every time, because the page count is
+       not known when the window is built - which is why the arrows
+       used to count past the end of a one-page document.  Bit 0 of
+       the flags says "lower bound given", bit 1 "upper bound"; the
+       step and precision are left alone.                         */
+    _swix(Toolbox_ObjectMiscOp, _INR(0, 6),
+          3, vw.toolobj, NumberRange_SetBounds, CMP_PAGE,
+          1, (int) (vw.npages ? vw.npages : 1));
     _swix(Toolbox_ObjectMiscOp, _INR(0, 4),
           0, vw.toolobj, NumberRange_SetValue, CMP_PAGE,
           (int) vw.page + 1);
+    _swix(Toolbox_ObjectMiscOp, _INR(0, 4),
+          0, vw.toolobj, NumberRange_SetValue, CMP_ZOOM, vw.zoom);
+    /* Nothing to step to in a single-page document, so say so by
+       fading the arrows rather than letting them do nothing.     */
+    {
+        unsigned f = vw.npages > 1 ? 0u : Gadget_Faded;
+
+        _swix(Toolbox_ObjectMiscOp, _INR(0, 5),
+              0, vw.toolobj, Gadget_SetFlags, CMP_PREV, f, Gadget_Faded);
+        _swix(Toolbox_ObjectMiscOp, _INR(0, 5),
+              0, vw.toolobj, Gadget_SetFlags, CMP_NEXT, f, Gadget_Faded);
+        _swix(Toolbox_ObjectMiscOp, _INR(0, 5),
+              0, vw.toolobj, Gadget_SetFlags, CMP_PAGE, f, Gadget_Faded);
+    }
 }
 
 static void
@@ -982,10 +1008,6 @@ create_windows(void)
     if (e != NULL) {
         vw.toolobj = 0;
     }
-    /* the page can be any length; let the number range say so       */
-    _swix(Toolbox_ObjectMiscOp, _INR(0, 6),
-          0, vw.toolobj, NumberRange_SetBounds, CMP_PAGE,
-          1, (int) (vw.npages ? vw.npages : 1), 1, 0);
     return 0;
 }
 
@@ -1727,6 +1749,10 @@ poll_loop(void)
             case NumberRange_ValueChanged:
                 if (vw.idb.self_cmp == CMP_PAGE && blk[4] >= 1) {
                     goto_page((u32) blk[4] - 1);
+                } else if (vw.idb.self_cmp == CMP_ZOOM && blk[4] >= 10 &&
+                           blk[4] != vw.zoom) {
+                    vw.zoom = blk[4];
+                    rerender();
                 }
                 break;
             }

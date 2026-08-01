@@ -96,7 +96,10 @@
 #define SPRITE_MODE_32BPP_180 \
     ((6u << 27) | (180u << 14) | (180u << 1) | 1u)
 
-#define MAXDOCS 8
+/* One slot per open document.  Eight was too few: every viewer
+   window holds one, and the ninth failed with "out of memory", which
+   is both wrong and unhelpful.  A slot is a handful of pointers.  */
+#define MAXDOCS 32
 
 /* filetypes claim_filetypes()/mod_final walk                        */
 #define NTYPES 9
@@ -107,6 +110,7 @@ typedef struct {
     int inuse;
     int kind;                   /* FT_* of the opened file           */
     int filetype;               /* the real type, for FT_OTHER       */
+    u32 sprite;                 /* which sprite, in a sprite file    */
     PdfDoc *doc;                /* FT_PDF only                       */
     u8 *buf;                    /* whole file                        */
     u32 len;
@@ -195,6 +199,57 @@ load_file(const char *name, u8 **bufp, u32 *lenp, int *typep)
     *bufp = buf;
     *lenp = (u32) size;
     return NULL;
+}
+
+/* The idx'th sprite in a sprite file, or NULL.  A sprite file can
+   hold any number of them - which is what ImageViewer's index control
+   was for, and why a multi-sprite file has as many "pages" here as it
+   has sprites.  Offsets in the area are measured from the size word
+   that the FILE format leaves out, hence the -4.                  */
+static const u32 *
+sprite_at(const DocSlot *ds, u32 idx)
+{
+    const u32 *a = (const u32 *) ds->buf;
+    const u8 *p;
+    u32 n, i;
+
+    if (ds->buf == NULL || ds->len < 16) {
+        return NULL;
+    }
+    n = a[0];
+    if (n == 0 || idx >= n || a[1] < 4 || a[1] - 4 >= ds->len) {
+        return NULL;
+    }
+    p = ds->buf + a[1] - 4;
+    for (i = 0; i < idx; i++) {
+        u32 sz = ((const u32 *) p)[0];
+
+        if (sz < 44 || (u32) (p - ds->buf) + sz + 44 > ds->len) {
+            return NULL;
+        }
+        p += sz;
+    }
+    if ((u32) (p - ds->buf) + 44 > ds->len) {
+        return NULL;
+    }
+    return (const u32 *) p;
+}
+
+/* Pixel size of one sprite, from its header.  Below 32bpp a word
+   holds several pixels, and the last one is partly unused.       */
+static void
+sprite_size(const u32 *sp, int *w, int *h)
+{
+    u32 mode = sp[10];
+    int type = (int) ((mode >> 27) & 31);
+    int bpp = type == 6 ? 32 : type == 5 ? 16 : type == 4 ? 8
+            : type == 3 ? 4 : type == 2 ? 2 : type == 1 ? 1 : 0;
+
+    *w = (int) sp[4] + 1;               /* width in words - 1        */
+    *h = (int) sp[5] + 1;
+    if (bpp && bpp < 32) {
+        *w = *w * (32 / bpp) - (int) ((31 - sp[7]) / (u32) bpp);
+    }
 }
 
 /* Work out what a file is: its filetype if it has a useful one,
@@ -376,25 +431,12 @@ measure_doc(DocSlot *ds)
         }
     case FT_SPRITE:
         {
-            /* sprite file: count, first, free, then the sprite      */
-            const u32 *a = (const u32 *) ds->buf;
-            const u32 *sp;
-            if (ds->len < 60 || a[0] == 0) {
+            const u32 *sp = sprite_at(ds, ds->sprite);
+
+            if (sp == NULL) {
                 return err_BadPDF;
             }
-            sp = (const u32 *) (ds->buf + a[1] - 4);
-            ds->w = (int) sp[4] + 1;    /* width in words - 1        */
-            ds->h = (int) sp[5] + 1;
-            {   /* words hold several pixels below 32bpp             */
-                u32 mode = sp[10];
-                int type = (int) ((mode >> 27) & 31);
-                int bpp = type == 6 ? 32 : type == 5 ? 16 : type == 4 ? 8
-                        : type == 3 ? 4 : type == 2 ? 2 : type == 1 ? 1 : 0;
-                if (bpp && bpp < 32) {
-                    ds->w = ds->w * (32 / bpp) -
-                            (int) ((31 - sp[7]) / (u32) bpp);
-                }
-            }
+            sprite_size(sp, &ds->w, &ds->h);
             return NULL;
         }
     case FT_DRAW:
@@ -433,7 +475,7 @@ open_doc(const char *name, int *handlep)
         }
     }
     if (i == MAXDOCS) {
-        return err_NoMem;
+        return err_TooMany;
     }
     e = load_file(name, &buf, &len, &filetype);
     if (e != NULL) {
@@ -495,7 +537,15 @@ close_doc(DocSlot *ds)
 static u32
 doc_pages(DocSlot *ds)
 {
-    return ds->kind == FT_PDF ? ds->doc->npages : 1;
+    if (ds->kind == FT_PDF) {
+        return ds->doc->npages;
+    }
+    if (ds->kind == FT_SPRITE && ds->buf != NULL && ds->len >= 16) {
+        u32 n = ((const u32 *) ds->buf)[0];
+
+        return n ? n : 1;
+    }
+    return 1;
 }
 
 /* Render page (0-based) direct to the current VDU output at zoom
@@ -586,7 +636,16 @@ plot_sprite(DocSlot *ds, int dx, int dy, int dw, int dh)
        already correct - do NOT add 4 again.                         */
     ((u32 *) area)[0] = ds->len + 4;
     memcpy(area + 4, ds->buf, ds->len);
-    first = ((u32 *) area)[2];
+    /* Which sprite: the file may hold several, and ds->sprite says
+       which one the page number picked.  Its offset in the rebuilt
+       area is its offset in the file plus the size word.        */
+    {
+        const u32 *sp = sprite_at(ds, ds->sprite);
+
+        first = sp != NULL
+                ? (u32) ((const u8 *) sp - ds->buf) + 4
+                : ((u32 *) area)[2];
+    }
     scale[0] = (u32) dw;
     scale[1] = (u32) dh;
     scale[2] = (u32) ds->w;
@@ -1053,7 +1112,15 @@ mod_swi(int swi_no, _kernel_swi_regs *r, void *pw)
             }
             if (ds->kind != FT_PDF) {
                 /* one page; report the image at 1 pixel = 1 point so
-                   100% zoom shows it close to actual size          */
+                   100% zoom shows it close to actual size.  A sprite
+                   file may hold several, and then the page number
+                   selects which - so re-measure for it.          */
+                if (ds->kind == FT_SPRITE) {
+                    ds->sprite = (u32) r->r[1] - 1;
+                    if (measure_doc(ds) != NULL) {
+                        return err_BadPage;
+                    }
+                }
                 r->r[0] = ds->w * 1000;
                 r->r[1] = ds->h * 1000;
                 r->r[2] = 0;

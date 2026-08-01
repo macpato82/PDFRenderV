@@ -10,7 +10,7 @@ window_object {
   sprite_name:""
   pointer_limit:0
   hotspot:0,0
-  menu_name:""
+  menu_name:"Menu"
   default_focus:toolbox_WINDOW_FOCUS
   show_action:&0
   hide_action:&0
@@ -100,7 +100,7 @@ window_object {
   }
   displayfield_object {
     cmp:&2
-    bbox:104,-56,744,-4
+    bbox:104,-56,600,-4
     help_message:"This field describes the document being shown."
     help_limit:*
     flags:
@@ -108,8 +108,23 @@ window_object {
     text_limit:256
   }
   numberrange_object {
+    cmp:&4
+    bbox:612,-56,772,-4
+    help_message:"The scale the page is shown at.|MType a percentage or use the arrows."
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_ADJUSTERS | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:10
+    upper_bound:800
+    step_size:5
+    initial_value:100
+    precision:0
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:64
+  }
+  numberrange_object {
     cmp:&3
-    bbox:756,-56,916,-4
+    bbox:784,-56,944,-4
     help_message:"The page being shown.|MType a page number or use the arrows."
     help_limit:*
     flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_ADJUSTERS | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
@@ -122,4 +137,69 @@ window_object {
     next:toolbox_NULL_COMPONENT
     display_length:64
   }
+}
+
+menu_object {
+  header_flags:
+  version:102
+  object_name:"Menu"
+  menu_flags:
+  title:"Viewer"
+  title_limit:*
+  help:""
+  help_limit:*
+  show_action:&0
+  hide_action:
+  Entry {
+    cmp:0
+    flags:menu_ENTRY_SUB_MENU
+    cmp:&0
+    text:"Scale  F11"
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:"Scale"
+    sub_menu_action:&0
+    click_action:&0
+    help:"\Rselect a scale for the page."
+    help_limit:*
+  }
+  Entry {
+    cmp:1
+    flags:menu_ENTRY_SUB_MENU
+    cmp:&1
+    text:"Export"
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:"SaveAs"
+    sub_menu_action:&0
+    click_action:&0
+    help:"\Rsave the page."
+    help_limit:*
+  }
+}
+
+scale_object {
+  header_flags:
+  version:100
+  object_name:"Scale"
+  scale_flags:scale_GENERATE_ABOUT_TO_BE_SHOWN
+  lower_bound:10
+  upper_bound:800
+  step_size:5
+  title:""
+  title_limit:*
+  alternative_window_name:""
+  std_value:50,75,100,200
+}
+
+saveas_object {
+  header_flags:
+  version:100
+  object_name:"SaveAs"
+  saveas_flags:saveas_GENERATE_ABOUT_TO_BE_SHOWN | saveas_NO_SELECTION_BUTTON
+  file_name:"Page"
+  file_type:&ff9
+  title:""
+  title_limit:*
+  alternative_window_name:""
 }

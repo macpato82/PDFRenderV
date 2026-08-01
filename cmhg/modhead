@@ -45,6 +45,7 @@ error-identifiers:      err_Already("PDFRenderV is already loaded - *RMKill PDFR
                         err_Encrypted("PDFRenderV: this PDF needs a password"),
                         err_Unsup("PDFRenderV: PDF uses an unsupported feature"),
                         err_BadSWI("PDFRenderV: unknown SWI"),
+                        err_TooMany("PDFRenderV: too many documents open at once"),
                         err_Syntax("Syntax: *PDFToSprite <pdf> <page> <spritefile> [<width px>]")
 
 command-keyword-table:  cmd_handler
