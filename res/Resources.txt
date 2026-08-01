@@ -35,7 +35,7 @@ window_object {
   window.title_flags:wimp_ICON_TEXT | wimp_ICON_HCENTRED | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
   window.work_flags:wimp_BUTTON_CLICK_DRAG
   window.sprite_area:&ffffffff
-  window.xmin:480
+  window.xmin:1240
   window.ymin:156
   window.title_text:"Viewer"
   window.title_text_limit:256
@@ -100,7 +100,7 @@ window_object {
   }
   displayfield_object {
     cmp:&2
-    bbox:104,-56,600,-4
+    bbox:104,-56,860,-4
     help_message:"This field describes the document being shown."
     help_limit:*
     flags:
@@ -109,7 +109,7 @@ window_object {
   }
   numberrange_object {
     cmp:&4
-    bbox:612,-56,772,-4
+    bbox:872,-56,1032,-4
     help_message:"The scale the page is shown at.|MType a percentage or use the arrows."
     help_limit:*
     flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_ADJUSTERS | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
@@ -124,7 +124,7 @@ window_object {
   }
   numberrange_object {
     cmp:&3
-    bbox:784,-56,944,-4
+    bbox:1044,-56,1204,-4
     help_message:"The page being shown.|MType a page number or use the arrows."
     help_limit:*
     flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_ADJUSTERS | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
@@ -152,8 +152,47 @@ menu_object {
   hide_action:
   Entry {
     cmp:0
-    flags:menu_ENTRY_SUB_MENU
+    flags:
     cmp:&0
+    text:"Copy"
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:""
+    sub_menu_action:&0
+    click_action:&0
+    help:"\Scopy the selected text to the clipboard."
+    help_limit:*
+  }
+  Entry {
+    cmp:1
+    flags:
+    cmp:&1
+    text:"Select all"
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:""
+    sub_menu_action:&0
+    click_action:&0
+    help:"\Sselect all the text on this page."
+    help_limit:*
+  }
+  Entry {
+    cmp:2
+    flags:
+    cmp:&2
+    text:"Save text..."
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:""
+    sub_menu_action:&0
+    click_action:&0
+    help:"\Ssave the selected text as a file."
+    help_limit:*
+  }
+  Entry {
+    cmp:3
+    flags:menu_ENTRY_SEPARATE | menu_ENTRY_SUB_MENU
+    cmp:&3
     text:"Scale  F11"
     text_limit:*
     click_object_name:""
@@ -164,16 +203,16 @@ menu_object {
     help_limit:*
   }
   Entry {
-    cmp:1
+    cmp:4
     flags:menu_ENTRY_SUB_MENU
-    cmp:&1
+    cmp:&4
     text:"Export"
     text_limit:*
     click_object_name:""
     sub_menu_object_name:"SaveAs"
     sub_menu_action:&0
     click_action:&0
-    help:"\Rsave the page."
+    help:"\Rsave this page as a sprite."
     help_limit:*
   }
 }

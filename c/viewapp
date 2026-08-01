@@ -158,6 +158,18 @@ static const struct { int x0, x1; } toollayout[] = {
 #define Window_GetWimpHandle    0
 #define Adjuster_Clicked        (Window_SWIChunkBase + 12)
 #define NumberRange_ValueChanged (Window_SWIChunkBase + 13)
+
+#define Scale_SWIChunkBase      0x82C00
+#define Scale_AboutToBeShown    (Scale_SWIChunkBase + 0)
+#define Scale_ApplyFactor       (Scale_SWIChunkBase + 2)
+#define Scale_SetValue          1
+
+#define SaveAs_SWIChunkBase     0x82BC0
+#define SaveAs_AboutToBeShown   (SaveAs_SWIChunkBase + 0)
+#define SaveAs_SaveToFile       (SaveAs_SWIChunkBase + 2)
+#define SaveAs_SaveCompleted    (SaveAs_SWIChunkBase + 4)
+#define SaveAs_SetFileName      0
+#define SaveAs_FileSaveCompleted 12
 #define DisplayField_SetValue   448
 #define NumberRange_SetValue    832
 #define NumberRange_SetBounds   834
@@ -1442,6 +1454,28 @@ print_page(void)
 
 /* Write the selection to a text file alongside the document, which
    is the useful thing to do without a full drag-and-drop save box. */
+/* Save the page as it is on screen: the sprite we already rendered,
+   written as a sprite file.  A sprite area's first word is its own
+   size, which the file format leaves out, so the file is the area
+   from the fourth byte on.  Returns 0 on success.               */
+static int
+save_page_sprite(const char *path)
+{
+    u32 *area = (u32 *) vw.area;
+    u32 len;
+
+    if (area == NULL || path == NULL) {
+        return -1;
+    }
+    len = area[2] - 4;                  /* free offset, less the word */
+    if (_swix(XOS_File, _INR(0, 5), 10, path, 0xFF9, 0,
+              (const u8 *) vw.area + 4, (const u8 *) vw.area + 4 + len)
+        != NULL) {
+        return -1;
+    }
+    return 0;
+}
+
 static void
 save_selection(void)
 {
@@ -1738,12 +1772,58 @@ poll_loop(void)
         case Wimp_EToolboxEvent:
             /* blk[2] is the event code, and the id block says which
                object and gadget it came from.                     */
+#if VIEWER_DEBUG
+            if (vw.toolobj != 0) {
+                char t[64];
+
+                sprintf(t, "event &%X cmp %d", (unsigned) blk[2],
+                        vw.idb.self_cmp);
+                _swix(Toolbox_ObjectMiscOp, _INR(0, 4),
+                      0, vw.toolobj, DisplayField_SetValue, CMP_INFO, t);
+            }
+#endif
             switch (blk[2]) {
             case Adjuster_Clicked:
                 if (vw.idb.self_cmp == CMP_PREV) {
                     status_click(TB_PREV);
                 } else if (vw.idb.self_cmp == CMP_NEXT) {
                     status_click(TB_NEXT);
+                }
+                break;
+            case Scale_AboutToBeShown:
+                /* open it showing the scale in force               */
+                _swix(Toolbox_ObjectMiscOp, _INR(0, 3),
+                      0, vw.idb.self_id, Scale_SetValue, vw.zoom);
+                break;
+            case Scale_ApplyFactor:
+                /* the factor is a percentage in the event block     */
+                if (blk[4] >= 10 && blk[4] <= 800 && blk[4] != vw.zoom) {
+                    vw.zoom = blk[4];
+                    rerender();
+                }
+                break;
+            case SaveAs_AboutToBeShown:
+                {
+                    /* suggest the document's leaf name with the page
+                       on it, so successive pages do not overwrite */
+                    char leaf[64];
+                    const char *lf = strrchr(vw.filename, '.');
+
+                    sprintf(leaf, "%.40sPage%u",
+                            lf != NULL ? lf + 1 : "", (unsigned) vw.page + 1);
+                    _swix(Toolbox_ObjectMiscOp, _INR(0, 3),
+                          0, vw.idb.self_id, SaveAs_SetFileName, leaf);
+                }
+                break;
+            case SaveAs_SaveToFile:
+                {
+                    /* blk[4] is a pointer to the chosen file name   */
+                    const char *path = (const char *) blk[4];
+                    int ok = save_page_sprite(path) == 0;
+
+                    _swix(Toolbox_ObjectMiscOp, _INR(0, 3),
+                          0, vw.idb.self_id, SaveAs_FileSaveCompleted,
+                          ok ? 1 : 0);
                 }
                 break;
             case NumberRange_ValueChanged:
