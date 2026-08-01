@@ -202,6 +202,8 @@ typedef struct {
                                natural order, undequantised             */
     int bw, bh;             /* blocks across/down, MCU-padded            */
     int bwf, bhf;           /* blocks the component's own size needs     */
+    int samp_w, samp_h;     /* samples in the plane that are the image,
+                               the rest being MCU padding                */
 } JpgComp;
 
 typedef struct {
@@ -978,55 +980,176 @@ ycbcr_to_rgb(u32 y, u32 cb, u32 cr, u32 *rp, u32 *gp, u32 *bp)
     *bp = clamp255(b);
 }
 
-/* Fetch component c's sample at output pixel (x, y), nearest-neighbour
-   upsampling any chroma subsampling by the ratio of its own sampling
-   factors to the frame's maximum (mirrors comp_at() in c/pdfjpx,
-   which does the same job for OpenJPEG's differently-shaped planes).
-   Quality is not the point - c->plane is already at the chosen DCT
-   scale, so this is nearest-neighbour on an already-small image.      */
-static u32
-comp_sample(const JpgComp *c, int x, int y, int hmax, int vmax)
-{
-    int cx = (x * c->h) / hmax;
-    int cy = (y * c->v) / vmax;
+/* --- chroma upsampling ---------------------------------------------------
 
-    if (cx < 0) {
-        cx = 0;
-    } else if (cx >= c->plane_w) {
-        cx = c->plane_w - 1;
+   A subsampled component's samples sit at the CENTRES of the groups
+   of output pixels they cover, not at their left edges, so an output
+   pixel generally falls between two of them.  Interpolating linearly
+   between the two, with that half-sample offset applied, is what T.81
+   calls triangular filtering and is what libjpeg does; taking the
+   nearer one instead puts a hard step at every group boundary, which
+   on a sharp colour edge is visibly wrong by a long way and is what
+   this used to do.
+
+   Source position for output x is (x + 1/2) * h / hmax - 1/2, which as
+   a fraction over D = 2*hmax is ((2x + 1)*h - hmax) / D.  Stepping x
+   by one adds 2*h to the numerator, and 2*h <= D always, so walking
+   along a row needs one add and at most one correction per pixel -
+   no division, which matters on an ARM without one.                  */
+
+typedef struct {
+    u16 *i0, *i1;           /* the two sample indices, already clamped   */
+    u16 *w;                 /* weight of the second, 0..256              */
+} UpsampleX;
+
+static void
+upsample_free(UpsampleX *u)
+{
+    free(u->i0);
+    free(u->i1);
+    free(u->w);
+    u->i0 = u->i1 = u->w = NULL;
+}
+
+/* Build the horizontal map for one component.  Vertical uses the same
+   arithmetic a row at a time, so it needs no table.                  */
+static int
+upsample_build(UpsampleX *u, const JpgComp *c, int hmax, int outw)
+{
+    int d = 2 * hmax;
+    int step = 2 * c->h;
+    int wtab[16];
+    int i, f, x;
+
+    u->i0 = malloc((size_t) outw * sizeof *u->i0);
+    u->i1 = malloc((size_t) outw * sizeof *u->i1);
+    u->w  = malloc((size_t) outw * sizeof *u->w);
+    if (u->i0 == NULL || u->i1 == NULL || u->w == NULL) {
+        upsample_free(u);
+        return PDF_E_NOMEM;
     }
-    if (cy < 0) {
-        cy = 0;
-    } else if (cy >= c->plane_h) {
-        cy = c->plane_h - 1;
+    for (f = 0; f < d && f < 16; f++) {
+        wtab[f] = (f * 256 + d / 2) / d;
     }
-    return c->plane[cy * c->plane_w + cx];
+    /* x = 0: numerator h - hmax, which is 0 or negative but never
+       below -hmax, so the sample index is 0 or -1 (clamped below). */
+    if (c->h == hmax) {
+        i = 0;
+        f = 0;
+    } else {
+        i = -1;
+        f = c->h - hmax + d;
+    }
+    for (x = 0; x < outw; x++) {
+        int a = i < 0 ? 0 : (i >= c->samp_w ? c->samp_w - 1 : i);
+        int b = i + 1 < 0 ? 0 : (i + 1 >= c->samp_w ? c->samp_w - 1 : i + 1);
+
+        u->i0[x] = (u16) a;
+        u->i1[x] = (u16) b;
+        u->w[x] = (u16) wtab[f];
+        f += step;
+        if (f >= d) {
+            f -= d;
+            i++;
+        }
+    }
+    return PDF_OK;
+}
+
+/* The vertical half: which two rows, and the weight between them.    */
+static void
+upsample_rows(const JpgComp *c, int y, int vmax, const u8 **r0p,
+              const u8 **r1p, int *wp)
+{
+    int d = 2 * vmax;
+    int n = (2 * y + 1) * c->v - vmax;
+    int i, f, a, b;
+
+    if (n >= 0) {
+        i = n / d;
+        f = n % d;
+    } else {
+        i = -1;
+        f = n + d;
+    }
+    a = i < 0 ? 0 : (i >= c->samp_h ? c->samp_h - 1 : i);
+    b = i + 1 < 0 ? 0 : (i + 1 >= c->samp_h ? c->samp_h - 1 : i + 1);
+    *r0p = c->plane + (u32) a * (u32) c->plane_w;
+    *r1p = c->plane + (u32) b * (u32) c->plane_w;
+    *wp = (f * 256 + d / 2) / d;
+}
+
+/* One output sample.  Both weights are applied before rounding, so
+   the result matches a single 16-weight filter rather than rounding
+   twice.                                                            */
+static u32
+comp_sample(const u8 *r0, const u8 *r1, const UpsampleX *u, int x, int wy)
+{
+    int i0, i1, wx, a, b;
+
+    if (u->i0 == NULL) {
+        return r0[x];                   /* full resolution: nothing to do */
+    }
+    i0 = u->i0[x];
+    i1 = u->i1[x];
+    wx = u->w[x];
+    a = r0[i0] * (256 - wx) + r0[i1] * wx;
+    b = r1[i0] * (256 - wx) + r1[i1] * wx;
+    return (u32) ((a * (256 - wy) + b * wy + 32768) >> 16);
 }
 
 static int
 build_output(const JpgCtx *ctx, int outw, int outh, u32 **pixp)
 {
     u32 *pix;
-    int x, y;
+    UpsampleX up[JPG_MAXCOMP];
+    const u8 *r0[JPG_MAXCOMP], *r1[JPG_MAXCOMP];
+    int wy[JPG_MAXCOMP];
+    int x, y, i, err = PDF_OK;
     int hmax = ctx->hmax, vmax = ctx->vmax;
 
+    memset(up, 0, sizeof up);
+    for (i = 0; i < ctx->ncomp; i++) {
+        const JpgComp *c = &ctx->comp[i];
+
+        if (c->h != hmax || c->v != vmax) {
+            err = upsample_build(&up[i], c, hmax, outw);
+            if (err != PDF_OK) {
+                goto fail;
+            }
+        }
+    }
     pix = malloc((size_t) outw * (size_t) outh * sizeof *pix);
     if (pix == NULL) {
-        return PDF_E_NOMEM;
+        err = PDF_E_NOMEM;
+        goto fail;
     }
 
     for (y = 0; y < outh; y++) {
         u32 *row = pix + (u32) y * (u32) outw;
 
+        for (i = 0; i < ctx->ncomp; i++) {
+            const JpgComp *c = &ctx->comp[i];
+
+            if (up[i].i0 != NULL) {
+                upsample_rows(c, y, vmax, &r0[i], &r1[i], &wy[i]);
+            } else {
+                int cy = y >= c->samp_h ? c->samp_h - 1 : y;
+
+                r0[i] = r1[i] = c->plane + (u32) cy * (u32) c->plane_w;
+                wy[i] = 0;
+            }
+        }
+
         for (x = 0; x < outw; x++) {
             u32 r, g, b;
 
             if (ctx->ncomp == 1) {
-                r = g = b = comp_sample(&ctx->comp[0], x, y, hmax, vmax);
+                r = g = b = comp_sample(r0[0], r1[0], &up[0], x, wy[0]);
             } else if (ctx->ncomp == 3) {
-                u32 yv = comp_sample(&ctx->comp[0], x, y, hmax, vmax);
-                u32 cb = comp_sample(&ctx->comp[1], x, y, hmax, vmax);
-                u32 cr = comp_sample(&ctx->comp[2], x, y, hmax, vmax);
+                u32 yv = comp_sample(r0[0], r1[0], &up[0], x, wy[0]);
+                u32 cb = comp_sample(r0[1], r1[1], &up[1], x, wy[1]);
+                u32 cr = comp_sample(r0[2], r1[2], &up[2], x, wy[2]);
 
                 if (ctx->adobe_transform == 0) {
                     r = yv;
@@ -1036,10 +1159,10 @@ build_output(const JpgCtx *ctx, int outw, int outh, u32 **pixp)
                     ycbcr_to_rgb(yv, cb, cr, &r, &g, &b);
                 }
             } else {
-                u32 c0 = comp_sample(&ctx->comp[0], x, y, hmax, vmax);
-                u32 c1 = comp_sample(&ctx->comp[1], x, y, hmax, vmax);
-                u32 c2 = comp_sample(&ctx->comp[2], x, y, hmax, vmax);
-                u32 kk = comp_sample(&ctx->comp[3], x, y, hmax, vmax);
+                u32 c0 = comp_sample(r0[0], r1[0], &up[0], x, wy[0]);
+                u32 c1 = comp_sample(r0[1], r1[1], &up[1], x, wy[1]);
+                u32 c2 = comp_sample(r0[2], r1[2], &up[2], x, wy[2]);
+                u32 kk = comp_sample(r0[3], r1[3], &up[3], x, wy[3]);
                 u32 cc, mm, yy;
 
                 if (ctx->adobe_transform == 2) {
@@ -1065,8 +1188,17 @@ build_output(const JpgCtx *ctx, int outw, int outh, u32 **pixp)
             row[x] = r | (g << 8) | (b << 16);
         }
     }
+    for (i = 0; i < ctx->ncomp; i++) {
+        upsample_free(&up[i]);
+    }
     *pixp = pix;
     return PDF_OK;
+
+fail:
+    for (i = 0; i < JPG_MAXCOMP; i++) {
+        upsample_free(&up[i]);
+    }
+    return err;
 }
 
 /* --- marker segment parsing ----------------------------------------------- */
@@ -1340,6 +1472,16 @@ setup_planes(JpgCtx *ctx, int maxw, int maxh, int *outwp, int *outhp)
         if (c->bhf > bh) { c->bhf = bh; }
         c->plane_w = bw * side;
         c->plane_h = bh * side;
+        /* What the component's own size occupies in that plane; the
+           rest is MCU padding, and filtering must not reach into it. */
+        c->samp_w = ((ctx->width * c->h + ctx->hmax - 1) / ctx->hmax +
+                     (1 << ctx->scale) - 1) >> ctx->scale;
+        c->samp_h = ((ctx->height * c->v + ctx->vmax - 1) / ctx->vmax +
+                     (1 << ctx->scale) - 1) >> ctx->scale;
+        if (c->samp_w > c->plane_w) { c->samp_w = c->plane_w; }
+        if (c->samp_h > c->plane_h) { c->samp_h = c->plane_h; }
+        if (c->samp_w < 1) { c->samp_w = 1; }
+        if (c->samp_h < 1) { c->samp_h = 1; }
         c->plane = malloc((size_t) c->plane_w * (size_t) c->plane_h);
         if (c->plane == NULL) {
             return PDF_E_NOMEM;
