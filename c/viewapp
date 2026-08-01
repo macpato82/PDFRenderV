@@ -74,6 +74,8 @@ typedef s32 fix;
 #define XWimp_Initialise        (0x400C0)
 #define XWimp_CreateWindow      (0x400C1)
 #define XWimp_OpenWindow        (0x400C5)
+#define XWimp_SetColour         (0x400E6)
+#define XOS_Plot                (0x45)
 #define XWimp_CloseWindow       (0x400C6)
 #define XWimp_Poll              (0x400C7)
 #define XWimp_RedrawWindow      (0x400C8)
@@ -887,13 +889,37 @@ static void
 set_extent(void)
 {
     int ext[4];
+    int w = page_w();
+    int h = page_h() + STATUSH;
 
     /* The work area is the page with the top bar's strip above it.
        The bottom bar is not in here at all: it lives in the
        horizontal scroll bar, which is furniture.                   */
+    /* At least as big as what is on show.  The Wimp only asks us to
+       redraw inside the extent, so where a window is larger than its
+       page the rest is never painted and keeps whatever was behind
+       it - which is the marbling that appears on a toggle to full
+       size.  Growing the extent to the visible area gives us
+       rectangles for the whole window, and clearing them is what
+       redraw_main now does.                                       */
+    {
+        int st[16];
+
+        st[0] = vw.win;
+        if (_swix(XWimp_GetWindowState, _IN(1), st) == NULL) {
+            int vw_ = st[3] - st[1], vh = st[4] - st[2];
+
+            if (vw_ > w) {
+                w = vw_;
+            }
+            if (vh > h) {
+                h = vh;
+            }
+        }
+    }
     ext[0] = 0;
-    ext[1] = PAGE_BOT - STATUSH;
-    ext[2] = page_w();
+    ext[1] = -h;
+    ext[2] = w;
     ext[3] = 0;
     _swix(XWimp_SetExtent, _INR(0, 1), vw.win, ext);
     _swix(XWimp_ForceRedraw, _INR(0, 4), vw.win,
@@ -974,12 +1000,20 @@ create_windows(void)
     return 0;
 }
 
-/* Open the window.  The Window module keeps the toolbar with it, so
-   there is nothing to place by hand any more.                     */
+/* Open or move the window.  It has to go through the Toolbox: the
+   Window module owns the toolbar and only moves it when it is the one
+   opening the window.  Calling Wimp_OpenWindow on the handle
+   underneath leaves the toolbar stranded where the window used to be.
+
+   A Wimp open block and the Toolbox's full specification are the same
+   seven words - visible area, scroll offsets, window to open behind -
+   just without the handle in front, so the block can be passed
+   straight through from either.                                   */
 static void
 open_with_pane(int *open)
 {
-    _swix(XWimp_OpenWindow, _IN(1), open);
+    _swix(Toolbox_ShowObject, _INR(0, 5),
+          0, vw.mainobj, 1 /* full spec */, open + 1, 0, -1);
 }
 
 /* Paint the selection as EOR'd rectangles over the plotted page, so
@@ -1023,6 +1057,15 @@ redraw_main(int *blk)
         int oy = blk[4] - blk[6];
         int sx = ox;
         int sy = oy + PAGE_BOT;
+
+        /* The window is not auto-redraw - it cannot be, because then
+           the Wimp would never ask us to draw the page - so clearing
+           the background is ours to do.  Without this, whatever the
+           window is larger than the page shows what was behind it. */
+        _swix(XWimp_SetColour, _IN(0), 1);      /* work background   */
+        _swix(XOS_Plot, _INR(0, 2), 4, blk[2], blk[3]);
+        _swix(XOS_Plot, _INR(0, 2), 96 + 5, blk[4] - 1, blk[5] - 1);
+
         if (vw.area != NULL) {
             _swix(XOS_SpriteOp, _INR(0, 7),
                   52 + 512, vw.area, vw.area + 16, sx, sy, 0, 0, 0);
@@ -1658,7 +1701,7 @@ poll_loop(void)
             break;
         case 2:                         /* open                      */
             if (blk[0] == vw.win) {
-                open_with_pane(blk);
+                open_with_pane(blk);        /* through the Toolbox */
             } else if (blk[0] == vw.pane) {
                 /* Deliberately nothing.  Once a bar is nested the
                    Wimp keeps it with its parent, and re-opening it
@@ -2180,13 +2223,19 @@ main(int argc, char **argv)
     update_toolbar_texts();
     build_menu();
 
-    /* open centred-ish via a GetWindowState + open                    */
+    /* Show it through the Toolbox, not with Wimp_OpenWindow on the
+       handle underneath.  The Window module attaches the toolbar
+       named in the template when the window it belongs to is shown,
+       and opening the Wimp window behind its back means it never
+       learns that happened - which is why the toolbar was missing
+       even though the resource file was right.                    */
     {
-        int st[16];
-        st[0] = vw.win;
-        _swix(XWimp_GetWindowState, _IN(1), st);
-        st[7] = -1;
-        open_with_pane(st);
+        _kernel_oserror *e2 = _swix(Toolbox_ShowObject, _INR(0, 5),
+                                    0, vw.mainobj, 0, NULL, 0, -1);
+
+        if (e2 != NULL) {
+            report_oserr(e2);
+        }
     }
     /* a PDF with bookmarks gets its contents listed beside it        */
     if (load_outline() > 0 && create_outline_window() == 0) {
