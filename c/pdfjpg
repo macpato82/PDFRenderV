@@ -247,6 +247,8 @@ typedef struct {
     const u8 *end;           /* one past the last valid source byte       */
     u32 buf;                  /* 0..8 bits, right-aligned                  */
     int nbits;
+    int ateof;                /* the coded data has ended, at a marker or
+                                 at the end of the buffer                 */
 } JpgBits;
 
 /* Fetch one entropy-coded byte, undoing FF/00 byte stuffing.  Returns
@@ -262,11 +264,13 @@ fetch_byte(JpgBits *br)
     u8 b, nb;
 
     if (br->p >= br->end) {
+        br->ateof = 1;
         return -1;
     }
     b = *br->p;
     if (b == 0xFF) {
         if (br->p + 1 >= br->end) {
+            br->ateof = 1;
             return -1;
         }
         nb = br->p[1];
@@ -274,6 +278,12 @@ fetch_byte(JpgBits *br)
             br->p += 2;
             return 0xFF;
         }
+        /* A marker where coded data was expected means the scan has
+           ended.  For a well-formed file that happens exactly when
+           the last block has been read; some real files stop a few
+           blocks earlier than their own dimensions call for, and
+           this is what lets those still produce a picture.      */
+        br->ateof = 1;
         return -1;
     }
     br->p += 1;
@@ -530,6 +540,7 @@ restart_sync(JpgBits *br)
         return PDF_E_DATA;
     }
     br->p = q + 1;
+    br->ateof = 0;                      /* a restart, not the end     */
     return PDF_OK;
 }
 
@@ -562,7 +573,15 @@ decode_scan(JpgCtx *ctx, JpgBits *br)
                         err = decode_block(br, c, dctab, actab, quant,
                                            side, outblk);
                         if (err) {
-                            return err;
+                            /* Running out of data is not the same as
+                               bad data.  Real files are sometimes a
+                               few blocks short of what their own
+                               dimensions call for, and a viewer that
+                               shows nothing at all in that case is
+                               less use than one that shows what was
+                               there - which is what every other JPEG
+                               decoder does.                       */
+                            return br->ateof ? PDF_OK : err;
                         }
                         px = (mx * c->h + bx) * side;
                         py = (my * c->v + by) * side;
@@ -1643,6 +1662,7 @@ pdfjpg_decode(const u8 *src, u32 srclen, int maxw, int maxh,
             br.end = src + srclen;
             br.buf = 0;
             br.nbits = 0;
+            br.ateof = 0;
 
             if (!ctx.progressive) {
                 err = decode_scan(&ctx, &br);
