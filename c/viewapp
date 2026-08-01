@@ -170,6 +170,9 @@ static const struct { int x0, x1; } toollayout[] = {
 #define SaveAs_SaveCompleted    (SaveAs_SWIChunkBase + 4)
 #define SaveAs_SetFileName      0
 #define SaveAs_FileSaveCompleted 12
+
+#define Menu_SWIChunkBase       0x828C0
+#define Menu_Selection          (Menu_SWIChunkBase + 3)
 #define DisplayField_SetValue   448
 #define NumberRange_SetValue    832
 #define NumberRange_SetBounds   834
@@ -262,9 +265,10 @@ typedef struct {
 #define TB_UP    4
 #define TB_DOWN  5
 
-/* fixed part of the top bar: the info field takes what is left       */
-#define TB_LEFTW  116           /* the two arrows and their margin    */
-#define TB_RIGHTW 176           /* page field plus bump arrows        */
+/* How wide the row in the resource file actually is, so the window is
+   never narrower than the toolbar it has to show.  Read off the
+   gadget furthest right, plus its margin.                          */
+#define TOOLBAR_W 1580
 
 /* bottom toolbar icon numbers */
 #define IC_ZOUT  0
@@ -1137,14 +1141,29 @@ size_to_page(void)
     if (wh > sh - 260) {
         wh = sh - 260;
     }
-    if (ww < TB_LEFTW + TB_RIGHTW + 160) {
-        ww = TB_LEFTW + TB_RIGHTW + 160;    /* room for the top bar   */
+    if (ww < TOOLBAR_W) {
+        ww = TOOLBAR_W;                 /* room for the whole row     */
     }
     if (wh < 200) {
         wh = 200;
     }
     st[3] = st[1] + ww;                 /* x1: grow/shrink rightwards */
     st[2] = st[4] - wh;                 /* y0: and downwards          */
+    /* Growing downwards from where the template put it can push the
+       foot of the window - and the toolbar with it - off the bottom
+       of the screen.  Slide it up rather than leave it there.     */
+    if (st[2] < 40) {
+        int up = 40 - st[2];
+
+        st[2] += up;
+        st[4] += up;
+        if (st[4] > sh - 40) {
+            int down = st[4] - (sh - 40);
+
+            st[2] -= down;
+            st[4] -= down;
+        }
+    }
     st[7] = -1;                         /* keep it in front           */
     open_with_pane(st);
 }
@@ -2240,6 +2259,17 @@ main(int argc, char **argv)
             Msg_ClaimEntity, Msg_DataRequest,
             Msg_ModeChange, Msg_BarPing, Msg_BarPong, 0
         };
+        /* Every Toolbox event we act on, named explicitly.  The C
+           veneer's header says a null list means "deliver them all",
+           but nothing was arriving - no adjuster click, no value
+           change - so the list is spelled out rather than trusted to
+           that reading of it.                                     */
+        static const int tbevents[] = {
+            Adjuster_Clicked, NumberRange_ValueChanged,
+            Scale_AboutToBeShown, Scale_ApplyFactor,
+            SaveAs_AboutToBeShown, SaveAs_SaveToFile,
+            Menu_Selection, 0
+        };
         /* The Toolbox registers with the Wimp on our behalf, loads
            the resource file from the application directory, and
            fills in the id block before each event.  380, not 310:
@@ -2250,7 +2280,7 @@ main(int argc, char **argv)
         int gotver;
 
         e = _swix(Toolbox_Initialise, _INR(0, 6) | _OUT(0) | _OUT(1) | _OUT(2),
-                  0, 380, wanted, NULL, "<PDFRenderV$Dir>",
+                  0, 380, wanted, tbevents, "<PDFRenderV$Dir>",
                   vw.msgfd, &vw.idb, &gotver, &vw.task, &sprarea);
     }
     if (e != NULL) {
