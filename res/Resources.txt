@@ -1,0 +1,125 @@
+RESF:1.01
+
+window_object {
+  header_flags:
+  version:102
+  object_name:"Main"
+  window_flags:
+  help_message:""
+  help_limit:*
+  sprite_name:""
+  pointer_limit:0
+  hotspot:0,0
+  menu_name:""
+  default_focus:toolbox_WINDOW_FOCUS
+  show_action:&0
+  hide_action:&0
+  toolbar_ibl:"Toolbar"
+  toolbar_itl:""
+  toolbar_ebl:""
+  toolbar_etl:""
+  window.visible:400,400,1600,1400
+  window.xscroll:0
+  window.yscroll:0
+  window.next:wimp_TOP
+  window.flags:wimp_WINDOW_MOVEABLE | wimp_WINDOW_AUTO_REDRAW | wimp_WINDOW_BACK_ICON | wimp_WINDOW_CLOSE_ICON | wimp_WINDOW_TITLE_ICON | wimp_WINDOW_TOGGLE_ICON | wimp_WINDOW_VSCROLL | wimp_WINDOW_SIZE_ICON | wimp_WINDOW_HSCROLL | wimp_WINDOW_NEW_FORMAT
+  window.title_fg:wimp_COLOUR_BLACK
+  window.title_bg:wimp_COLOUR_LIGHT_GREY
+  window.work_fg:wimp_COLOUR_BLACK
+  window.work_bg:wimp_COLOUR_VERY_LIGHT_GREY
+  window.scroll_outer:wimp_COLOUR_MID_LIGHT_GREY
+  window.scroll_inner:wimp_COLOUR_VERY_LIGHT_GREY
+  window.highlight_bg:wimp_COLOUR_CREAM
+  window.extra_flags:
+  window.extent:0,-6000,8192,0
+  window.title_flags:wimp_ICON_TEXT | wimp_ICON_HCENTRED | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
+  window.work_flags:wimp_BUTTON_CLICK_DRAG
+  window.sprite_area:&ffffffff
+  window.xmin:480
+  window.ymin:156
+  window.title_text:"Viewer"
+  window.title_text_limit:256
+  window.title_valid:""
+}
+
+window_object {
+  header_flags:
+  version:102
+  object_name:"Toolbar"
+  window_flags:window_AUTO_OPEN | window_AUTO_CLOSE
+  help_message:""
+  help_limit:*
+  sprite_name:""
+  pointer_limit:0
+  hotspot:0,0
+  menu_name:""
+  default_focus:toolbox_NULL_COMPONENT
+  show_action:
+  hide_action:
+  toolbar_ibl:""
+  toolbar_itl:""
+  toolbar_ebl:""
+  toolbar_etl:""
+  window.visible:2,2068,3198,2132
+  window.xscroll:0
+  window.yscroll:0
+  window.next:wimp_TOP
+  window.flags:wimp_WINDOW_MOVEABLE | wimp_WINDOW_AUTO_REDRAW | wimp_WINDOW_SIZE_ICON | wimp_WINDOW_NEW_FORMAT
+  window.title_fg:wimp_COLOUR_BLACK
+  window.title_bg:wimp_COLOUR_LIGHT_GREY
+  window.work_fg:wimp_COLOUR_BLACK
+  window.work_bg:wimp_COLOUR_VERY_LIGHT_GREY
+  window.scroll_outer:wimp_COLOUR_MID_LIGHT_GREY
+  window.scroll_inner:wimp_COLOUR_VERY_LIGHT_GREY
+  window.highlight_bg:wimp_COLOUR_CREAM
+  window.extra_flags:
+  window.extent:0,-64,4096,0
+  window.title_flags:wimp_ICON_TEXT | wimp_ICON_HCENTRED | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
+  window.work_flags:
+  window.sprite_area:&ffffffff
+  window.xmin:100
+  window.ymin:64
+  window.title_text:""
+  window.title_text_limit:*
+  window.title_valid:""
+  adjuster_object {
+    cmp:&0
+    bbox:12,-44,44,-12
+    help_message:"\Sgo to the previous page.|MThe left cursor key does the same."
+    help_limit:*
+    flags:
+    reserved:0
+  }
+  adjuster_object {
+    cmp:&1
+    bbox:56,-44,88,-12
+    help_message:"\Sgo to the next page.|MThe right cursor key does the same."
+    help_limit:*
+    flags:adjuster_INCREMENT
+    reserved:0
+  }
+  displayfield_object {
+    cmp:&2
+    bbox:104,-56,744,-4
+    help_message:"This field describes the document being shown."
+    help_limit:*
+    flags:
+    text:"PDF 1.6: 595 x 841 points, page 1 of 1"
+    text_limit:256
+  }
+  numberrange_object {
+    cmp:&3
+    bbox:756,-56,916,-4
+    help_message:"The page being shown.|MType a page number or use the arrows."
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_ADJUSTERS | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:1
+    upper_bound:65536
+    step_size:1
+    initial_value:1
+    precision:0
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:64
+  }
+}

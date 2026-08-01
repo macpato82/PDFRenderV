@@ -1,0 +1,437 @@
+RESF:1.01
+
+window_object {
+  header_flags:
+  version:102
+  object_name:"Window"
+  window_flags:
+  help_message:""
+  help_limit:*
+  sprite_name:""
+  pointer_limit:0
+  hotspot:0,0
+  menu_name:"Menu"
+  default_focus:toolbox_WINDOW_FOCUS
+  show_action:&0
+  hide_action:&0
+  toolbar_ibl:""
+  toolbar_itl:""
+  toolbar_ebl:""
+  toolbar_etl:""
+  window.visible:964,636,2024,1560
+  window.xscroll:0
+  window.yscroll:0
+  window.next:wimp_TOP
+  window.flags:wimp_WINDOW_MOVEABLE | wimp_WINDOW_AUTO_REDRAW | wimp_WINDOW_BACK_ICON | wimp_WINDOW_CLOSE_ICON | wimp_WINDOW_TITLE_ICON | wimp_WINDOW_TOGGLE_ICON | wimp_WINDOW_VSCROLL | wimp_WINDOW_SIZE_ICON | wimp_WINDOW_HSCROLL | wimp_WINDOW_NEW_FORMAT
+  window.title_fg:wimp_COLOUR_BLACK
+  window.title_bg:wimp_COLOUR_LIGHT_GREY
+  window.work_fg:wimp_COLOUR_BLACK
+  window.work_bg:wimp_COLOUR_VERY_LIGHT_GREY
+  window.scroll_outer:wimp_COLOUR_MID_LIGHT_GREY
+  window.scroll_inner:wimp_COLOUR_VERY_LIGHT_GREY
+  window.highlight_bg:wimp_COLOUR_CREAM
+  window.extra_flags:wimp_WINDOW_NEVER3D | wimp_WINDOW_ALWAYS3D
+  window.extent:0,-6000,65536,0
+  window.title_flags:wimp_ICON_TEXT | wimp_ICON_HCENTRED | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
+  window.work_flags:wimp_BUTTON_ALWAYS | wimp_BUTTON_REPEAT
+  window.sprite_area:&ffffffff
+  window.xmin:480
+  window.ymin:156
+  window.title_text:"Image viewer: filename"
+  window.title_text_limit:256
+  window.title_valid:""
+  keyboardshortcut_object {
+    flags:
+    key_code:&18c
+    key_event:&8000
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:
+    key_code:&18d
+    key_event:&8001
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:
+    key_code:&18f
+    key_event:&8003
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:
+    key_code:&18e
+    key_event:&8002
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:
+    key_code:&1a2
+    key_event:&8004
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:
+    key_code:&20
+    key_event:&8001
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:
+    key_code:&8
+    key_event:&8000
+    key_show:""
+  }
+  keyboardshortcut_object {
+    flags:keyboardshortcut_SHOW_AS_MENU | keyboardshortcut_SHOW_AT_POINTER
+    key_code:&1cb
+    key_event:&0
+    key_show:"Scale"
+  }
+}
+
+window_object {
+  header_flags:
+  version:102
+  object_name:"Toolbar"
+  window_flags:window_AUTO_OPEN | window_AUTO_CLOSE
+  help_message:""
+  help_limit:*
+  sprite_name:""
+  pointer_limit:0
+  hotspot:0,0
+  menu_name:""
+  default_focus:toolbox_NULL_COMPONENT
+  show_action:
+  hide_action:
+  toolbar_ibl:""
+  toolbar_itl:""
+  toolbar_ebl:""
+  toolbar_etl:""
+  window.visible:2,2068,3198,2132
+  window.xscroll:0
+  window.yscroll:0
+  window.next:wimp_TOP
+  window.flags:wimp_WINDOW_MOVEABLE | wimp_WINDOW_AUTO_REDRAW | wimp_WINDOW_SIZE_ICON | wimp_WINDOW_NEW_FORMAT
+  window.title_fg:wimp_COLOUR_BLACK
+  window.title_bg:wimp_COLOUR_LIGHT_GREY
+  window.work_fg:wimp_COLOUR_BLACK
+  window.work_bg:wimp_COLOUR_VERY_LIGHT_GREY
+  window.scroll_outer:wimp_COLOUR_MID_LIGHT_GREY
+  window.scroll_inner:wimp_COLOUR_VERY_LIGHT_GREY
+  window.highlight_bg:wimp_COLOUR_CREAM
+  window.extra_flags:
+  window.extent:0,-64,4096,0
+  window.title_flags:wimp_ICON_TEXT | wimp_ICON_HCENTRED | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
+  window.work_flags:
+  window.sprite_area:&ffffffff
+  window.xmin:100
+  window.ymin:64
+  window.title_text:""
+  window.title_text_limit:*
+  window.title_valid:""
+  adjuster_object {
+    cmp:&0
+    bbox:12,-44,44,-12
+    help_message:"\Smove to the previous image in this directory.|MThe left cursor key will also perform this action."
+    help_limit:*
+    flags:
+    reserved:0
+  }
+  adjuster_object {
+    cmp:&1
+    bbox:56,-44,88,-12
+    help_message:"\Smove to the next image in this directory.|MThe right cursor key will also perform this action."
+    help_limit:*
+    flags:adjuster_INCREMENT
+    reserved:0
+  }
+  displayfield_object {
+    cmp:&2
+    bbox:104,-56,744,-4
+    help_message:"This field shows information about the current image."
+    help_limit:*
+    flags:
+    text:"Sprite: 1024x1024, 65535 dpi, full colour"
+    text_limit:256
+  }
+  numberrange_object {
+    cmp:&3
+    bbox:756,-56,916,-4
+    help_message:"This shows the image index within the current file.|MAn index of '0' indicates that the default image is being shown.|MYou can change the image using the arrows or keyboard."
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_ADJUSTERS | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:0
+    upper_bound:4096
+    step_size:1
+    initial_value:0
+    precision:0
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:64
+  }
+}
+
+menu_object {
+  header_flags:
+  version:102
+  object_name:"Menu"
+  menu_flags:
+  title:"Image viewer"
+  title_limit:*
+  help:""
+  help_limit:*
+  show_action:&0
+  hide_action:
+  Entry {
+    cmp:0
+    flags:menu_ENTRY_SUB_MENU
+    cmp:&0
+    text:"Scale  F11"
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:"Scale"
+    sub_menu_action:&0
+    click_action:&0
+    help:"\Rselect a scale for the image."
+    help_limit:*
+  }
+  Entry {
+    cmp:2
+    flags:menu_ENTRY_SEPARATE | menu_ENTRY_SUB_MENU | menu_ENTRY_GENERATE_SUB_MENU_ACTION
+    cmp:&2
+    text:"Export"
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:"Export"
+    sub_menu_action:&0
+    click_action:&0
+    help:""
+    help_limit:*
+  }
+  Entry {
+    cmp:1
+    flags:
+    cmp:&1
+    text:"Options..."
+    text_limit:*
+    click_object_name:""
+    sub_menu_object_name:""
+    sub_menu_action:&0
+    click_action:&23
+    help:"\Sopen the rendering options window."
+    help_limit:*
+  }
+}
+
+scale_object {
+  header_flags:
+  version:100
+  object_name:"Scale"
+  scale_flags:scale_GENERATE_ABOUT_TO_BE_SHOWN | scale_GENERATE_DIALOGUE_COMPLETED
+  lower_bound:5
+  upper_bound:2000
+  step_size:1
+  title:""
+  title_limit:*
+  alternative_window_name:""
+  std_value:25,50,100,200
+}
+
+window_object {
+  header_flags:
+  version:102
+  object_name:"Options"
+  window_flags:window_AUTO_OPEN | window_AUTO_CLOSE
+  help_message:""
+  help_limit:*
+  sprite_name:""
+  pointer_limit:0
+  hotspot:0,0
+  menu_name:""
+  default_focus:toolbox_NULL_COMPONENT
+  show_action:
+  hide_action:
+  toolbar_ibl:""
+  toolbar_itl:""
+  toolbar_ebl:""
+  toolbar_etl:""
+  window.visible:72,1196,788,1548
+  window.xscroll:0
+  window.yscroll:0
+  window.next:wimp_TOP
+  window.flags:wimp_WINDOW_MOVEABLE | wimp_WINDOW_AUTO_REDRAW | wimp_WINDOW_BACK_ICON | wimp_WINDOW_TITLE_ICON | wimp_WINDOW_SIZE_ICON | wimp_WINDOW_NEW_FORMAT
+  window.title_fg:wimp_COLOUR_BLACK
+  window.title_bg:wimp_COLOUR_LIGHT_GREY
+  window.work_fg:wimp_COLOUR_BLACK
+  window.work_bg:wimp_COLOUR_VERY_LIGHT_GREY
+  window.scroll_outer:wimp_COLOUR_MID_LIGHT_GREY
+  window.scroll_inner:wimp_COLOUR_VERY_LIGHT_GREY
+  window.highlight_bg:wimp_COLOUR_CREAM
+  window.extra_flags:
+  window.extent:0,-1024,1280,0
+  window.title_flags:wimp_ICON_TEXT | wimp_ICON_HCENTRED | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
+  window.work_flags:
+  window.sprite_area:&ffffffff
+  window.xmin:100
+  window.ymin:100
+  window.title_text:"Rendering options"
+  window.title_text_limit:*
+  window.title_valid:""
+  numberrange_object {
+    cmp:&107
+    bbox:228,-124,696,-72
+    help_message:""
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_WRITABLE | numberrange_ADJUSTERS | numberrange_SLIDER_TYPE_LEFT | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:1
+    upper_bound:40
+    step_size:1
+    initial_value:10
+    precision:1
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:96
+  }
+  label_object {
+    cmp:&108
+    bbox:28,-124,216,-72
+    help_message:""
+    help_limit:*
+    flags:label_NO_BOX | label_RJUSTIFIED
+    label:"Gamma"
+  }
+  numberrange_object {
+    cmp:&109
+    bbox:228,-180,696,-128
+    help_message:""
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_WRITABLE | numberrange_ADJUSTERS | numberrange_SLIDER_TYPE_LEFT | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:-255
+    upper_bound:255
+    step_size:1
+    initial_value:0
+    precision:0
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:96
+  }
+  label_object {
+    cmp:&10a
+    bbox:28,-180,216,-128
+    help_message:""
+    help_limit:*
+    flags:label_NO_BOX | label_RJUSTIFIED
+    label:"Brightness"
+  }
+  numberrange_object {
+    cmp:&10b
+    bbox:228,-236,696,-184
+    help_message:""
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_WRITABLE | numberrange_ADJUSTERS | numberrange_SLIDER_TYPE_LEFT | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:1
+    upper_bound:40
+    step_size:1
+    initial_value:10
+    precision:1
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:96
+  }
+  label_object {
+    cmp:&10c
+    bbox:28,-236,216,-184
+    help_message:""
+    help_limit:*
+    flags:label_NO_BOX | label_RJUSTIFIED
+    label:"Contrast"
+  }
+  numberrange_object {
+    cmp:&10d
+    bbox:228,-68,696,-16
+    help_message:""
+    help_limit:*
+    flags:numberrange_GENERATE_VALUE_CHANGED | numberrange_WRITABLE | numberrange_ADJUSTERS | numberrange_SLIDER_TYPE_LEFT | numberrange_RJUSTIFIED | numberrange_KNOB_COLOUR_MID_DARK_GREY
+    lower_bound:0
+    upper_bound:15
+    step_size:1
+    initial_value:15
+    precision:0
+    prev:toolbox_NULL_COMPONENT
+    next:toolbox_NULL_COMPONENT
+    display_length:96
+  }
+  optionbutton_object {
+    cmp:&10f
+    bbox:28,-64,216,-20
+    help_message:"When enabled, the 'quality' of image rendering can be controlled for this image. The quality level selected will be used for all subsequent rendering of this image type."
+    help_limit:*
+    flags:optionbutton_GENERATE_STATE_CHANGED
+    label:"Quality"
+    label_limit:*
+    action:&0
+  }
+  actionbutton_object {
+    cmp:&110
+    bbox:496,-332,700,-264
+    help_message:"\Sconfirm the options and close this \w.|M\Aconfirm the options and leave this \w open."
+    help_limit:*
+    flags:actionbutton_IS_DEFAULT
+    text:"OK"
+    text_limit:*
+    click_show:""
+    action:&0
+  }
+  button_object {
+    cmp:&111
+    bbox:0,-260,1024,-244
+    help_message:""
+    help_limit:*
+    flags:
+    button_flags:wimp_ICON_SPRITE | wimp_ICON_VCENTRED | wimp_ICON_INDIRECTED
+    button_esg:0
+    button_fg:wimp_COLOUR_BLACK
+    button_bg:wimp_COLOUR_WHITE
+    value:"divider"
+    value_limit:*
+    validation:""
+    validation_limit:*
+  }
+  actionbutton_object {
+    cmp:&112
+    bbox:296,-324,484,-272
+    help_message:"\Sto discard these options."
+    help_limit:*
+    flags:
+    text:"Cancel"
+    text_limit:*
+    click_show:""
+    action:&0
+  }
+}
+
+menu_object {
+  header_flags:
+  version:102
+  object_name:"Export"
+  menu_flags:menu_GENERATE_ABOUT_TO_BE_SHOWN
+  title:"Export"
+  title_limit:*
+  help:""
+  help_limit:*
+  show_action:&8006
+  hide_action:
+}
+
+saveas_object {
+  header_flags:
+  version:100
+  object_name:"SaveAs"
+  saveas_flags:saveas_GENERATE_ABOUT_TO_BE_SHOWN | saveas_NO_SELECTION_BUTTON
+  file_name:""
+  file_type:&0
+  title:""
+  title_limit:*
+  alternative_window_name:""
+}
