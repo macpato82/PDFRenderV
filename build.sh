@@ -107,6 +107,9 @@ run "$D/bin/link,ff8" -aif -o aif.Viewer o.viewapp C:CLib.o.stubs
 if [ -d "$HERE/app/!Viewer" ]; then
     cp "$HERE/rm/PDFRenderV" "$HERE/app/!Viewer/PDFRenderV,ffa"
     cp "$HERE/aif/Viewer"    "$HERE/app/!Viewer/Viewer,ff8"
+    # Toolbox_Initialise loads <dir>.Res from the application
+    # directory, so the resource file has to travel with it
+    cp "$HERE/res/Resources,fae" "$HERE/app/!Viewer/Res,fae"
     echo "   refreshed app/!Viewer"
 fi
 

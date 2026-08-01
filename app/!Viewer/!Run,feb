@@ -8,5 +8,16 @@
 | Licensed under the Common Development and Distribution License 1.0; see LICENSE.
 
 Run <Obey$Dir>.!Boot
+
+| The window, its toolbar and the gadgets on it are Toolbox objects,
+| so the object modules have to be there.  On RISC OS 5 they are in
+| the ROM; the checks are for anyone running this anywhere else.
+RMEnsure Toolbox   1.36 RMLoad System:Modules.Toolbox.Toolbox
+RMEnsure Toolbox   1.36 Error Viewer needs the Toolbox module
+RMEnsure Window    1.58 RMLoad System:Modules.Toolbox.Window
+RMEnsure Window    1.58 Error Viewer needs the Window module
+RMEnsure Menu      0.35 RMLoad System:Modules.Toolbox.Menu
+RMEnsure Menu      0.35 Error Viewer needs the Menu module
+
 WimpSlot -min 320K -max 4096K
 Run <PDFRenderV$Dir>.Viewer %*0
